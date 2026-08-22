@@ -49,8 +49,11 @@ def _tree_edges(
   efc_J_colind_in: wp.array3d[int],
   efc_J_in: wp.array3d[float],
   njmax_in: int,
+  # In:
+  use_bitset: bool,
   # Out:
-  tree_tree: wp.array3d[int],  # kernel_analyzer: off
+  tree_tree_out: wp.array3d[int],  # kernel_analyzer: off
+  tree_edges_out: wp.array2d[wp.uint32],
 ):
   """Find tree edges."""
   worldid, efcid = wp.tid()
@@ -125,13 +128,20 @@ def _tree_edges(
     if tree0 >= 0:
       if tree1 < 0 or tree0 == tree1:
         # self-edge
-        wp.atomic_max(tree_tree, worldid, tree0, tree0, 1)
+        if use_bitset:
+          wp.atomic_or(tree_edges_out, worldid, tree0, wp.uint32(1) << wp.uint32(tree0))
+        else:
+          wp.atomic_max(tree_tree_out, worldid, tree0, tree0, 1)
       else:
         # cross-tree edge
         t1 = wp.min(tree0, tree1)
         t2 = wp.max(tree0, tree1)
-        wp.atomic_max(tree_tree, worldid, t1, t2, 1)
-        wp.atomic_max(tree_tree, worldid, t2, t1, 1)
+        if use_bitset:
+          wp.atomic_or(tree_edges_out, worldid, t1, wp.uint32(1) << wp.uint32(t2))
+          wp.atomic_or(tree_edges_out, worldid, t2, wp.uint32(1) << wp.uint32(t1))
+        else:
+          wp.atomic_max(tree_tree_out, worldid, t1, t2, 1)
+          wp.atomic_max(tree_tree_out, worldid, t2, t1, 1)
     return
 
   # generic: scan Jacobian row
@@ -162,18 +172,28 @@ def _tree_edges(
     elif tree != first_tree:
       t1 = wp.min(first_tree, tree)
       t2 = wp.max(first_tree, tree)
-      wp.atomic_max(tree_tree, worldid, t1, t2, 1)
-      wp.atomic_max(tree_tree, worldid, t2, t1, 1)
+      if use_bitset:
+        wp.atomic_or(tree_edges_out, worldid, t1, wp.uint32(1) << wp.uint32(t2))
+        wp.atomic_or(tree_edges_out, worldid, t2, wp.uint32(1) << wp.uint32(t1))
+      else:
+        wp.atomic_max(tree_tree_out, worldid, t1, t2, 1)
+        wp.atomic_max(tree_tree_out, worldid, t2, t1, 1)
       has_cross_edge = 1
 
   if first_tree >= 0 and has_cross_edge == 0:
-    wp.atomic_max(tree_tree, worldid, first_tree, first_tree, 1)
+    if use_bitset:
+      wp.atomic_or(tree_edges_out, worldid, first_tree, wp.uint32(1) << wp.uint32(first_tree))
+    else:
+      wp.atomic_max(tree_tree_out, worldid, first_tree, first_tree, 1)
 
 
-@event_scope
-def tree_edges(m: types.Model, d: types.Data, tree_tree: wp.array3d[int]):
-  """Compute tree-tree adjacency matrix."""
-  tree_tree.zero_()
+def _launch_tree_edges(
+  m: types.Model,
+  d: types.Data,
+  use_bitset: bool,
+  tree_tree: wp.array3d[int],
+  tree_edges: wp.array2d[wp.uint32],
+):
   wp.launch(
     kernel=_tree_edges,
     dim=(d.nworld, d.njmax),
@@ -198,9 +218,24 @@ def tree_edges(m: types.Model, d: types.Data, tree_tree: wp.array3d[int]):
       d.efc.J_colind,
       d.efc.J,
       d.njmax,
+      use_bitset,
     ],
-    outputs=[tree_tree],
+    outputs=[tree_tree, tree_edges],
   )
+
+
+@event_scope
+def tree_edges(m: types.Model, d: types.Data, tree_tree: wp.array3d[int]):
+  """Compute tree-tree adjacency matrix."""
+  tree_tree.zero_()
+  empty_edges = wp.empty((0, 0), dtype=wp.uint32, device=tree_tree.device)
+  _launch_tree_edges(m, d, False, tree_tree, empty_edges)
+
+
+def _tree_edge_bitsets(m: types.Model, d: types.Data, edges: wp.array2d[wp.uint32]):
+  edges.zero_()
+  empty_matrix = wp.empty((0, 0, 0), dtype=int, device=edges.device)
+  _launch_tree_edges(m, d, True, empty_matrix, edges)
 
 
 @wp.kernel
@@ -294,6 +329,81 @@ def _zero_island_counts(
   nidof_out[worldid] = 0
 
 
+@wp.func
+def _lowest_set_bit(mask: wp.uint32) -> int:
+  index = int(0)
+  if (mask & wp.uint32(0xFFFF)) == 0:
+    mask >>= wp.uint32(16)
+    index += 16
+  if (mask & wp.uint32(0xFF)) == 0:
+    mask >>= wp.uint32(8)
+    index += 8
+  if (mask & wp.uint32(0xF)) == 0:
+    mask >>= wp.uint32(4)
+    index += 4
+  if (mask & wp.uint32(0x3)) == 0:
+    mask >>= wp.uint32(2)
+    index += 2
+  if (mask & wp.uint32(0x1)) == 0:
+    index += 1
+  return index
+
+
+@wp.kernel
+def _flood_fill_bitsets(
+  # Model:
+  ntree: int,
+  tree_dofnum: wp.array[int],
+  # In:
+  tree_edges_in: wp.array2d[wp.uint32],
+  # Data out:
+  nisland_out: wp.array[int],
+  tree_island_out: wp.array2d[int],
+  island_nv_out: wp.array2d[int],
+):
+  """Discover small constraint islands from uint32 adjacency rows."""
+  worldid = wp.tid()
+
+  for tree in range(ntree):
+    island_nv_out[worldid, tree] = 0
+
+  visited = wp.uint32(0)
+  nisland = int(0)
+  for root in range(ntree):
+    root_bit = wp.uint32(1) << wp.uint32(root)
+    if (visited & root_bit) != wp.uint32(0):
+      continue
+    if tree_edges_in[worldid, root] == wp.uint32(0):
+      tree_island_out[worldid, root] = -1
+      continue
+
+    pending = root_bit
+    island_nv = int(0)
+    while pending != wp.uint32(0):
+      tree = _lowest_set_bit(pending)
+      tree_bit = wp.uint32(1) << wp.uint32(tree)
+      pending &= ~tree_bit
+      visited |= tree_bit
+      neighbors = tree_edges_in[worldid, tree]
+      tree_island_out[worldid, tree] = nisland
+      island_nv += tree_dofnum[tree]
+      pending |= neighbors & ~visited
+
+    island_nv_out[worldid, nisland] = island_nv
+    nisland += 1
+
+  nisland_out[worldid] = nisland
+
+
+def _flood_fill_small(m: types.Model, d: types.Data, tree_edges: wp.array2d[wp.uint32]):
+  wp.launch(
+    _flood_fill_bitsets,
+    dim=d.nworld,
+    inputs=[m.ntree, m.tree_dofnum, tree_edges],
+    outputs=[d.nisland, d.tree_island, d.island_nv],
+  )
+
+
 @event_scope
 def island(m: types.Model, d: types.Data):
   """Discover constraint islands."""
@@ -305,11 +415,15 @@ def island(m: types.Model, d: types.Data):
     )
     return
 
-  # Step 1: Find tree edges
+  if m.ntree <= 32:
+    # Flood fill reads each adjacency row before replacing it with the final label.
+    edge_bits = d.tree_island.view(wp.uint32)
+    _tree_edge_bitsets(m, d, edge_bits)
+    _flood_fill_small(m, d, edge_bits)
+    return
+
   tree_tree = wp.zeros((d.nworld, m.ntree, m.ntree), dtype=int)
   tree_edges(m, d, tree_tree)
-
-  # Step 2: DFS flood fill
   flood_fill(m, d, tree_tree)
 
 
