@@ -1912,6 +1912,7 @@ def make_data(
   _allocate_island_arrays(mjm, d, nworld, njmax, island_alloc, mjd)
   _allocate_compact_arrays(mjm, d, nworld, sizes["nvmax_pad"], sizes["njmax_pad"], compact_alloc)
   d.ncdof.zero_()
+  d.nsingleton6.zero_()
   d.dof_cdof.fill_(-1)
   d.cdof_dof.fill_(-1)
 
@@ -2204,6 +2205,7 @@ def put_data(
   _allocate_island_arrays(mjm, d, nworld, njmax, island_alloc, mjd)
   _allocate_compact_arrays(mjm, d, nworld, sizes["nvmax_pad"], sizes["njmax_pad"], compact_alloc)
   d.ncdof.zero_()
+  d.nsingleton6.zero_()
   d.dof_cdof.fill_(-1)
   d.cdof_dof.fill_(-1)
 

@@ -26,6 +26,7 @@ from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_augmented_factorize_solve_newton_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_factorize_solve_func
+from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
 from mujoco_warp._src.types import InverseContext
@@ -2904,6 +2905,176 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
   return kernel
 
 
+@cache_kernel
+def _update_gradient_cholesky_general(tile_size: int, matrix_size: int, force_factor: bool, skip_noflip: bool):
+  """Factor and solve the non-singleton prefix of a compacted system."""
+  FORCE_FACTOR = force_factor
+  SKIP_NOFLIP = skip_noflip
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
+  def kernel(
+    # Data in:
+    ncdof_in: wp.array[int],
+    nsingleton6_in: wp.array[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    ctx_grad_in: wp.array3d[float],
+    ctx_h_in: wp.array3d[float],
+    quad_changed_count_in: wp.array[int],
+    state_changed_count_in: wp.array[int],
+    # Out:
+    ctx_hfactor_out: wp.array3d[float],
+    ctx_solution_out: wp.array3d[float],
+  ):
+    worldid = wp.tid()
+    TILE_SIZE = wp.static(tile_size)
+
+    if ctx_done_in[worldid]:
+      return
+    if wp.static(SKIP_NOFLIP):
+      if state_changed_count_in[worldid] == 0:
+        return
+
+    size = ncdof_in[worldid] - 6 * nsingleton6_in[worldid]
+    if size > 0:
+      size = ((size + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
+
+    if wp.static(FORCE_FACTOR) or quad_changed_count_in[worldid] > 0:
+      wp.static(create_blocked_cholesky_factorize_solve_func(TILE_SIZE, matrix_size))(
+        ctx_h_in[worldid],
+        ctx_grad_in[worldid],
+        size,
+        ctx_hfactor_out[worldid],
+        ctx_solution_out[worldid],
+      )
+    else:
+      wp.static(create_blocked_cholesky_solve_func(TILE_SIZE, matrix_size))(
+        ctx_hfactor_out[worldid],
+        ctx_grad_in[worldid],
+        size,
+        ctx_solution_out[worldid],
+      )
+
+  return kernel
+
+
+@cache_kernel
+def _update_gradient_cholesky_singleton6(tile_size: int, force_factor: bool, skip_noflip: bool):
+  """Factor and solve independent six-DOF trees."""
+  FORCE_FACTOR = force_factor
+  SKIP_NOFLIP = skip_noflip
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Data in:
+    ncdof_in: wp.array[int],
+    nsingleton6_in: wp.array[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    ctx_grad_in: wp.array3d[float],
+    ctx_h_in: wp.array3d[float],
+    quad_changed_count_in: wp.array[int],
+    state_changed_count_in: wp.array[int],
+    # Out:
+    ctx_hfactor_out: wp.array3d[float],
+    ctx_solution_out: wp.array3d[float],
+  ):
+    worldid, singletonid = wp.tid()
+
+    if ctx_done_in[worldid] or singletonid >= nsingleton6_in[worldid]:
+      return
+    if wp.static(SKIP_NOFLIP):
+      if state_changed_count_in[worldid] == 0:
+        return
+
+    general_size = ncdof_in[worldid] - 6 * nsingleton6_in[worldid]
+    start = int(0)
+    if general_size > 0:
+      start = ((general_size + tile_size - 1) // tile_size) * tile_size
+    start += 6 * singletonid
+
+    if wp.static(FORCE_FACTOR) or quad_changed_count_in[worldid] > 0:
+      for i in range(wp.static(6)):
+        diagonal = ctx_h_in[worldid, start + i, start + i]
+        rhs = ctx_grad_in[worldid, start + i, 0]
+        for k in range(i):
+          factor = ctx_hfactor_out[worldid, start + k, start + i]
+          diagonal -= factor * factor
+          rhs -= factor * ctx_solution_out[worldid, start + k, 0]
+
+        diagonal = wp.sqrt(diagonal)
+        ctx_hfactor_out[worldid, start + i, start + i] = diagonal
+        diagonal_inv = 1.0 / diagonal
+        ctx_solution_out[worldid, start + i, 0] = rhs * diagonal_inv
+
+        for j in range(i + 1, wp.static(6)):
+          value = ctx_h_in[worldid, start + i, start + j]
+          for k in range(i):
+            value -= ctx_hfactor_out[worldid, start + k, start + i] * ctx_hfactor_out[worldid, start + k, start + j]
+          ctx_hfactor_out[worldid, start + i, start + j] = value * diagonal_inv
+    else:
+      for i in range(wp.static(6)):
+        rhs = ctx_grad_in[worldid, start + i, 0]
+        for k in range(i):
+          rhs -= ctx_hfactor_out[worldid, start + k, start + i] * ctx_solution_out[worldid, start + k, 0]
+        ctx_solution_out[worldid, start + i, 0] = rhs / ctx_hfactor_out[worldid, start + i, start + i]
+
+    for reverse_i in range(wp.static(6)):
+      i = 5 - reverse_i
+      value = ctx_solution_out[worldid, start + i, 0]
+      for k in range(i + 1, wp.static(6)):
+        value -= ctx_hfactor_out[worldid, start + i, start + k] * ctx_solution_out[worldid, start + k, 0]
+      ctx_solution_out[worldid, start + i, 0] = value / ctx_hfactor_out[worldid, start + i, start + i]
+
+  return kernel
+
+
+@cache_kernel
+def _finish_gradient_cholesky_singletons(tile_size: int, vector_size: int, skip_noflip: bool):
+  """Form the search direction and Newton-decrement reductions."""
+  SKIP_NOFLIP = skip_noflip
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
+  def kernel(
+    # Data in:
+    ncdof_in: wp.array[int],
+    nsingleton6_in: wp.array[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    state_changed_count_in: wp.array[int],
+    ctx_grad_in: wp.array2d[float],
+    # Out:
+    ctx_solution_out: wp.array2d[float],
+    ctx_search_dot_out: wp.array[float],
+    ctx_newton_decrement_out: wp.array[float],
+  ):
+    worldid = wp.tid()
+
+    if ctx_done_in[worldid]:
+      return
+    if wp.static(SKIP_NOFLIP):
+      if state_changed_count_in[worldid] == 0:
+        return
+
+    general_size = ncdof_in[worldid] - 6 * nsingleton6_in[worldid]
+    active_size = int(0)
+    if general_size > 0:
+      active_size = ((general_size + tile_size - 1) // tile_size) * tile_size
+    active_size += 6 * nsingleton6_in[worldid]
+
+    index = wp.tile_arange(wp.static(vector_size), dtype=int)
+    active = wp.tile_ones(shape=wp.static(vector_size), dtype=int) * active_size
+    solution = wp.tile_load(ctx_solution_out[worldid], shape=wp.static(vector_size), bounds_check=False)
+    solution = wp.tile_map(wp.mul, solution, wp.tile_map(_active_check, index, active))
+    grad = wp.tile_load(ctx_grad_in[worldid], shape=wp.static(vector_size), bounds_check=False)
+    sums = wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, grad, solution))[0]
+    ctx_search_dot_out[worldid] = sums[0]
+    ctx_newton_decrement_out[worldid] = sums[1]
+    wp.tile_store(ctx_solution_out[worldid], wp.tile_map(wp.mul, solution, -1.0), bounds_check=False)
+
+  return kernel
+
+
 @wp.kernel(grid_stride=True)
 def _padding_h(nv: int, ctx_done_in: wp.array[bool], ctx_h_out: wp.array3d[float]):
   worldid, elementid = wp.tid()
@@ -2923,6 +3094,49 @@ def _cholesky_factorize_solve(
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
+  if m.nv > _BLOCK_CHOLESKY_DIM and _sparse_compact(ctx):
+    dfull = ctx.compact_d_full
+    tile_size = types.TILE_SIZE_JTDAJ_DENSE
+    quad_changed = ctx.quad_changed_count if skip_unchanged else d.nefc
+    state_changed = ctx.state_changed_count if skip_noflip else d.nefc
+    wp.launch_tiled(
+      _update_gradient_cholesky_general(tile_size, m.nv_pad, not skip_unchanged, skip_noflip),
+      dim=d.nworld,
+      inputs=[
+        dfull.ncdof,
+        dfull.nsingleton6,
+        ctx.done,
+        ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)),
+        ctx.h,
+        quad_changed,
+        state_changed,
+      ],
+      outputs=[ctx.hfactor, ctx.search.reshape(shape=(d.nworld, m.nv, 1))],
+      block_dim=m.block_dim.update_gradient_cholesky_blocked,
+    )
+    wp.launch(
+      _update_gradient_cholesky_singleton6(tile_size, not skip_unchanged, skip_noflip),
+      dim=(d.nworld, ctx.compact_m_full.ntree),
+      inputs=[
+        dfull.ncdof,
+        dfull.nsingleton6,
+        ctx.done,
+        ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)),
+        ctx.h,
+        quad_changed,
+        state_changed,
+      ],
+      outputs=[ctx.hfactor, ctx.search.reshape(shape=(d.nworld, m.nv, 1))],
+    )
+    wp.launch_tiled(
+      _finish_gradient_cholesky_singletons(tile_size, m.nv, skip_noflip),
+      dim=d.nworld,
+      inputs=[dfull.ncdof, dfull.nsingleton6, ctx.done, state_changed, ctx.grad],
+      outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
+      block_dim=m.block_dim.update_gradient_cholesky_blocked,
+    )
+    return
+
   if m.nv <= _BLOCK_CHOLESKY_DIM:
     wp.launch_tiled(
       _update_gradient_cholesky(m.nv, skip_noflip),
@@ -4077,9 +4291,9 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
 
 # Active-DOF compaction solve (nvmax < nv).
 #
-# When fewer than nv DOFs are active, the active set is packed into a contiguous
-# [0, ncdof) range (see island.update_active_dofs) and the dense factor/solve runs at
-# size nvmax_pad instead of nv. The compacted workspace lives on Data as c* fields
+# When fewer than nv DOFs are active, the active set is packed into nvmax_pad
+# (see island.update_active_dofs) and the dense factor/solve runs there instead of nv.
+# The compacted workspace lives on Data as c* fields
 # (mirroring the island-local i* fields). The constrained solve gathers into compacted
 # arrays, shallow-replaces (m, d) so the stock dense Newton solver runs at nvmax_pad,
 # then scatters qacc/qfrc_constraint back, freezing inactive DOFs to 0.
@@ -4088,14 +4302,15 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
 @wp.kernel
 def _init_compact_inertia(
   # Data in:
-  ncdof_in: wp.array[int],
+  cdof_dof_in: wp.array2d[int],
   # Out:
   M_c_out: wp.array3d[float],
 ):
   worldid, i, j = wp.tid()
   val = 0.0
-  if i == j and i >= ncdof_in[worldid]:
-    val = 1.0
+  if i == j:
+    if cdof_dof_in[worldid, i] < 0:
+      val = 1.0
   M_c_out[worldid, i, j] = val
 
 
@@ -4236,7 +4451,7 @@ def smooth_solve_compact(m: types.Model, d: types.Data):
   wp.launch(
     _init_compact_inertia,
     dim=(d.nworld, d.nvmax_pad, d.nvmax_pad),
-    inputs=[d.ncdof],
+    inputs=[d.cdof_dof],
     outputs=[d.cM],
   )
   wp.launch(
@@ -4402,7 +4617,7 @@ def _compact_gather(m: types.Model, d: types.Data):
     wp.launch(
       _init_compact_inertia,
       dim=(d.nworld, nvp, nvp),
-      inputs=[d.ncdof],
+      inputs=[d.cdof_dof],
       outputs=[d.cM],
     )
     wp.launch(

@@ -1349,6 +1349,38 @@ _COMPACT_CONTACT_XML = """
 """
 
 
+_COMPACT_SINGLETON_XML = """
+<mujoco>
+  <option jacobian="sparse" solver="Newton" iterations="20"/>
+  <worldbody>
+    <geom type="plane" size="5 5 .1"/>
+    <body><joint type="hinge"/><geom type="capsule" fromto="0 0 .2 .1 0 .2" size=".02"/>
+      <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+        <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+          <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+            <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+              <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+                <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+                  <body pos=".1 0 0"><joint type="hinge"/><geom type="capsule" fromto="0 0 0 .1 0 0" size=".02"/>
+                    <body pos=".1 0 0"><joint type="hinge"/><geom type="sphere" size=".02"/></body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <body name="free0" pos="1 0 .08"><freejoint/><geom type="sphere" size=".1"/></body>
+    <body name="free1" pos="1.25 0 .08"><freejoint/><geom type="sphere" size=".1"/></body>
+    <body pos="3 0 .08"><freejoint/><geom type="sphere" size=".1"/></body>
+    <body pos="4 0 .08"><freejoint/><geom type="sphere" size=".1"/></body>
+  </worldbody>
+  <equality><connect body1="free0" body2="free1" anchor="1.125 0 .08"/></equality>
+</mujoco>
+"""
+
+
 def _put_compact(xml: str, nvmax: int | None = None, sparse: bool = False):
   """Build (mjm, mjd, m, d) with the compact workspace allocated via nvmax.
 
@@ -1415,10 +1447,24 @@ class CompactSolverTest(absltest.TestCase):
         d.tree_awake = wp.array(np.ones((d.nworld, m.ntree), dtype=int), dtype=int)
         island.update_active_dofs(m, d)
         self.assertEqual(d.ncdof.numpy()[0], m.nv)
+        self.assertEqual(d.nsingleton6.numpy()[0], 0)
 
         solver.solve_compact(m, d)
 
         np.testing.assert_allclose(d.qacc.numpy(), baseline_qacc, rtol=1e-3, atol=1e-4)
+
+  def test_constrained_solve_singleton6_equivalence(self):
+    """Singleton free bodies and a coupled pair match a full Newton step."""
+    _, _, baseline_m, baseline_d = _put_compact(_COMPACT_SINGLETON_XML)
+    _, _, m, d = _put_compact(_COMPACT_SINGLETON_XML)
+    m.opt.enableflags |= types.EnableBit.SLEEP
+
+    mjw.step(baseline_m, baseline_d)
+    mjw.step(m, d)
+
+    self.assertEqual(d.nsingleton6.numpy()[0], 2)
+    for field in ("qpos", "qvel", "qacc"):
+      np.testing.assert_allclose(getattr(d, field).numpy(), getattr(baseline_d, field).numpy(), rtol=1e-3, atol=1e-4)
 
   def test_solve_compact_populates_islands(self):
     """When using the compact solver via mjw.solve, island mapping fields are updated."""
