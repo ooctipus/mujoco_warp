@@ -403,6 +403,82 @@ class IslandEdgeDiscoveryTest(absltest.TestCase):
 class IslandDiscoveryTest(absltest.TestCase):
   """Tests for full island discovery."""
 
+  def test_bitset_island_matches_generic(self):
+    """The complete small-tree path matches generic island discovery."""
+    bodies = "".join(
+      f'<body name="b{i}" pos="{i} 0 0"><freejoint/><geom size=".1" contype="0" conaffinity="0"/></body>' for i in range(32)
+    )
+    xml = f"""
+    <mujoco>
+      <worldbody>{bodies}</worldbody>
+      <equality>
+        <weld body1="b0" body2="b31"/>
+        <weld body1="b4" body2="b17"/>
+      </equality>
+    </mujoco>
+    """
+    _, _, m, d = test_data.fixture(xml=xml, nworld=4)
+    mjwarp.fwd_position(m, d)
+
+    tree_tree = wp.empty((d.nworld, m.ntree, m.ntree), dtype=int)
+    island.tree_edges(m, d, tree_tree)
+    island.flood_fill(m, d, tree_tree)
+    expected_nisland = d.nisland.numpy()
+    expected_labels = d.tree_island.numpy()
+    expected_sizes = d.island_nv.numpy()
+
+    island.island(m, d)
+
+    np.testing.assert_array_equal(d.nisland.numpy(), expected_nisland)
+    np.testing.assert_array_equal(d.tree_island.numpy(), expected_labels)
+    np.testing.assert_array_equal(d.island_nv.numpy(), expected_sizes)
+
+  def test_bitset_flood_fill_matches_generic(self):
+    """The small-tree bitset path exactly matches generic DFS labels and sizes."""
+    ntree = 32
+    nworld = 8
+    rng = np.random.default_rng(17)
+    tree_tree = np.zeros((nworld, ntree, ntree), dtype=np.int32)
+    for world in range(nworld):
+      edges = rng.random((ntree, ntree)) < 0.04 * world
+      edges = np.triu(edges)
+      tree_tree[world] = edges | edges.T
+
+    edge_bits = np.zeros((nworld, ntree), dtype=np.uint32)
+    for world in range(nworld):
+      for tree in range(ntree):
+        for neighbor in np.flatnonzero(tree_tree[world, tree]):
+          edge_bits[world, tree] |= np.uint32(1 << int(neighbor))
+
+    tree_dofnum = wp.array(1 + np.arange(ntree, dtype=np.int32) % 6, dtype=int)
+    tree_tree_wp = wp.array(tree_tree, dtype=int)
+    edge_bits_wp = wp.array(edge_bits, dtype=wp.uint32)
+
+    generic_nisland = wp.empty(nworld, dtype=int)
+    generic_labels = wp.full((nworld, ntree), -1, dtype=int)
+    generic_sizes = wp.zeros((nworld, ntree), dtype=int)
+    stack = wp.empty((nworld, ntree * ntree), dtype=int)
+    wp.launch(
+      island._flood_fill,
+      dim=nworld,
+      inputs=[ntree, tree_dofnum, tree_tree_wp, generic_labels, stack],
+      outputs=[generic_nisland, generic_labels, generic_sizes, stack],
+    )
+
+    bitset_nisland = wp.empty(nworld, dtype=int)
+    bitset_labels = wp.empty((nworld, ntree), dtype=int)
+    bitset_sizes = wp.empty((nworld, ntree), dtype=int)
+    wp.launch(
+      island._flood_fill_bitsets,
+      dim=nworld,
+      inputs=[ntree, tree_dofnum, edge_bits_wp],
+      outputs=[bitset_nisland, bitset_labels, bitset_sizes],
+    )
+
+    np.testing.assert_array_equal(bitset_nisland.numpy(), generic_nisland.numpy())
+    np.testing.assert_array_equal(bitset_labels.numpy(), generic_labels.numpy())
+    np.testing.assert_array_equal(bitset_sizes.numpy(), generic_sizes.numpy())
+
   def test_two_trees_one_constraint_one_island(self):
     """Two trees connected by one constraint form one island.
 
