@@ -4771,6 +4771,7 @@ def _gather_dof_vecs_compact(
 def _scatter_dof_vecs(
   # Data in:
   dof_cdof_in: wp.array2d[int],
+  qacc_smooth_in: wp.array2d[float],
   # In:
   qacc_c_in: wp.array2d[float],
   qfrc_constraint_c_in: wp.array2d[float],
@@ -4784,7 +4785,7 @@ def _scatter_dof_vecs(
     qacc_out[worldid, i] = qacc_c_in[worldid, ci]
     qfrc_constraint_out[worldid, i] = qfrc_constraint_c_in[worldid, ci]
   else:
-    qacc_out[worldid, i] = 0.0
+    qacc_out[worldid, i] = qacc_smooth_in[worldid, i]
     qfrc_constraint_out[worldid, i] = 0.0
 
 
@@ -4839,8 +4840,9 @@ def solve_compact(m: types.Model, d: types.Data):
   Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
   into nvmax_pad-sized dense workspaces, runs the stock dense Newton solver on a
   shallow-replaced (m, d) at nvmax_pad, then scatters qacc/qfrc_constraint back.
-  Inactive DOFs are frozen to 0. On the incremental Newton path the solver
-  kernels read the sparse M and J directly through the compaction maps.
+  Sleeping DOFs stay frozen while unconstrained trees keep their smooth acceleration.
+  On the incremental Newton path the solver kernels read the sparse M and J directly
+  through the compaction maps.
   """
   _compact_gather(m, d)
 
@@ -4920,15 +4922,15 @@ def _compact_gather(m: types.Model, d: types.Data):
 
 @event_scope
 def _compact_scatter(m: types.Model, d: types.Data):
-  # scatter results back to full DOF space (inactive frozen to 0) in one launch
+  # scatter results back to full DOF space in one launch
   wp.launch(
     _scatter_dof_vecs,
     dim=(d.nworld, m.nv),
-    inputs=[d.dof_cdof, d.cqacc, d.cqfrc_constraint],
+    inputs=[d.dof_cdof, d.qacc_smooth, d.cqacc, d.cqfrc_constraint],
     outputs=[d.qacc, d.qfrc_constraint],
   )
 
   # Refresh full d.efc.Ma = M @ qacc. The integrators (Euler/implicit damping) use Ma as
   # the RHS; the compact solve only populated the compacted Ma, so recompute it in full
-  # space. Inactive DOFs have qacc=0 so their Ma is 0 and they stay frozen.
+  # space.
   support.mul_m(m, d, d.efc.Ma, d.qacc)

@@ -1071,9 +1071,9 @@ def compute_island_mapping(m: types.Model, d: types.Data):
 
 # Active-DOF compaction (nvmax < nv).
 #
-# The active set is tracked per kinematic tree (the unit of coupling in the mass matrix)
-# via the same tree_awake bookkeeping used by the sleep solver. Each step the active trees'
-# DOFs are packed into the nvmax workspace so the dense factor/solve can run below nv.
+# The active set is tracked per kinematic tree (the unit of coupling in the mass matrix).
+# Each step the awake trees that own constraints are packed into the nvmax workspace so
+# the dense factor/solve can run below nv.
 # This is the active-set analog of compute_island_mapping.
 
 
@@ -1117,11 +1117,11 @@ def _compact_dof_layout(
   count = int(0)
   singleton_count = int(0)
   for t in range(ntree):
-    if tree_awake_in[worldid, t] == 1:
+    island_id = tree_island_in[worldid, t]
+    if tree_awake_in[worldid, t] == 1 and island_id >= 0:
       num = tree_dofnum[t]
       count += num
-      island_id = tree_island_in[worldid, t]
-      if num == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6):
+      if num == 6 and island_nv_in[worldid, island_id] == 6:
         singleton_count += 1
 
   if count > nvmax_in:
@@ -1170,7 +1170,7 @@ def _map_compact_dofs(
   cdof_dof_out: wp.array2d[int],
 ):
   worldid, treeid = wp.tid()
-  if tree_awake_in[worldid, treeid] == 0:
+  if tree_awake_in[worldid, treeid] == 0 or tree_island_in[worldid, treeid] < 0:
     return
 
   singleton_count = nsingleton6_in[worldid]
@@ -1183,21 +1183,17 @@ def _map_compact_dofs(
   general = int(0)
   singleton = int(0)
   for t in range(treeid):
-    if tree_awake_in[worldid, t] == 0:
-      continue
     island_id = tree_island_in[worldid, t]
-    is_singleton = (
-      singleton < singleton_count and tree_dofnum[t] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
-    )
+    if tree_awake_in[worldid, t] == 0 or island_id < 0:
+      continue
+    is_singleton = singleton < singleton_count and tree_dofnum[t] == 6 and island_nv_in[worldid, island_id] == 6
     if is_singleton:
       singleton += 1
     else:
       general += tree_dofnum[t]
 
   island_id = tree_island_in[worldid, treeid]
-  is_singleton = (
-    singleton < singleton_count and tree_dofnum[treeid] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
-  )
+  is_singleton = singleton < singleton_count and tree_dofnum[treeid] == 6 and island_nv_in[worldid, island_id] == 6
   start = general_end + 6 * singleton if is_singleton else general
   adr = tree_dofadr[treeid]
   for j in range(tree_dofnum[treeid]):
@@ -1210,7 +1206,7 @@ def _map_compact_dofs(
 
 @event_scope
 def update_active_dofs(m: types.Model, d: types.Data):
-  """Rebuild the compaction maps (dof_cdof / cdof_dof) from tree_awake."""
+  """Rebuild the compaction maps for awake trees that own constraints."""
   wp.launch(
     _reset_compact_maps,
     dim=(d.nworld, max(m.nv, d.nvmax_pad)),

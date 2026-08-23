@@ -1704,8 +1704,8 @@ class CompactSolverTest(absltest.TestCase):
     np.testing.assert_allclose(out[0, :2], baseline[0, :2], rtol=1e-4, atol=1e-5)
     np.testing.assert_array_equal(out[0, 2:], np.zeros(m.nv - 2))
 
-  def test_constrained_solve_equivalence_all_active(self):
-    """With every tree active and nvmax=nv, the compacted Newton solve matches baseline qacc."""
+  def test_constrained_solve_bypasses_unconstrained_tree(self):
+    """An awake constraint-free tree keeps its smooth acceleration outside the solve."""
     for cone in ("pyramidal", "elliptic"):
       with self.subTest(cone=cone):
         xml = _COMPACT_CONTACT_XML.replace('iterations="20"', f'iterations="20" cone="{cone}"')
@@ -1714,15 +1714,47 @@ class CompactSolverTest(absltest.TestCase):
         mjw.forward(m, d)  # full baseline solve (also builds efc.J, M)
         self.assertGreater(d.nacon.numpy()[0], 0)  # contacts exist
         baseline_qacc = d.qacc.numpy().copy()
+        baseline_qfrc_constraint = d.qfrc_constraint.numpy().copy()
 
+        island.island(m, d)
         d.tree_awake = wp.array(np.ones((d.nworld, m.ntree), dtype=int), dtype=int)
         island.update_active_dofs(m, d)
-        self.assertEqual(d.ncdof.numpy()[0], m.nv)
-        self.assertEqual(d.nsingleton6.numpy()[0], 0)
+        self.assertEqual(d.ncdof.numpy()[0], m.nv - 1)
+        self.assertEqual(d.dof_cdof.numpy()[0, 0], -1)
 
         solver.solve_compact(m, d)
 
         np.testing.assert_allclose(d.qacc.numpy(), baseline_qacc, rtol=1e-3, atol=1e-4)
+        np.testing.assert_allclose(d.qfrc_constraint.numpy(), baseline_qfrc_constraint, rtol=1e-3, atol=1e-4)
+
+  def test_all_unconstrained_trees_bypass_solver(self):
+    """Awake free trees keep smooth acceleration while sleeping trees remain frozen."""
+    _, _, m, d = _put_compact(
+      """
+      <mujoco>
+        <option jacobian="sparse" solver="Newton"/>
+        <worldbody>
+          <body pos="0 0 1"><freejoint/><geom type="sphere" size=".1"/></body>
+          <body pos="1 0 1"><freejoint/><geom type="sphere" size=".1"/></body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    mjw.forward(m, d)
+    d.tree_awake = wp.array([[1, 0]], dtype=int)
+    solver.smooth_solve_compact(m, d)
+    expected = d.qacc_smooth.numpy().copy()
+    island.island(m, d)
+    island.update_active_dofs(m, d)
+
+    self.assertEqual(d.ncdof.numpy()[0], 0)
+    self.assertGreater(np.linalg.norm(expected[0, :6]), 0.0)
+    np.testing.assert_array_equal(expected[0, 6:], np.zeros(6))
+
+    solver.solve_compact(m, d)
+
+    np.testing.assert_allclose(d.qacc.numpy(), expected, rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(d.qfrc_constraint.numpy(), np.zeros((1, m.nv)))
 
   def test_constrained_solve_singleton6_equivalence(self):
     """Singleton free bodies and a coupled pair match a full Newton step."""

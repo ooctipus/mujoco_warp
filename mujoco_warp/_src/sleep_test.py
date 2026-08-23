@@ -930,7 +930,7 @@ _ARM_XML = """
 
 
 class ActiveDofTest(absltest.TestCase):
-  """Tests that the sleep/wake state drives island.update_active_dofs (the active-DOF maps)."""
+  """Tests that awake, constrained trees drive the active-DOF maps."""
 
   def test_singleton_packing_retains_fitting_subset(self):
     """Six-DOF trees that fit beside the aligned general block stay specialized."""
@@ -954,7 +954,8 @@ class ActiveDofTest(absltest.TestCase):
       nvmax=49,
     )
     d.tree_awake = wp.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 0]], dtype=int)
-    d.tree_island.fill_(-1)
+    d.tree_island = wp.array([list(range(9)) + [-1]], dtype=int)
+    d.island_nv = wp.array([[1] + [6] * 8 + [0]], dtype=int)
 
     island.update_active_dofs(m, d)
 
@@ -998,9 +999,10 @@ class ActiveDofTest(absltest.TestCase):
 
     island.update_active_dofs(m, d)
 
-    # world 0: arm (2) + free body 1 (6) = 8; world 1: arm only = 2
-    np.testing.assert_array_equal(d.ncdof.numpy(), [8, 2])
-    np.testing.assert_array_equal(d.dof_cdof.numpy()[0][:8], np.arange(8))
+    self.assertEqual(d.tree_awake.numpy()[0, 1], 1)
+    # The force wakes the free body, but it has no constraints and needs no compact solve.
+    np.testing.assert_array_equal(d.ncdof.numpy(), [2, 2])
+    self.assertTrue((d.dof_cdof.numpy()[0][2:] == -1).all())
     self.assertTrue((d.dof_cdof.numpy()[1][2:] == -1).all())
 
   def _fake_contact(self, d, g0, g1):
@@ -1034,8 +1036,8 @@ class ActiveDofTest(absltest.TestCase):
 
     island.update_active_dofs(m, d)
 
-    # both free bodies awake = 6 + 6 = 12 DOFs
-    self.assertEqual(d.ncdof.numpy()[0], 12)
+    np.testing.assert_array_equal(d.tree_awake.numpy()[0, 1:], [1, 1])
+    self.assertEqual(d.ncdof.numpy()[0], 0)
 
   def test_resting_contact_does_not_wake(self):
     """A contact where both bodies are at rest does not wake them."""
@@ -1074,6 +1076,8 @@ class ActiveDofTest(absltest.TestCase):
     sleep.wake_collision(m, d)
     sleep.update_sleep(m, d)
 
+    d.tree_island = wp.array([[-1, 0, -1]], dtype=int)
+    d.island_nv = wp.array([[6, 0, 0]], dtype=int)
     island.update_active_dofs(m, d)
 
     # only tree 1 (ball0) wakes -> 6 DOFs
@@ -1087,6 +1091,8 @@ class ActiveDofTest(absltest.TestCase):
     m = mjwarp.put_model(mjm)
     d = mjwarp.put_data(mjm, mjd, nvmax=4)
     d.tree_awake = wp.array([[1, 1, 1]], dtype=int)
+    d.tree_island = wp.array([[0, 1, 2]], dtype=int)
+    d.island_nv = wp.array([[2, 6, 6]], dtype=int)
 
     island.update_active_dofs(m, d)
 
