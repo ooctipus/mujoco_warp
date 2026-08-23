@@ -84,7 +84,7 @@ def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
   alloc_h = m.opt.solver == types.SolverType.NEWTON
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
   alloc_mgrad = m.opt.solver == types.SolverType.CG
-  alloc_incremental = _use_incremental(m)
+  alloc_incremental = m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC
   alloc_quad = m.opt.cone == types.ConeType.ELLIPTIC
 
   return SolverContext(
@@ -1426,7 +1426,7 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
       m.opt.cone,
       fuse_jv,
       m.is_sparse,
-      _use_incremental(m),
+      m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC,
       fuse_constraint_update,
       bool(m.opt.warn_overflow),
     ),
@@ -1593,7 +1593,8 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, fuse_constrai
   # mv and jv are pure functions of the search direction, and M and J are
   # constant within a solve, so worlds whose search was kept reuse last
   # iteration's values.
-  skip = ctx.search_unchanged if _use_incremental(m) else ctx.done
+  incremental = m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC
+  skip = ctx.search_unchanged if incremental else ctx.done
 
   # Fuse small dense Jv unconditionally. Sparse Jv uses the world-warp path
   # only when the batch supplies enough independent warps to fill the GPU.
@@ -4202,11 +4203,6 @@ def _solve_done(warn_overflow: bool):
 _ALPHA_NOISE_EPS = 8.0 * 1.1920929e-07  # 8 * float32 eps
 
 
-def _use_incremental(m: types.Model) -> bool:
-  """Whether constraint state changes are tracked for incremental H updates."""
-  return m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC
-
-
 @wp.kernel(grid_stride=True)
 def _zero_change_counters(
   # Out:
@@ -4230,7 +4226,7 @@ def _solver_iteration(
 ):
   # The high-world-count sparse path can consume accepted constraint states
   # without rebuilding generalized constraint force in a separate pass.
-  incremental = _use_incremental(m)
+  incremental = m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC
   fuse_qfrc_gradient = (
     incremental
     and m.is_sparse
@@ -4483,7 +4479,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   #  context
   init_context(m, d, ctx, grad=True, compact=compact)
 
-  if _use_incremental(m):
+  if m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC:
     # A new solve computes a new search direction: invalidate the mv/jv reuse
     # left over from the previous solve.
     ctx.search_unchanged.zero_()
@@ -4518,7 +4514,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
   # the fast path leaves it stale, and the per-iteration zeroing wiped it for
   # worlds that converged early.
-  if _use_incremental(m):
+  if m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC:
     wp.launch(
       _qfrc_constraint_from_grad,
       dim=(d.nworld, m.nv),
