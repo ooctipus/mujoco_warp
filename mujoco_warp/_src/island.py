@@ -920,18 +920,19 @@ def _init_dof_arrays(
 
 @wp.kernel
 def _init_efc_arrays(
+  nefc_in: wp.array[int],
   efc_island_out: wp.array2d[int],
   map_efc2iefc_out: wp.array2d[int],
   map_iefc2efc_out: wp.array2d[int],
   iefc_islandid_out: wp.array2d[int],
-  efc_tree_out: wp.array2d[int],
 ):
   worldid, efcid = wp.tid()
   efc_island_out[worldid, efcid] = -1
+  if efcid >= nefc_in[worldid]:
+    return
   map_efc2iefc_out[worldid, efcid] = 0
   map_iefc2efc_out[worldid, efcid] = 0
   iefc_islandid_out[worldid, efcid] = -1
-  efc_tree_out[worldid, efcid] = -1
 
 
 @event_scope
@@ -979,8 +980,8 @@ def compute_island_mapping(m: types.Model, d: types.Data):
   wp.launch(
     _init_efc_arrays,
     dim=(d.nworld, d.njmax),
-    inputs=[],
-    outputs=[d.efc.island, d.map_efc2iefc, d.map_iefc2efc, d.efc_islandid, efc_tree],
+    inputs=[d.nefc],
+    outputs=[d.efc.island, d.map_efc2iefc, d.map_iefc2efc, d.efc_islandid],
   )
 
   wp.launch(
