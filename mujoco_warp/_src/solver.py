@@ -2662,6 +2662,64 @@ def _update_gradient_init_h_sparse(compact: bool):
   return kernel
 
 
+@cache_kernel
+def _update_gradient_init_h_sparse_blocks(tile_size: int):
+  TILE_SIZE = tile_size
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
+  def kernel(
+    # Model:
+    M_elemid: wp.array2d[int],
+    # Data in:
+    M_in: wp.array2d[float],
+    cdof_dof_in: wp.array2d[int],
+    ncdof_in: wp.array[int],
+    nsingleton6_in: wp.array[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    # Out:
+    ctx_h_out: wp.array3d[float],
+  ):
+    """Seed only the compact blocks consumed by the specialized Cholesky path."""
+    worldid, lane = wp.tid()
+    if ctx_done_in[worldid]:
+      return
+
+    singleton_count = nsingleton6_in[worldid]
+    general_size = ncdof_in[worldid] - 6 * singleton_count
+    general_end = int(0)
+    if general_size > 0:
+      general_end = ((general_size + wp.static(TILE_SIZE) - 1) // wp.static(TILE_SIZE)) * wp.static(TILE_SIZE)
+
+    general_entries = general_end * (general_end + 1) // 2
+    entries = general_entries + 21 * singleton_count
+    for entry in range(lane, entries, wp.block_dim()):
+      local_entry = entry
+      block_start = int(0)
+      if entry >= general_entries:
+        singleton_entry = entry - general_entries
+        block_start = general_end + 6 * (singleton_entry // 21)
+        local_entry = singleton_entry % 21
+
+      col = (int(wp.sqrt(float(8 * local_entry + 1))) - 1) // 2
+      row = local_entry - col * (col + 1) // 2
+      row += block_start
+      col += block_start
+
+      dof_row = cdof_dof_in[worldid, row]
+      dof_col = cdof_dof_in[worldid, col]
+      if dof_row < 0 or dof_col < 0:
+        ctx_h_out[worldid, row, col] = wp.where(row == col, 1.0, 0.0)
+      else:
+        elemid = M_elemid[wp.max(dof_row, dof_col), wp.min(dof_row, dof_col)]
+        if elemid >= 0:
+          ctx_h_out[worldid, row, col] = M_in[worldid, elemid]
+        else:
+          ctx_h_out[worldid, row, col] = 0.0
+
+  return kernel
+
+
 @wp.func
 def _state_check(D: float, state: int) -> float:
   if state == types.ConstraintState.QUADRATIC.value:
@@ -3710,12 +3768,21 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
     if m.is_sparse or sc:
       mj = ctx.compact_m_full if sc else m
       dj = ctx.compact_d_full if sc else d
-      wp.launch(
-        _update_gradient_init_h_sparse(sc),
-        dim=(d.nworld, m.nv_pad, m.nv_pad),
-        inputs=[mj.nv, mj.M_elemid, dj.M, dj.cdof_dof, ctx.done],
-        outputs=[ctx.h],
-      )
+      if sc and m.nv > _BLOCK_CHOLESKY_DIM:
+        wp.launch(
+          _update_gradient_init_h_sparse_blocks(types.TILE_SIZE_JTDAJ_DENSE),
+          dim=(d.nworld, 128),
+          inputs=[mj.M_elemid, dj.M, dj.cdof_dof, dj.ncdof, dj.nsingleton6, ctx.done],
+          outputs=[ctx.h],
+          block_dim=128,
+        )
+      else:
+        wp.launch(
+          _update_gradient_init_h_sparse(sc),
+          dim=(d.nworld, m.nv_pad, m.nv_pad),
+          inputs=[mj.nv, mj.M_elemid, dj.M, dj.cdof_dof, ctx.done],
+          outputs=[ctx.h],
+        )
 
       groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax)
       max_condim = 3
