@@ -1229,14 +1229,17 @@ class SolverFastPathTest(parameterized.TestCase):
   def test_delta_gradient_sparse(self):
     """Changed-row correction matches direct sparse J transpose evaluation."""
     nv = 4
-    J = np.array([1.0, -2.0, 0.5, 3.0, -1.5], dtype=np.float32)
-    rowadr = np.array([[0, 2, 4]], dtype=np.int32)
-    rownnz = np.array([[2, 2, 1]], dtype=np.int32)
-    colind = np.array([[[0, 2, 1, 2, 3]]], dtype=np.int32)
+    J = np.array([1.0, -2.0, 0.25, 0.5, 3.0, -1.5], dtype=np.float32)
+    rowadr = np.array([[0, 3, 5]], dtype=np.int32)
+    rownnz = np.array([[3, 2, 1]], dtype=np.int32)
+    colind = np.array([[[0, 1, 4, 2, 3, 0]]], dtype=np.int32)
+    dof_cdof = np.array([[2, -1, 0, 1, -1]], dtype=np.int32)
     jaref = np.array([[-0.2, 0.1, 1.0]], dtype=np.float32)
     D = np.array([[2.0, 3.0, 0.0]], dtype=np.float32)
     frictionloss = np.array([[0.0, 0.0, 0.5]], dtype=np.float32)
     force = np.array([[0.4, 0.0, -0.5]], dtype=np.float32)
+    qfrc_smooth = np.array([[0.1, 0.3, -0.2, 0.5]], dtype=np.float32)
+    Ma = np.array([[0.4, -0.2, 0.8, 1.1]], dtype=np.float32)
     old_state = np.array(
       [[types.ConstraintState.SATISFIED, types.ConstraintState.QUADRATIC, types.ConstraintState.LINEARNEG]],
       dtype=np.uint8,
@@ -1247,7 +1250,7 @@ class SolverFastPathTest(parameterized.TestCase):
 
     arrays = {
       "nefc": wp.array([3], dtype=int),
-      "qfrc_smooth": wp.zeros((1, nv), dtype=float),
+      "qfrc_smooth": wp.array(qfrc_smooth, dtype=float),
       "rownnz": wp.array(rownnz, dtype=int),
       "rowadr": wp.array(rowadr, dtype=int),
       "colind": wp.array(colind, dtype=int),
@@ -1255,8 +1258,8 @@ class SolverFastPathTest(parameterized.TestCase):
       "D": wp.array(D, dtype=float),
       "frictionloss": wp.array(frictionloss, dtype=float),
       "force": wp.array(force, dtype=float),
-      "Ma": wp.zeros((1, nv), dtype=float),
-      "dof_cdof": wp.array([[0, 1, 2, 3]], dtype=int),
+      "Ma": wp.array(Ma, dtype=float),
+      "dof_cdof": wp.array(dof_cdof, dtype=int),
       "state_changes": wp.array(old_state.astype(np.int32) * 3 + np.arange(3, dtype=np.int32), dtype=int),
       "changed_count": wp.array([3], dtype=int),
       "Jaref": wp.array(jaref, dtype=float),
@@ -1312,23 +1315,51 @@ class SolverFastPathTest(parameterized.TestCase):
     for efcid in range(3):
       start = rowadr[0, efcid]
       end = start + rownnz[0, efcid]
-      expected[colind[0, 0, start:end]] -= J[start:end] * (force[0, efcid] - predicted_force[efcid])
+      for sparseid in range(start, end):
+        cdof = dof_cdof[0, colind[0, 0, sparseid]]
+        if cdof >= 0:
+          expected[cdof] -= J[sparseid] * (force[0, efcid] - predicted_force[efcid])
     np.testing.assert_allclose(arrays["grad"].numpy()[0], expected, atol=1e-6, rtol=1e-6)
     self.assertAlmostEqual(arrays["grad_dot"].numpy()[0], float(expected @ expected), places=6)
     self.assertEqual(arrays["grad_scale"].numpy()[0], 1.0)
     self.assertFalse(arrays["search_unchanged"].numpy()[0])
 
+    stable_sigma = 0.8
+    stable_alpha = 0.2
+    stable_decrement = 2.0
+    expected_dot = float(expected @ expected)
     arrays["changed_count"].zero_()
+    arrays["alpha"].fill_(stable_alpha)
+    arrays["grad_scale"].fill_(stable_sigma)
+    arrays["grad_dot"].fill_(stable_sigma * stable_sigma * expected_dot)
+    arrays["decrement"].fill_(stable_decrement)
+    launch()
+    np.testing.assert_allclose(arrays["grad"].numpy()[0], expected, atol=1e-6, rtol=1e-6)
+    self.assertAlmostEqual(arrays["grad_scale"].numpy()[0], stable_sigma - stable_alpha, places=6)
+    self.assertAlmostEqual(arrays["grad_dot"].numpy()[0], (stable_sigma - stable_alpha) ** 2 * expected_dot, places=6)
+    self.assertAlmostEqual(
+      arrays["decrement"].numpy()[0],
+      stable_decrement * ((stable_sigma - stable_alpha) / stable_sigma) ** 2,
+      places=6,
+    )
+    self.assertTrue(arrays["search_unchanged"].numpy()[0])
+
     arrays["exhausted"].fill_(True)
     arrays["grad"].fill_(9.0)
     launch()
-    expected = np.zeros(nv, dtype=np.float32)
+    expected = (Ma - qfrc_smooth)[0]
     for efcid in range(3):
       start = rowadr[0, efcid]
       end = start + rownnz[0, efcid]
-      expected[colind[0, 0, start:end]] -= J[start:end] * force[0, efcid]
+      for sparseid in range(start, end):
+        cdof = dof_cdof[0, colind[0, 0, sparseid]]
+        if cdof >= 0:
+          expected[cdof] -= J[sparseid] * force[0, efcid]
     np.testing.assert_allclose(arrays["grad"].numpy()[0], expected, atol=1e-6, rtol=1e-6)
     self.assertAlmostEqual(arrays["grad_dot"].numpy()[0], float(expected @ expected), places=6)
+    self.assertEqual(arrays["grad_scale"].numpy()[0], 1.0)
+    self.assertEqual(arrays["decrement"].numpy()[0], 0.0)
+    self.assertFalse(arrays["search_unchanged"].numpy()[0])
 
   @parameterized.parameters(False, True)
   def test_fast_path_friction_transitions(self, compact):
