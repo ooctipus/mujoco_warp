@@ -1608,19 +1608,19 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, fuse_constrai
       _linesearch_mv_jv_sparse_compact,
       dim=(d.nworld, max(d.njmax, m.nv)),
       inputs=[
+        m.nv,
         mfull.M_mulm_rowadr,
         mfull.M_mulm_col,
         mfull.M_mulm_madr,
-        dfull.M,
-        dfull.dof_cdof,
-        dfull.cdof_dof,
         d.nefc,
+        dfull.M,
         dfull.efc.J_rownnz,
         dfull.efc.J_rowadr,
         dfull.efc.J_colind,
         dfull.efc.J,
+        dfull.dof_cdof,
+        dfull.cdof_dof,
         d.njmax,
-        m.nv,
         ctx.search,
         skip,
       ],
@@ -2672,9 +2672,9 @@ def _update_gradient_init_h_sparse_blocks(tile_size: int):
     M_elemid: wp.array2d[int],
     # Data in:
     M_in: wp.array2d[float],
-    cdof_dof_in: wp.array2d[int],
     ncdof_in: wp.array[int],
     nsingleton6_in: wp.array[int],
+    cdof_dof_in: wp.array2d[int],
     # In:
     ctx_done_in: wp.array[bool],
     # Out:
@@ -3772,7 +3772,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         wp.launch(
           _update_gradient_init_h_sparse_blocks(types.TILE_SIZE_JTDAJ_DENSE),
           dim=(d.nworld, 128),
-          inputs=[mj.M_elemid, dj.M, dj.cdof_dof, dj.ncdof, dj.nsingleton6, ctx.done],
+          inputs=[mj.M_elemid, dj.M, dj.ncdof, dj.nsingleton6, dj.cdof_dof, ctx.done],
           outputs=[ctx.h],
           block_dim=128,
         )
@@ -4594,20 +4594,20 @@ def _mul_m_sparse_compact(
 @wp.kernel
 def _linesearch_mv_jv_sparse_compact(
   # Model:
+  nv: int,
   M_mulm_rowadr: wp.array[int],
   M_mulm_col: wp.array[int],
   M_mulm_madr: wp.array[int],
   # Data in:
+  nefc_in: wp.array[int],
   M_in: wp.array2d[float],
+  efc_J_rownnz_in: wp.array2d[int],
+  efc_J_rowadr_in: wp.array2d[int],
+  efc_J_colind_in: wp.array3d[int],
+  efc_J_in: wp.array3d[float],
   dof_cdof_in: wp.array2d[int],
   cdof_dof_in: wp.array2d[int],
-  nefc_in: wp.array[int],
-  J_rownnz_in: wp.array2d[int],
-  J_rowadr_in: wp.array2d[int],
-  J_colind_in: wp.array3d[int],
-  J_in: wp.array3d[float],
-  njmax: int,
-  nv: int,
+  njmax_in: int,
   # In:
   search_in: wp.array2d[float],
   skip_in: wp.array[bool],
@@ -4633,14 +4633,14 @@ def _linesearch_mv_jv_sparse_compact(
           mv += M_in[worldid, M_mulm_madr[k]] * search_in[worldid, compact_col]
     mv_out[worldid, row] = mv
 
-  if row < wp.min(nefc_in[worldid], njmax):
+  if row < wp.min(nefc_in[worldid], njmax_in):
     jv = float(0.0)
-    rowadr = J_rowadr_in[worldid, row]
-    for k in range(J_rownnz_in[worldid, row]):
+    rowadr = efc_J_rowadr_in[worldid, row]
+    for k in range(efc_J_rownnz_in[worldid, row]):
       sparseid = rowadr + k
-      compact_col = dof_cdof_in[worldid, J_colind_in[worldid, 0, sparseid]]
+      compact_col = dof_cdof_in[worldid, efc_J_colind_in[worldid, 0, sparseid]]
       if compact_col >= 0:
-        jv += J_in[worldid, 0, sparseid] * search_in[worldid, compact_col]
+        jv += efc_J_in[worldid, 0, sparseid] * search_in[worldid, compact_col]
     jv_out[worldid, row] = jv
 
 
