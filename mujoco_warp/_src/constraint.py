@@ -4209,10 +4209,10 @@ def _efc_contact_jac_dense_flex(tile_size: int, cone_type: types.ConeType):
 
 
 @cache_kernel
-def _efc_contact_update(cone_type: types.ConeType, world_warp: bool, flg_adhesion: bool):
+def _efc_contact_update(cone_type: types.ConeType, world_lanes: int, flg_adhesion: bool):
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
-  WORLD_WARP = world_warp
-  EFC_STRIDE = 32 if world_warp else 1
+  WORLD_WARP = world_lanes > 1
+  EFC_STRIDE = world_lanes
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=True)
   def kernel(
@@ -5490,6 +5490,7 @@ def make_constraint(m: types.Model, d: types.Data):
     if not (m.opt.disableflags & types.DisableBit.CONTACT):
       nmaxdim = int(m.nmaxpyramid) if m.opt.cone == types.ConeType.PYRAMIDAL else int(m.nmaxcondim)
       world_warp = launch_world_warp_enabled(d.nworld, d.qvel.device)
+      world_lanes = _contact_jac_world_lanes(d.nworld, d.qvel.device) if world_warp else 1
 
       # Reinterpret to avoid unnecessary loads
       contact_frame_2d = wp.array(
@@ -5645,7 +5646,6 @@ def make_constraint(m: types.Model, d: types.Data):
             ],
           )
         else:
-          world_lanes = _contact_jac_world_lanes(d.nworld, d.qvel.device) if world_warp else 1
           wp.launch(
             _efc_contact_jac_sparse(m.opt.cone, world_lanes),
             dim=(d.nworld, world_lanes) if world_warp else (d.naconmax, nmaxdim),
@@ -5844,8 +5844,8 @@ def make_constraint(m: types.Model, d: types.Data):
         )
       else:
         wp.launch(
-          _efc_contact_update(m.opt.cone, world_warp, m.flg_adhesion),
-          dim=(d.nworld, 32) if world_warp else (d.naconmax, nmaxdim),
+          _efc_contact_update(m.opt.cone, world_lanes, m.flg_adhesion),
+          dim=(d.nworld, world_lanes) if world_warp else (d.naconmax, nmaxdim),
           inputs=[
             m.opt.timestep,
             m.opt.disableflags,
