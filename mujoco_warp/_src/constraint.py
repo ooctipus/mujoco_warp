@@ -3188,68 +3188,61 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, world_warp: bool):
 
       Jqvel = float(0.0)
       nnz = int(0)
-      dofid = int(da)
 
-      while True:
-        if nnz >= rownnz:
-          break
+      while nnz < rownnz:
+        # Common ancestors are excluded from rownnz, so one body owns this DOF.
+        body = body2
+        sign = float(1.0)
+        if da1 == da:
+          body = body1
+          sign = -1.0
 
-        if dofid == da:
-          # Common ancestors are excluded from rownnz, so one body owns this DOF.
-          body = body2
-          sign = float(1.0)
-          if da1 == da:
-            body = body1
-            sign = -1.0
+        cdof = cdof_in[worldid, da]
+        cdof_ang = wp.spatial_top(cdof)
+        offset = con_pos - subtree_com_in[worldid, body_rootid[body]]
+        jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
+        jacr_dif = cdof_ang * sign
 
-          cdof = cdof_in[worldid, dofid]
-          cdof_ang = wp.spatial_top(cdof)
-          offset = con_pos - subtree_com_in[worldid, body_rootid[body]]
-          jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
-          jacr_dif = cdof_ang * sign
-
-          if wp.static(IS_ELLIPTIC):
-            J = float(0.0)
-            if dimid < 3:
-              frame_row = frame_in[conid, dimid]
-              for xyz in range(3):
-                J += frame_row[xyz] * jacp_dif[xyz]
-            else:
-              frame_row = frame_in[conid, dimid - 3]
-              for xyz in range(3):
-                J += frame_row[xyz] * jacr_dif[xyz]
-          else:
-            J = float(0.0)
-            Ji = float(0.0)
-
+        if wp.static(IS_ELLIPTIC):
+          J = float(0.0)
+          if dimid < 3:
+            frame_row = frame_in[conid, dimid]
             for xyz in range(3):
-              J += frame_0[xyz] * jacp_dif[xyz]
+              J += frame_row[xyz] * jacp_dif[xyz]
+          else:
+            frame_row = frame_in[conid, dimid - 3]
+            for xyz in range(3):
+              J += frame_row[xyz] * jacr_dif[xyz]
+        else:
+          J = float(0.0)
+          Ji = float(0.0)
 
-              if condim > 1:
-                if dimid2 < 3:
-                  Ji += frame_in[conid, dimid2][xyz] * jacp_dif[xyz]
-                else:
-                  Ji += frame_in[conid, dimid2 - 3][xyz] * jacr_dif[xyz]
+          for xyz in range(3):
+            J += frame_0[xyz] * jacp_dif[xyz]
 
             if condim > 1:
-              if dimid % 2 == 0:
-                J += Ji * frii
+              if dimid2 < 3:
+                Ji += frame_in[conid, dimid2][xyz] * jacp_dif[xyz]
               else:
-                J -= Ji * frii
+                Ji += frame_in[conid, dimid2 - 3][xyz] * jacr_dif[xyz]
 
-          sparseid = rowadr + nnz
-          efc_J_colind_out[worldid, 0, sparseid] = dofid
-          efc_J_out[worldid, 0, sparseid] = J
-          nnz += 1
-          Jqvel += J * qvel_in[worldid, dofid]
+          if condim > 1:
+            if dimid % 2 == 0:
+              J += Ji * frii
+            else:
+              J -= Ji * frii
 
-          # Advance tree pointers and recompute da for next iteration
-          if da1 == da:
-            da1 = dof_parentid[da1]
-          if da2 == da:
-            da2 = dof_parentid[da2]
-          da = wp.max(da1, da2)
-          dofid = da
+        sparseid = rowadr + nnz
+        efc_J_colind_out[worldid, 0, sparseid] = da
+        efc_J_out[worldid, 0, sparseid] = J
+        nnz += 1
+        Jqvel += J * qvel_in[worldid, da]
+
+        if da1 == da:
+          da1 = dof_parentid[da1]
+        if da2 == da:
+          da2 = dof_parentid[da2]
+        da = wp.max(da1, da2)
 
       efc_Jqvel_out[worldid, efcid] = Jqvel
 
