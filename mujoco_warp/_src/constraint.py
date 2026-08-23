@@ -32,6 +32,8 @@ from mujoco_warp._src.warp_util import launch_world_warp_enabled
 
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
+_CONTACT_JAC_WORLD_BLOCK_DIM = 128
+
 
 @wp.func
 def _add_weight(
@@ -3098,11 +3100,23 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
   return kernel
 
 
+def _contact_jac_world_lanes(nworld: int, device) -> int:
+  """Select the fewest lanes per world that supply four block waves."""
+  lanes = 32
+  target_blocks = 4 * device.sm_count
+  while lanes < _CONTACT_JAC_WORLD_BLOCK_DIM:
+    num_blocks = (nworld * lanes + _CONTACT_JAC_WORLD_BLOCK_DIM - 1) // _CONTACT_JAC_WORLD_BLOCK_DIM
+    if num_blocks >= target_blocks:
+      break
+    lanes *= 2
+  return lanes
+
+
 @cache_kernel
-def _efc_contact_jac_sparse(cone_type: types.ConeType, world_warp: bool):
+def _efc_contact_jac_sparse(cone_type: types.ConeType, world_lanes: int):
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
-  WORLD_WARP = world_warp
-  EFC_STRIDE = 32 if world_warp else 1
+  WORLD_WARP = world_lanes > 1
+  EFC_STRIDE = world_lanes
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
@@ -5631,9 +5645,10 @@ def make_constraint(m: types.Model, d: types.Data):
             ],
           )
         else:
+          world_lanes = _contact_jac_world_lanes(d.nworld, d.qvel.device) if world_warp else 1
           wp.launch(
-            _efc_contact_jac_sparse(m.opt.cone, world_warp),
-            dim=(d.nworld, 32) if world_warp else (d.naconmax, nmaxdim),
+            _efc_contact_jac_sparse(m.opt.cone, world_lanes),
+            dim=(d.nworld, world_lanes) if world_warp else (d.naconmax, nmaxdim),
             inputs=[
               m.body_rootid,
               m.body_weldid,
@@ -5666,6 +5681,7 @@ def make_constraint(m: types.Model, d: types.Data):
               d.efc.J,
               d.efc.Jqvel,
             ],
+            block_dim=_CONTACT_JAC_WORLD_BLOCK_DIM,
           )
       else:
         d.efc.Jqvel.zero_()
