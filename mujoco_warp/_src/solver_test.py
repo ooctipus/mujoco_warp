@@ -1701,6 +1701,21 @@ class CompactSolverTest(absltest.TestCase):
     for field in ("qpos", "qvel", "qacc"):
       np.testing.assert_allclose(getattr(d, field).numpy(), getattr(baseline_d, field).numpy(), rtol=1e-3, atol=1e-4)
 
+  def test_constrained_solve_promoted_singleton_equivalence(self):
+    """A singleton folded into the general prefix preserves the Newton solve."""
+    _, _, m, d = _put_compact(_COMPACT_SINGLETON_XML, nvmax=27)
+    d.eq_active.zero_()
+    mjw.forward(m, d)
+    baseline_qacc = d.qacc.numpy().copy()
+
+    island.island(m, d)
+    d.tree_awake = wp.array([[1, 1, 1, 1, 0]], dtype=int)
+    island.update_active_dofs(m, d)
+    self.assertEqual(d.nsingleton6.numpy()[0], 2)
+    solver.solve_compact(m, d)
+
+    np.testing.assert_allclose(d.qacc.numpy()[0, :27], baseline_qacc[0, :27], rtol=1e-3, atol=1e-4)
+
   def test_solve_compact_populates_islands(self):
     """When using the compact solver via mjw.solve, island mapping fields are updated."""
     mjm = mujoco.MjModel.from_xml_string(_COMPACT_CONTACT_XML)
