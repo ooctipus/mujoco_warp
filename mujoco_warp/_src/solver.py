@@ -2672,6 +2672,14 @@ def _active_check(tid: int, threshold: int) -> float:
     return 1.0
 
 
+@wp.func
+def _active_value(value: float, tid: int, threshold: int) -> float:
+  if tid >= threshold:
+    return 0.0
+  else:
+    return value
+
+
 @cache_kernel
 def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njmax: int):
   """Compact-path variant of _update_gradient_JTDAJ_dense_tiled.
@@ -3127,22 +3135,42 @@ def _update_gradient_cholesky_general(tile_size: int, matrix_size: int, force_fa
     size = ncdof_in[worldid] - 6 * nsingleton6_in[worldid]
     if size > 0:
       size = ((size + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
-
-    if wp.static(FORCE_FACTOR) or quad_changed_count_in[worldid] > 0:
-      wp.static(create_blocked_cholesky_factorize_solve_func(TILE_SIZE, matrix_size))(
-        ctx_h_in[worldid],
-        ctx_grad_in[worldid],
-        size,
-        ctx_hfactor_out[worldid],
-        ctx_solution_out[worldid],
-      )
     else:
-      wp.static(create_blocked_cholesky_solve_func(TILE_SIZE, matrix_size))(
-        ctx_hfactor_out[worldid],
-        ctx_grad_in[worldid],
-        size,
-        ctx_solution_out[worldid],
-      )
+      return
+
+    # Most compact worlds fit in two tiles; larger systems keep the full-capacity path.
+    if wp.static(FORCE_FACTOR) or quad_changed_count_in[worldid] > 0:
+      if size <= wp.static(_BLOCK_CHOLESKY_DIM):
+        wp.static(create_blocked_cholesky_factorize_solve_func(TILE_SIZE, _BLOCK_CHOLESKY_DIM))(
+          ctx_h_in[worldid],
+          ctx_grad_in[worldid],
+          size,
+          ctx_hfactor_out[worldid],
+          ctx_solution_out[worldid],
+        )
+      else:
+        wp.static(create_blocked_cholesky_factorize_solve_func(TILE_SIZE, matrix_size))(
+          ctx_h_in[worldid],
+          ctx_grad_in[worldid],
+          size,
+          ctx_hfactor_out[worldid],
+          ctx_solution_out[worldid],
+        )
+    else:
+      if size <= wp.static(_BLOCK_CHOLESKY_DIM):
+        wp.static(create_blocked_cholesky_solve_func(TILE_SIZE, _BLOCK_CHOLESKY_DIM))(
+          ctx_hfactor_out[worldid],
+          ctx_grad_in[worldid],
+          size,
+          ctx_solution_out[worldid],
+        )
+      else:
+        wp.static(create_blocked_cholesky_solve_func(TILE_SIZE, matrix_size))(
+          ctx_hfactor_out[worldid],
+          ctx_grad_in[worldid],
+          size,
+          ctx_solution_out[worldid],
+        )
 
   return kernel
 
@@ -3254,7 +3282,7 @@ def _finish_gradient_cholesky_singletons(tile_size: int, vector_size: int, skip_
     index = wp.tile_arange(wp.static(vector_size), dtype=int)
     active = wp.tile_ones(shape=wp.static(vector_size), dtype=int) * active_size
     solution = wp.tile_load(ctx_solution_out[worldid], shape=wp.static(vector_size), bounds_check=False)
-    solution = wp.tile_map(wp.mul, solution, wp.tile_map(_active_check, index, active))
+    solution = wp.tile_map(_active_value, solution, index, active)
     grad = wp.tile_load(ctx_grad_in[worldid], shape=wp.static(vector_size), bounds_check=False)
     sums = wp.tile_reduce(wp.add, wp.tile_map(solve_search_sums, grad, solution))[0]
     ctx_search_dot_out[worldid] = sums[0]
