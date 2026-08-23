@@ -4224,7 +4224,7 @@ def _solver_iteration(
           ctx.done,
         ],
         outputs=[ctx.grad, ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
-        block_dim=32,
+        block_dim=128,
       )
 
   if incremental:
