@@ -1595,17 +1595,42 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, fuse_constrai
   # iteration's values.
   skip = ctx.search_unchanged if _use_incremental(m) else ctx.done
 
-  # mv = M @ search (common to both parallel and iterative)
-  _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip)
-
   # Fuse small dense Jv unconditionally. Sparse Jv uses the world-warp path
   # only when the batch supplies enough independent warps to fill the GPU.
   sc = _sparse_compact(ctx)
   world_warp = launch_world_warp_enabled(d.nworld, d.qacc.device)
   fuse_jv = m.nv <= 50 and not sc and (not m.is_sparse or world_warp)
 
+  if sc:
+    dfull = ctx.compact_d_full
+    mfull = ctx.compact_m_full
+    wp.launch(
+      _linesearch_mv_jv_sparse_compact,
+      dim=(d.nworld, max(d.njmax, m.nv)),
+      inputs=[
+        mfull.M_mulm_rowadr,
+        mfull.M_mulm_col,
+        mfull.M_mulm_madr,
+        dfull.M,
+        dfull.dof_cdof,
+        dfull.cdof_dof,
+        d.nefc,
+        dfull.efc.J_rownnz,
+        dfull.efc.J_rowadr,
+        dfull.efc.J_colind,
+        dfull.efc.J,
+        d.njmax,
+        m.nv,
+        ctx.search,
+        skip,
+      ],
+      outputs=[ctx.mv, ctx.jv],
+    )
+  else:
+    _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip)
+
   # jv = J @ search (when not fused into iterative kernel)
-  if not fuse_jv:
+  if not fuse_jv and not sc:
     dj = ctx.compact_d_full if sc else d
     if sc or m.is_sparse:
       # Sparse J has few nonzeros per row, one thread handles them all.
@@ -4496,6 +4521,59 @@ def _mul_m_sparse_compact(
     if cj >= 0:
       acc += M_in[worldid, M_mulm_madr[k]] * vec[worldid, cj]
   res[worldid, ci] = acc
+
+
+@wp.kernel
+def _linesearch_mv_jv_sparse_compact(
+  # Model:
+  M_mulm_rowadr: wp.array[int],
+  M_mulm_col: wp.array[int],
+  M_mulm_madr: wp.array[int],
+  # Data in:
+  M_in: wp.array2d[float],
+  dof_cdof_in: wp.array2d[int],
+  cdof_dof_in: wp.array2d[int],
+  nefc_in: wp.array[int],
+  J_rownnz_in: wp.array2d[int],
+  J_rowadr_in: wp.array2d[int],
+  J_colind_in: wp.array3d[int],
+  J_in: wp.array3d[float],
+  njmax: int,
+  nv: int,
+  # In:
+  search_in: wp.array2d[float],
+  skip_in: wp.array[bool],
+  # Out:
+  mv_out: wp.array2d[float],
+  jv_out: wp.array2d[float],
+):
+  """Compute compact M @ search and J @ search with one row-parallel launch."""
+  worldid, row = wp.tid()
+
+  if skip_in[worldid]:
+    return
+
+  if row < nv:
+    dof = cdof_dof_in[worldid, row]
+    mv = float(0.0)
+    if dof >= 0:
+      start = M_mulm_rowadr[dof]
+      end = M_mulm_rowadr[dof + 1]
+      for k in range(start, end):
+        compact_col = dof_cdof_in[worldid, M_mulm_col[k]]
+        if compact_col >= 0:
+          mv += M_in[worldid, M_mulm_madr[k]] * search_in[worldid, compact_col]
+    mv_out[worldid, row] = mv
+
+  if row < wp.min(nefc_in[worldid], njmax):
+    jv = float(0.0)
+    rowadr = J_rowadr_in[worldid, row]
+    for k in range(J_rownnz_in[worldid, row]):
+      sparseid = rowadr + k
+      compact_col = dof_cdof_in[worldid, J_colind_in[worldid, 0, sparseid]]
+      if compact_col >= 0:
+        jv += J_in[worldid, 0, sparseid] * search_in[worldid, compact_col]
+    jv_out[worldid, row] = jv
 
 
 def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
