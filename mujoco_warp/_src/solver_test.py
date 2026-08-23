@@ -1371,7 +1371,8 @@ class SolverFastPathTest(parameterized.TestCase):
     mjd = mujoco.MjData(mjm)
     mujoco.mj_forward(mjm, mjd)
     m = mjw.put_model(mjm)
-    nworld = 64
+    device = wp.get_device()
+    nworld = max(64, 4 * device.sm_count) if compact and device.is_cuda else 64
     d = mjw.put_data(mjm, mjd, nworld=nworld, nvmax=mjm.nv if compact else None)
     rng = np.random.default_rng(3)
     qvel = rng.uniform(-8.0, 8.0, size=(nworld, mjm.nv)).astype(np.float32)

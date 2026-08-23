@@ -4161,11 +4161,10 @@ def _solver_iteration(
   nsolving: wp.array[int],
   compact: bool = False,
 ):
-  # Fuse the high-world-count sparse pyramidal Newton path: it already computes
-  # Jv and accepted Jaref in one warp per world. Low-occupancy, compact/island,
-  # elliptic, dense, CG, and large-nv paths retain the generic launches.
+  # The high-world-count sparse path can consume accepted constraint states
+  # without rebuilding generalized constraint force in a separate pass.
   incremental = _use_incremental(m)
-  fuse_constraint_update = (
+  fuse_qfrc_gradient = (
     incremental
     and m.is_sparse
     and not compact
@@ -4175,7 +4174,8 @@ def _solver_iteration(
     and launch_world_warp_enabled(d.nworld, d.qacc.device)
   )
   delta_gradient = incremental and _sparse_compact(ctx) and launch_world_warp_enabled(d.nworld, d.qacc.device)
-  _linesearch(m, d, ctx, fuse_constraint_update)
+  fuse_constraint_state = fuse_qfrc_gradient or delta_gradient
+  _linesearch(m, d, ctx, fuse_constraint_state)
 
   # Incremental H is only valid for non-elliptic cones. The elliptic cone
   # path in _update_constraint_efc has early returns that skip state change
@@ -4185,7 +4185,7 @@ def _solver_iteration(
   # flips this iteration were exactly quadratic over the step, so grad/search
   # only changed by a scalar along the same ray. Skip their qfrc/grad/
   # solve/search updates and track the scalar in ctx.grad_scale.
-  if fuse_constraint_update:
+  if fuse_qfrc_gradient:
     wp.launch_tiled(
       _update_constraint_qfrc_gradient_sparse_world_warp(m.nv),
       dim=d.nworld,
@@ -4214,14 +4214,15 @@ def _solver_iteration(
       block_dim=32,
     )
   else:
-    _update_constraint(
-      m,
-      d,
-      ctx,
-      track_changes=incremental,
-      stable_fast=incremental,
-      update_qfrc=not delta_gradient,
-    )
+    if not fuse_constraint_state:
+      _update_constraint(
+        m,
+        d,
+        ctx,
+        track_changes=incremental,
+        stable_fast=incremental,
+        update_qfrc=not delta_gradient,
+      )
     if delta_gradient:
       dj = ctx.compact_d_full
       wp.launch_tiled(
@@ -4258,7 +4259,7 @@ def _solver_iteration(
       d,
       ctx,
       stable_fast=incremental,
-      qfrc_grad_ready=fuse_constraint_update or delta_gradient,
+      qfrc_grad_ready=fuse_qfrc_gradient or delta_gradient,
     )
   else:
     _update_gradient(m, d, ctx, compact=compact)
