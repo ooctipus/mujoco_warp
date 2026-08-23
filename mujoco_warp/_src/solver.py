@@ -39,6 +39,7 @@ from mujoco_warp._src.warp_util import launch_world_warp_enabled
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
 _BLOCK_CHOLESKY_DIM = 32
+_LINESEARCH_MV_JV_ROW_SPAN = 512
 
 
 def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
@@ -1607,7 +1608,7 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, fuse_constrai
     mfull = ctx.compact_m_full
     wp.launch(
       _linesearch_mv_jv_sparse_compact,
-      dim=(d.nworld, max(d.njmax, m.nv)),
+      dim=(d.nworld, _LINESEARCH_MV_JV_ROW_SPAN),
       inputs=[
         m.nv,
         mfull.M_mulm_rowadr,
@@ -1626,6 +1627,7 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, fuse_constrai
         skip,
       ],
       outputs=[ctx.mv, ctx.jv],
+      block_dim=128,
     )
   else:
     _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip)
@@ -4603,7 +4605,7 @@ def _mul_m_sparse_compact(
   res[worldid, ci] = acc
 
 
-@wp.kernel
+@wp.kernel(module="unique", enable_backward=False, grid_stride=False)
 def _linesearch_mv_jv_sparse_compact(
   # Model:
   nv: int,
@@ -4627,33 +4629,35 @@ def _linesearch_mv_jv_sparse_compact(
   mv_out: wp.array2d[float],
   jv_out: wp.array2d[float],
 ):
-  """Compute compact M @ search and J @ search with one row-parallel launch."""
-  worldid, row = wp.tid()
+  """Compute compact M @ search and J @ search with a bounded row-parallel launch."""
+  worldid, lane = wp.tid()
 
   if skip_in[worldid]:
     return
 
-  if row < nv:
-    dof = cdof_dof_in[worldid, row]
-    mv = float(0.0)
-    if dof >= 0:
-      start = M_mulm_rowadr[dof]
-      end = M_mulm_rowadr[dof + 1]
-      for k in range(start, end):
-        compact_col = dof_cdof_in[worldid, M_mulm_col[k]]
-        if compact_col >= 0:
-          mv += M_in[worldid, M_mulm_madr[k]] * search_in[worldid, compact_col]
-    mv_out[worldid, row] = mv
+  nefc = wp.min(nefc_in[worldid], njmax_in)
+  for row in range(lane, wp.max(nv, nefc), wp.static(_LINESEARCH_MV_JV_ROW_SPAN)):
+    if row < nv:
+      dof = cdof_dof_in[worldid, row]
+      mv = float(0.0)
+      if dof >= 0:
+        start = M_mulm_rowadr[dof]
+        end = M_mulm_rowadr[dof + 1]
+        for k in range(start, end):
+          compact_col = dof_cdof_in[worldid, M_mulm_col[k]]
+          if compact_col >= 0:
+            mv += M_in[worldid, M_mulm_madr[k]] * search_in[worldid, compact_col]
+      mv_out[worldid, row] = mv
 
-  if row < wp.min(nefc_in[worldid], njmax_in):
-    jv = float(0.0)
-    rowadr = efc_J_rowadr_in[worldid, row]
-    for k in range(efc_J_rownnz_in[worldid, row]):
-      sparseid = rowadr + k
-      compact_col = dof_cdof_in[worldid, efc_J_colind_in[worldid, 0, sparseid]]
-      if compact_col >= 0:
-        jv += efc_J_in[worldid, 0, sparseid] * search_in[worldid, compact_col]
-    jv_out[worldid, row] = jv
+    if row < nefc:
+      jv = float(0.0)
+      rowadr = efc_J_rowadr_in[worldid, row]
+      for k in range(efc_J_rownnz_in[worldid, row]):
+        sparseid = rowadr + k
+        compact_col = dof_cdof_in[worldid, efc_J_colind_in[worldid, 0, sparseid]]
+        if compact_col >= 0:
+          jv += efc_J_in[worldid, 0, sparseid] * search_in[worldid, compact_col]
+      jv_out[worldid, row] = jv
 
 
 def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
