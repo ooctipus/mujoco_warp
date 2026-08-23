@@ -5681,7 +5681,7 @@ def make_constraint(m: types.Model, d: types.Data):
               d.efc.J,
               d.efc.Jqvel,
             ],
-            block_dim=_CONTACT_JAC_WORLD_BLOCK_DIM,
+            block_dim=_CONTACT_JAC_WORLD_BLOCK_DIM if world_warp else 256,
           )
       else:
         d.efc.Jqvel.zero_()
