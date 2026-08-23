@@ -104,7 +104,7 @@ class BlockDim:
   update_gradient_cholesky_blocked: int = 64
   update_gradient_JTDAJ_sparse: int = 128
   update_gradient_JTDAJ_dense: int = 128
-  linesearch_iterative: int = 32
+  linesearch_iterative: int = 128
   update_gradient_grad: int = 256
   solve_beta_accumulate: int = 256
   solve_search_update_cg: int = 256
