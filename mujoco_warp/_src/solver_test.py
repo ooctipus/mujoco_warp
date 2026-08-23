@@ -1515,9 +1515,6 @@ class CompactSolverTest(absltest.TestCase):
     baseline = d.qacc_smooth.numpy().copy()
 
     d.tree_awake = wp.array(np.ones((d.nworld, m.ntree), dtype=int), dtype=int)
-    island.update_active_dofs(m, d)
-    self.assertEqual(d.ncdof.numpy()[0], m.nv)
-
     solver.smooth_solve_compact(m, d)
 
     np.testing.assert_allclose(d.qacc_smooth.numpy(), baseline, rtol=1e-4, atol=1e-5)
@@ -1530,9 +1527,6 @@ class CompactSolverTest(absltest.TestCase):
 
     # only the actuated arm tree (dofs 0-1) is active
     d.tree_awake = wp.array([[1, 0, 0]], dtype=int)
-    island.update_active_dofs(m, d)
-    self.assertEqual(d.ncdof.numpy()[0], 2)
-
     solver.smooth_solve_compact(m, d)
 
     out = d.qacc_smooth.numpy()

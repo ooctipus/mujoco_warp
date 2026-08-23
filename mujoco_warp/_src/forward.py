@@ -1314,9 +1314,6 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
   xfrc_accumulate(m, d, d.qfrc_smooth)
 
   if enable_sleep:
-    # update the active-DOF set (needs contacts from fwd_position) and solve
-    # the smooth acceleration in compacted dense space.
-    island.update_active_dofs(m, d)
     solver.smooth_solve_compact(m, d)
   elif factorize:
     smooth.factor_solve_i(m, d, d.M, d.qLD, d.qLDiagInv, d.qacc_smooth, d.qfrc_smooth)

@@ -4351,71 +4351,35 @@ def _gather_M_sparse(
 
 
 @wp.kernel
-def _gather_rhs_compact(
+def _freeze_sleeping_dofs(
+  # Model:
+  body_treeid: wp.array[int],
+  dof_bodyid: wp.array[int],
   # Data in:
-  cdof_dof_in: wp.array2d[int],
-  # In:
-  vec_in: wp.array2d[float],
-  # Out:
-  rhs_out: wp.array3d[float],
+  tree_awake_in: wp.array2d[int],
+  # Data out:
+  qacc_smooth_out: wp.array2d[float],
 ):
-  worldid, ci = wp.tid()
-  dof = cdof_dof_in[worldid, ci]
-  if dof >= 0:
-    rhs_out[worldid, ci, 0] = vec_in[worldid, dof]
-  else:
-    rhs_out[worldid, ci, 0] = 0.0
-
-
-@wp.kernel
-def _scatter_solution(
-  # Data in:
-  dof_cdof_in: wp.array2d[int],
-  # In:
-  x_in: wp.array3d[float],
-  # Out:
-  vec_out: wp.array2d[float],
-):
-  worldid, i = wp.tid()
-  ci = dof_cdof_in[worldid, i]
-  if ci >= 0:
-    vec_out[worldid, i] = x_in[worldid, ci, 0]
-  else:
-    vec_out[worldid, i] = 0.0  # frozen inactive DOF
+  worldid, dofid = wp.tid()
+  treeid = body_treeid[dof_bodyid[dofid]]
+  if treeid >= 0 and tree_awake_in[worldid, treeid] == 0:
+    qacc_smooth_out[worldid, dofid] = 0.0
 
 
 @event_scope
 def smooth_solve_compact(m: types.Model, d: types.Data):
-  """Compacted equivalent of solve_m: qacc_smooth[active] = cM^-1 qfrc_smooth[active].
+  """Solve each kinematic tree independently and freeze sleeping DOFs.
 
-  Inactive DOFs are frozen (qacc_smooth set to 0). Reads the sparse Model inertia.
+  The inertia matrix is block diagonal by kinematic tree, so the native per-tree
+  factorization avoids gathering active blocks into one padded dense matrix.
   """
+  smooth.factor_solve_i(m, d, d.M, d.qLD, d.qLDiagInv, d.qacc_smooth, d.qfrc_smooth)
   wp.launch(
-    _init_compact_inertia,
-    dim=(d.nworld, d.nvmax_pad, d.nvmax_pad),
-    inputs=[d.cdof_dof],
-    outputs=[d.cM],
-  )
-  wp.launch(
-    _gather_M_sparse,
+    _freeze_sleeping_dofs,
     dim=(d.nworld, m.nv),
-    inputs=[m.M_rownnz, m.M_rowadr, m.M_colind, d.M, d.dof_cdof],
-    outputs=[d.cM],
+    inputs=[m.body_treeid, m.dof_bodyid, d.tree_awake],
+    outputs=[d.qacc_smooth],
   )
-  wp.launch(
-    _gather_rhs_compact,
-    dim=(d.nworld, d.nvmax_pad),
-    inputs=[d.cdof_dof, d.qfrc_smooth],
-    outputs=[d.crhs],
-  )
-  wp.launch_tiled(
-    _cholesky_factorize_solve_blocked(types.TILE_SIZE_JTDAJ_DENSE, d.nvmax_pad),
-    dim=d.nworld,
-    inputs=[d.cM, d.crhs],
-    outputs=[d.cqLD, d.cx],
-    block_dim=m.block_dim.update_gradient_cholesky_blocked,
-  )
-  wp.launch(_scatter_solution, dim=(d.nworld, m.nv), inputs=[d.dof_cdof, d.cx], outputs=[d.qacc_smooth])
 
 
 @wp.kernel
