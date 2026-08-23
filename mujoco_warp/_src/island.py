@@ -1154,29 +1154,23 @@ def _compact_dofs(
     general_end = int(0)
     if general_count > 0:
       general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
-    if general_end + 6 * singleton_count > nvmax_pad_in:
-      compact = int(0)
-      for t in range(ntree):
-        if tree_awake_in[worldid, t] == 1:
-          adr = tree_dofadr[t]
-          num = tree_dofnum[t]
-          for j in range(num):
-            dof = adr + j
-            dof_cdof_out[worldid, dof] = compact
-            cdof_dof_out[worldid, compact] = dof
-            compact += 1
-      ncdof_out[worldid] = count
-      nsingleton6_out[worldid] = 0
-      return
+    # Keep the final slot free for the augmented Cholesky column. If every
+    # singleton does not fit after the aligned general block, fold only as many
+    # six-DOF trees as necessary back into that block.
+    while singleton_count > 0 and general_end + 6 * singleton_count >= nvmax_pad_in:
+      singleton_count -= 1
+      general_count += 6
+      general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
 
     general = int(0)
     singleton_start = general_end
+    singletons_left = singleton_count
     for t in range(ntree):
       if tree_awake_in[worldid, t] == 0:
         continue
 
       island_id = tree_island_in[worldid, t]
-      is_singleton = tree_dofnum[t] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
+      is_singleton = singletons_left > 0 and tree_dofnum[t] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
 
       start = singleton_start if is_singleton else general
       adr = tree_dofadr[t]
@@ -1187,6 +1181,7 @@ def _compact_dofs(
         cdof_dof_out[worldid, start + j] = dof
       if is_singleton:
         singleton_start += num
+        singletons_left -= 1
       else:
         general += num
 

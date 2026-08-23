@@ -932,6 +932,35 @@ _ARM_XML = """
 class ActiveDofTest(absltest.TestCase):
   """Tests that the sleep/wake state drives island.update_active_dofs (the active-DOF maps)."""
 
+  def test_singleton_packing_retains_fitting_subset(self):
+    """Six-DOF trees that fit beside the aligned general block stay specialized."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body><joint type="hinge"/><geom size=".01"/></body>
+          <body><freejoint/><geom size=".01"/></body>
+          <body><freejoint/><geom size=".01"/></body>
+          <body><freejoint/><geom size=".01"/></body>
+          <body><freejoint/><geom size=".01"/></body>
+        </worldbody>
+      </mujoco>
+      """,
+      nvmax=19,
+    )
+    d.tree_awake = wp.array([[1, 1, 1, 1, 0]], dtype=int)
+    d.tree_island.fill_(-1)
+
+    island.update_active_dofs(m, d)
+
+    self.assertEqual(d.ncdof.numpy()[0], 19)
+    self.assertEqual(d.nsingleton6.numpy()[0], 2)
+    cdof_dof = d.cdof_dof.numpy()[0]
+    np.testing.assert_array_equal(cdof_dof[:7], [0, 13, 14, 15, 16, 17, 18])
+    self.assertEqual(cdof_dof[15], -1)
+    np.testing.assert_array_equal(cdof_dof[16:28], np.arange(1, 13))
+    self.assertTrue((cdof_dof[28:] == -1).all())
+
   def test_actuated_tree_seeded(self):
     """Only the actuated arm tree is active at construction; maps are compact."""
     _, _, m, d = test_data.fixture(xml=_ARM_XML)
