@@ -2383,7 +2383,8 @@ class InverseContext:
   Jaref: wp.array2d[float]
   search_dot: wp.array[float]
   done: wp.array[bool]
-  quad_changed_ids: wp.array2d[int]
+  state_changes: wp.array2d[int]  # old state * njmax + efc id
+  state_changed_row_count: wp.array[int]
   quad_changed_count: wp.array[int]
   state_changed_count: wp.array[int]
   ls_exhausted: wp.array[bool]
@@ -2419,7 +2420,8 @@ class SolverContext:
   beta_den: wp.array[float]
   h: wp.array3d[float]
   hfactor: wp.array3d[float]
-  quad_changed_ids: wp.array2d[int]
+  state_changes: wp.array2d[int]  # old state * njmax + efc id
+  state_changed_row_count: wp.array[int]
   quad_changed_count: wp.array[int]
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None

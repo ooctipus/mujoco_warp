@@ -1226,6 +1226,110 @@ _FRICTION_CHAIN_XML = """
 
 
 class SolverFastPathTest(parameterized.TestCase):
+  def test_delta_gradient_sparse(self):
+    """Changed-row correction matches direct sparse J transpose evaluation."""
+    nv = 4
+    J = np.array([1.0, -2.0, 0.5, 3.0, -1.5], dtype=np.float32)
+    rowadr = np.array([[0, 2, 4]], dtype=np.int32)
+    rownnz = np.array([[2, 2, 1]], dtype=np.int32)
+    colind = np.array([[[0, 2, 1, 2, 3]]], dtype=np.int32)
+    jaref = np.array([[-0.2, 0.1, 1.0]], dtype=np.float32)
+    D = np.array([[2.0, 3.0, 0.0]], dtype=np.float32)
+    frictionloss = np.array([[0.0, 0.0, 0.5]], dtype=np.float32)
+    force = np.array([[0.4, 0.0, -0.5]], dtype=np.float32)
+    old_state = np.array(
+      [[types.ConstraintState.SATISFIED, types.ConstraintState.QUADRATIC, types.ConstraintState.LINEARNEG]],
+      dtype=np.uint8,
+    )
+    grad = np.array([[0.2, -0.4, 0.6, -0.8]], dtype=np.float32)
+    sigma = 0.75
+    alpha = 0.25
+
+    arrays = {
+      "nefc": wp.array([3], dtype=int),
+      "qfrc_smooth": wp.zeros((1, nv), dtype=float),
+      "rownnz": wp.array(rownnz, dtype=int),
+      "rowadr": wp.array(rowadr, dtype=int),
+      "colind": wp.array(colind, dtype=int),
+      "J": wp.array(J.reshape(1, 1, -1), dtype=float),
+      "D": wp.array(D, dtype=float),
+      "frictionloss": wp.array(frictionloss, dtype=float),
+      "force": wp.array(force, dtype=float),
+      "Ma": wp.zeros((1, nv), dtype=float),
+      "dof_cdof": wp.array([[0, 1, 2, 3]], dtype=int),
+      "state_changes": wp.array(old_state.astype(np.int32) * 3 + np.arange(3, dtype=np.int32), dtype=int),
+      "changed_count": wp.array([3], dtype=int),
+      "Jaref": wp.array(jaref, dtype=float),
+      "alpha": wp.array([alpha], dtype=float),
+      "grad_scale": wp.array([sigma], dtype=float),
+      "exhausted": wp.array([False], dtype=bool),
+      "done": wp.array([False], dtype=bool),
+      "grad": wp.array(grad, dtype=float),
+      "grad_dot": wp.zeros(1, dtype=float),
+      "decrement": wp.zeros(1, dtype=float),
+      "search_unchanged": wp.empty(1, dtype=bool),
+    }
+
+    def launch():
+      wp.launch_tiled(
+        solver._update_constraint_delta_gradient_sparse(nv, True),
+        dim=1,
+        inputs=[
+          arrays["nefc"],
+          arrays["qfrc_smooth"],
+          arrays["rownnz"],
+          arrays["rowadr"],
+          arrays["colind"],
+          arrays["J"],
+          arrays["D"],
+          arrays["frictionloss"],
+          arrays["force"],
+          arrays["Ma"],
+          arrays["dof_cdof"],
+          3,
+          arrays["state_changes"],
+          arrays["changed_count"],
+          arrays["Jaref"],
+          arrays["alpha"],
+          arrays["grad_scale"],
+          arrays["exhausted"],
+          arrays["done"],
+        ],
+        outputs=[
+          arrays["grad"],
+          arrays["grad_dot"],
+          arrays["decrement"],
+          arrays["grad_scale"],
+          arrays["search_unchanged"],
+        ],
+        block_dim=32,
+      )
+
+    launch()
+
+    predicted_force = np.array([0.0, -0.3, 0.5], dtype=np.float32)
+    expected = grad[0] * (sigma - alpha)
+    for efcid in range(3):
+      start = rowadr[0, efcid]
+      end = start + rownnz[0, efcid]
+      expected[colind[0, 0, start:end]] -= J[start:end] * (force[0, efcid] - predicted_force[efcid])
+    np.testing.assert_allclose(arrays["grad"].numpy()[0], expected, atol=1e-6, rtol=1e-6)
+    self.assertAlmostEqual(arrays["grad_dot"].numpy()[0], float(expected @ expected), places=6)
+    self.assertEqual(arrays["grad_scale"].numpy()[0], 1.0)
+    self.assertFalse(arrays["search_unchanged"].numpy()[0])
+
+    arrays["changed_count"].zero_()
+    arrays["exhausted"].fill_(True)
+    arrays["grad"].fill_(9.0)
+    launch()
+    expected = np.zeros(nv, dtype=np.float32)
+    for efcid in range(3):
+      start = rowadr[0, efcid]
+      end = start + rownnz[0, efcid]
+      expected[colind[0, 0, start:end]] -= J[start:end] * force[0, efcid]
+    np.testing.assert_allclose(arrays["grad"].numpy()[0], expected, atol=1e-6, rtol=1e-6)
+    self.assertAlmostEqual(arrays["grad_dot"].numpy()[0], float(expected @ expected), places=6)
+
   @parameterized.parameters(False, True)
   def test_fast_path_friction_transitions(self, compact):
     """qfrc_constraint must stay consistent when friction rows cross linear zones."""
