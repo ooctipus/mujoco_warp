@@ -28,6 +28,7 @@ import mujoco_warp as mjw
 from mujoco_warp import ConeType
 from mujoco_warp import test_data
 from mujoco_warp._src import constraint
+from mujoco_warp._src import types
 
 # tolerance for difference between MuJoCo and MJWarp constraint calculations,
 # mostly due to float precision
@@ -155,6 +156,43 @@ class ConstraintTest(parameterized.TestCase):
 
     _assert_eq(d.nacon.numpy()[0], nworld * mjd.ncon, "nacon")
     _assert_efc_eq(mjm, m, d, mjd, mjd.nefc, "efc", m.nv)
+
+  def test_sparse_contact_nnz_overflow_clears_live_rows(self):
+    """Sparse contact overflow leaves safe metadata for every live row."""
+    xml = """
+      <mujoco>
+        <option cone="pyramidal" solver="Newton" jacobian="sparse"/>
+        <worldbody>
+          <body pos="0 0 .099">
+            <freejoint/>
+            <geom type="box" size=".1 .1 .1" condim="6"/>
+          </body>
+          <geom type="plane" size="1 1 .1" condim="6"/>
+        </worldbody>
+      </mujoco>
+    """
+    _, _, m, d = test_data.fixture(xml=xml, nworld=4, njmax_nnz=1024)
+
+    with mock.patch.object(constraint, "launch_world_warp_enabled", return_value=True):
+      mjw.make_constraint(m, d)
+      self.assertTrue(np.any(d.efc.J_rownnz.numpy() > 0))
+
+      d.njmax_nnz = 1
+      d.overflow.zero_()
+      mjw.make_constraint(m, d)
+
+    nefc = np.minimum(d.nefc.numpy(), d.njmax)
+    rownnz = d.efc.J_rownnz.numpy()
+    rowadr = d.efc.J_rowadr.numpy()
+    for worldid, count in enumerate(nefc):
+      self.assertTrue(np.all(rownnz[worldid, :count] == 0))
+      self.assertTrue(np.all(rowadr[worldid, :count] == 0))
+    self.assertTrue(np.all(d.efc.jtdaj_nblock.numpy() == 0))
+    self.assertTrue(np.all(d.overflow.numpy() & types.OverflowType.NJMAX_NNZ))
+
+    mjw.solve(m, d)
+    wp.synchronize()
+    self.assertTrue(np.all(np.isfinite(d.qacc.numpy())))
 
   @parameterized.parameters(
     *itertools.product(

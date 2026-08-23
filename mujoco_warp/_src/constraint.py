@@ -2677,6 +2677,7 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
     efc_J_rowadr_out: wp.array2d[int],
     # Out:
     efc_nnz_out: wp.array[int],
+    overflow_out: wp.array[int],
   ):
     conid = wp.tid()
 
@@ -2719,12 +2720,6 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
         # This is redundant with the _efc_row call later but needed for the jac calculation
         efc_id_out[worldid, efcid] = conid
 
-    if wp.static(is_sparse and newton):
-      if base_efcid < njmax_in:
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-        efc_jtdaj_adr_out[worldid, jgid] = base_efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base_efcid)
-
     if wp.static(IS_SPARSE):
       geom = geom_in[conid]
       body1 = body_weldid[geom_bodyid[geom[0]]]
@@ -2748,12 +2743,24 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
 
       rowadr = wp.atomic_add(efc_nnz_out, worldid, rownnz * ndim)
       if rowadr + rownnz * ndim > njmax_nnz_in:
+        for dim in range(ndim):
+          efcid = base_efcid + dim
+          if efcid < njmax_in:
+            efc_J_rowadr_out[worldid, efcid] = 0
+            efc_J_rownnz_out[worldid, efcid] = 0
+        wp.atomic_or(overflow_out, worldid, types.OverflowType.NJMAX_NNZ)
         return
       for dim in range(ndim):
         efcid = base_efcid + dim
         if efcid < njmax_in:
           efc_J_rowadr_out[worldid, efcid] = rowadr + dim * rownnz
           efc_J_rownnz_out[worldid, efcid] = rownnz
+
+      if wp.static(newton):
+        if base_efcid < njmax_in:
+          jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+          efc_jtdaj_adr_out[worldid, jgid] = base_efcid
+          efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base_efcid)
 
   return kernel
 
@@ -2813,6 +2820,7 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
     efc_J_rowadr_out: wp.array2d[int],
     # Out:
     efc_nnz_out: wp.array[int],
+    overflow_out: wp.array[int],
   ):
     conid = wp.tid()
 
@@ -2854,12 +2862,6 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
         contact_efc_address_out[conid, dim] = efcid
         # This is redundant with the _efc_row call later but needed for the jac calculation
         efc_id_out[worldid, efcid] = conid
-
-    if wp.static(is_sparse and newton):
-      if base_efcid < njmax_in:
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
-        efc_jtdaj_adr_out[worldid, jgid] = base_efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base_efcid)
 
     if wp.static(IS_SPARSE):
       geom = geom_in[conid]
@@ -3090,12 +3092,24 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
 
       rowadr = wp.atomic_add(efc_nnz_out, worldid, rownnz * ndim)
       if rowadr + rownnz * ndim > njmax_nnz_in:
+        for dim in range(ndim):
+          efcid = base_efcid + dim
+          if efcid < njmax_in:
+            efc_J_rowadr_out[worldid, efcid] = 0
+            efc_J_rownnz_out[worldid, efcid] = 0
+        wp.atomic_or(overflow_out, worldid, types.OverflowType.NJMAX_NNZ)
         return
       for dim in range(ndim):
         efcid = base_efcid + dim
         if efcid < njmax_in:
           efc_J_rowadr_out[worldid, efcid] = rowadr + dim * rownnz
           efc_J_rownnz_out[worldid, efcid] = rownnz
+
+      if wp.static(newton):
+        if base_efcid < njmax_in:
+          jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+          efc_jtdaj_adr_out[worldid, jgid] = base_efcid
+          efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base_efcid)
 
   return kernel
 
@@ -5558,6 +5572,7 @@ def make_constraint(m: types.Model, d: types.Data):
             d.efc.J_rownnz,
             d.efc.J_rowadr,
             efc_nnz,
+            d.overflow,
           ],
         )
       else:
@@ -5591,6 +5606,7 @@ def make_constraint(m: types.Model, d: types.Data):
             d.efc.J_rownnz,
             d.efc.J_rowadr,
             efc_nnz,
+            d.overflow,
           ],
         )
 
