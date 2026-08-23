@@ -3107,15 +3107,12 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, world_warp: bool):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
     # Model:
-    body_parentid: wp.array[int],
     body_rootid: wp.array[int],
     body_weldid: wp.array[int],
     body_dofnum: wp.array[int],
     body_dofadr: wp.array[int],
-    dof_bodyid: wp.array[int],
     dof_parentid: wp.array[int],
     geom_bodyid: wp.array[int],
-    body_isdofancestor: wp.array2d[int],
     # Data in:
     ne_in: wp.array[int],
     nf_in: wp.array[int],
@@ -3198,33 +3195,18 @@ def _efc_contact_jac_sparse(cone_type: types.ConeType, world_warp: bool):
           break
 
         if dofid == da:
-          jac1p, jac1r = support.jac_dof(
-            body_parentid,
-            body_rootid,
-            dof_bodyid,
-            body_isdofancestor,
-            subtree_com_in,
-            cdof_in,
-            con_pos,
-            body1,
-            dofid,
-            worldid,
-          )
-          jac2p, jac2r = support.jac_dof(
-            body_parentid,
-            body_rootid,
-            dof_bodyid,
-            body_isdofancestor,
-            subtree_com_in,
-            cdof_in,
-            con_pos,
-            body2,
-            dofid,
-            worldid,
-          )
+          # Common ancestors are excluded from rownnz, so one body owns this DOF.
+          body = body2
+          sign = float(1.0)
+          if da1 == da:
+            body = body1
+            sign = -1.0
 
-          jacp_dif = jac2p - jac1p
-          jacr_dif = jac2r - jac1r
+          cdof = cdof_in[worldid, dofid]
+          cdof_ang = wp.spatial_top(cdof)
+          offset = con_pos - subtree_com_in[worldid, body_rootid[body]]
+          jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
+          jacr_dif = cdof_ang * sign
 
           if wp.static(IS_ELLIPTIC):
             J = float(0.0)
@@ -5660,15 +5642,12 @@ def make_constraint(m: types.Model, d: types.Data):
             _efc_contact_jac_sparse(m.opt.cone, world_warp),
             dim=(d.nworld, 32) if world_warp else (d.naconmax, nmaxdim),
             inputs=[
-              m.body_parentid,
               m.body_rootid,
               m.body_weldid,
               m.body_dofnum,
               m.body_dofadr,
-              m.dof_bodyid,
               m.dof_parentid,
               m.geom_bodyid,
-              m.body_isdofancestor,
               d.ne,
               d.nf,
               d.nl,
