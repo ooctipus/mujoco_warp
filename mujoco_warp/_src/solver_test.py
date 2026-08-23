@@ -34,6 +34,18 @@ from mujoco_warp._src import types
 _TOLERANCE = 5e-3
 
 
+@wp.kernel
+def _decode_upper_triangle_indices(
+  # In:
+  entries_in: wp.array[wp.int64],
+  # Out:
+  coordinates_out: wp.array[wp.vec2i],
+):
+  i = wp.tid()
+  row, col = solver._upper_triangle_coordinates(entries_in[i])
+  coordinates_out[i] = wp.vec2i(row, col)
+
+
 def _assert_eq(a, b, name):
   tol = _TOLERANCE * 20  # avoid test noise
   err_msg = f"mismatch: {name}"
@@ -1200,7 +1212,7 @@ class SolverTest(parameterized.TestCase):
 
 _FRICTION_CHAIN_XML = """
 <mujoco>
-  <option timestep="0.01" solver="Newton" cone="pyramidal" jacobian="dense">
+  <option timestep="0.01" solver="Newton" cone="pyramidal" jacobian="sparse">
     <flag warmstart="disable"/>
   </option>
   <worldbody>
@@ -1371,6 +1383,7 @@ class SolverFastPathTest(parameterized.TestCase):
     mjd = mujoco.MjData(mjm)
     mujoco.mj_forward(mjm, mjd)
     m = mjw.put_model(mjm)
+    self.assertTrue(m.is_sparse)
     device = wp.get_device()
     nworld = max(64, 4 * device.sm_count) if compact and device.is_cuda else 64
     d = mjw.put_data(mjm, mjd, nworld=nworld, nvmax=mjm.nv if compact else None)
@@ -1387,11 +1400,19 @@ class SolverFastPathTest(parameterized.TestCase):
       J = d.efc.J.numpy()
       force = d.efc.force.numpy()
       got = d.qfrc_constraint.numpy()
+      rownnz = d.efc.J_rownnz.numpy()
+      rowadr = d.efc.J_rowadr.numpy()
+      colind = d.efc.J_colind.numpy()
       for w in range(nworld):
         n = nefc[w]
         if n == 0:
           continue
-        ref = J[w, :n, : mjm.nv].astype(np.float64).T @ force[w, :n].astype(np.float64)
+        ref = np.zeros(mjm.nv, dtype=np.float64)
+        for efcid in range(n):
+          start = rowadr[w, efcid]
+          end = start + rownnz[w, efcid]
+          cols = colind[w, 0, start:end]
+          ref[cols] += J[w, 0, start:end].astype(np.float64) * force[w, efcid]
         scale = max(np.abs(ref).max(), 1.0)
         max_rel = max(max_rel, np.abs(ref - got[w]).max() / scale)
     self.assertLess(max_rel, 1e-4, f"qfrc_constraint inconsistent with J^T f: rel {max_rel:.3e}")
@@ -1642,6 +1663,20 @@ def _put_compact(xml: str, nvmax: int | None = None, sparse: bool = False):
 
 class CompactSolverTest(absltest.TestCase):
   """Tests for the compacted smooth and constrained solves (solver.py compact path)."""
+
+  def test_upper_triangle_index_decode_at_float_boundary(self):
+    """Large triangle boundaries are corrected after the float sqrt estimate."""
+    sizes = (4608, 65535)
+    boundaries = tuple(size * (size + 1) // 2 for size in sizes)
+    entries = wp.array([boundaries[0] - 1, boundaries[0], boundaries[1] - 1], dtype=wp.int64)
+    coordinates = wp.empty(3, dtype=wp.vec2i)
+
+    wp.launch(_decode_upper_triangle_indices, dim=3, inputs=[entries], outputs=[coordinates])
+
+    np.testing.assert_array_equal(
+      coordinates.numpy(),
+      ((sizes[0] - 1, sizes[0] - 1), (0, sizes[0]), (sizes[1] - 1, sizes[1] - 1)),
+    )
 
   def test_smooth_solve_equivalence_all_active(self):
     """With every tree active and nvmax=nv, compacted qacc_smooth matches baseline."""

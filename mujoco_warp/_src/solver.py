@@ -2663,6 +2663,20 @@ def _update_gradient_init_h_sparse(compact: bool):
   return kernel
 
 
+@wp.func
+def _upper_triangle_coordinates(entry: wp.int64) -> tuple[int, int]:
+  """Decode a column-major upper-triangle index without trusting float rounding."""
+  col = (int(wp.sqrt(8.0 * float(entry) + 1.0)) - 1) // 2
+  col_start = wp.int64(col) * wp.int64(col + 1) // wp.int64(2)
+  if col_start > entry:
+    col_start -= wp.int64(col)
+    col -= 1
+  elif entry >= col_start + wp.int64(col + 1):
+    col_start += wp.int64(col + 1)
+    col += 1
+  return int(entry - col_start), col
+
+
 @cache_kernel
 def _update_gradient_init_h_sparse_blocks(tile_size: int):
   TILE_SIZE = tile_size
@@ -2688,24 +2702,25 @@ def _update_gradient_init_h_sparse_blocks(tile_size: int):
 
     singleton_count = nsingleton6_in[worldid]
     general_size = ncdof_in[worldid] - 6 * singleton_count
-    general_end = int(0)
+    general_end = wp.int64(0)
     if general_size > 0:
-      general_end = ((general_size + wp.static(TILE_SIZE) - 1) // wp.static(TILE_SIZE)) * wp.static(TILE_SIZE)
+      general_end = wp.int64(((general_size + wp.static(TILE_SIZE) - 1) // wp.static(TILE_SIZE)) * wp.static(TILE_SIZE))
 
-    general_entries = general_end * (general_end + 1) // 2
-    entries = general_entries + 21 * singleton_count
-    for entry in range(lane, entries, wp.block_dim()):
+    general_entries = general_end * (general_end + wp.int64(1)) // wp.int64(2)
+    entries = general_entries + wp.int64(21) * wp.int64(singleton_count)
+    stride = wp.int64(wp.block_dim())
+    entry = wp.int64(lane)
+    while entry < entries:
       local_entry = entry
-      block_start = int(0)
+      block_start = wp.int64(0)
       if entry >= general_entries:
         singleton_entry = entry - general_entries
-        block_start = general_end + 6 * (singleton_entry // 21)
-        local_entry = singleton_entry % 21
+        block_start = general_end + wp.int64(6) * (singleton_entry // wp.int64(21))
+        local_entry = singleton_entry % wp.int64(21)
 
-      col = (int(wp.sqrt(float(8 * local_entry + 1))) - 1) // 2
-      row = local_entry - col * (col + 1) // 2
-      row += block_start
-      col += block_start
+      row, col = _upper_triangle_coordinates(local_entry)
+      row = int(wp.int64(row) + block_start)
+      col = int(wp.int64(col) + block_start)
 
       dof_row = cdof_dof_in[worldid, row]
       dof_col = cdof_dof_in[worldid, col]
@@ -2717,6 +2732,7 @@ def _update_gradient_init_h_sparse_blocks(tile_size: int):
           ctx_h_out[worldid, row, col] = M_in[worldid, elemid]
         else:
           ctx_h_out[worldid, row, col] = 0.0
+      entry += stride
 
   return kernel
 
