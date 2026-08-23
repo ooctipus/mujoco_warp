@@ -2394,10 +2394,9 @@ def _update_constraint_qfrc(
       inputs=[changed, ctx.done],
       outputs=[d.qfrc_constraint],
     )
-    world_warp = launch_world_warp_enabled(d.nworld, d.qacc.device)
     wp.launch(
-      _update_constraint_init_qfrc_constraint_sparse(sc, world_warp),
-      dim=(d.nworld, 32 if world_warp else d.njmax),
+      _update_constraint_init_qfrc_constraint_sparse(sc, False),
+      dim=(d.nworld, d.njmax),
       inputs=[
         d.nefc,
         dj.efc.J_rownnz,
