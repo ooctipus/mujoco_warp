@@ -1096,10 +1096,9 @@ def _reset_compact_maps(
 
 
 @wp.kernel
-def _compact_dofs(
+def _compact_dof_layout(
   # Model:
   ntree: int,
-  tree_dofadr: wp.array[int],
   tree_dofnum: wp.array[int],
   # Data in:
   tree_awake_in: wp.array2d[int],
@@ -1112,8 +1111,6 @@ def _compact_dofs(
   # Data out:
   ncdof_out: wp.array[int],
   nsingleton6_out: wp.array[int],
-  dof_cdof_out: wp.array2d[int],
-  cdof_dof_out: wp.array2d[int],
   overflow_out: wp.array[int],
 ):
   worldid = wp.tid()
@@ -1128,17 +1125,6 @@ def _compact_dofs(
         singleton_count += 1
 
   if count > nvmax_in:
-    compact = int(0)
-    for t in range(ntree):
-      if tree_awake_in[worldid, t] == 1:
-        adr = tree_dofadr[t]
-        num = tree_dofnum[t]
-        for j in range(num):
-          dof = adr + j
-          if compact < nvmax_in:
-            dof_cdof_out[worldid, dof] = compact
-            cdof_dof_out[worldid, compact] = dof
-          compact += 1
     if warn_overflow:
       wp.printf(
         "nvmax overflow: world %d needs %d active DOFs but nvmax = %d (behavior undefined)\n",
@@ -1162,31 +1148,64 @@ def _compact_dofs(
       general_count += 6
       general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
 
-    general = int(0)
-    singleton_start = general_end
-    singletons_left = singleton_count
-    for t in range(ntree):
-      if tree_awake_in[worldid, t] == 0:
-        continue
-
-      island_id = tree_island_in[worldid, t]
-      is_singleton = singletons_left > 0 and tree_dofnum[t] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
-
-      start = singleton_start if is_singleton else general
-      adr = tree_dofadr[t]
-      num = tree_dofnum[t]
-      for j in range(num):
-        dof = adr + j
-        dof_cdof_out[worldid, dof] = start + j
-        cdof_dof_out[worldid, start + j] = dof
-      if is_singleton:
-        singleton_start += num
-        singletons_left -= 1
-      else:
-        general += num
-
     ncdof_out[worldid] = count
     nsingleton6_out[worldid] = singleton_count
+
+
+@wp.kernel
+def _map_compact_dofs(
+  # Model:
+  tree_dofadr: wp.array[int],
+  tree_dofnum: wp.array[int],
+  # Data in:
+  tree_awake_in: wp.array2d[int],
+  tree_island_in: wp.array2d[int],
+  island_nv_in: wp.array2d[int],
+  ncdof_in: wp.array[int],
+  nsingleton6_in: wp.array[int],
+  nvmax_in: int,
+  tile_size_in: int,
+  # Data out:
+  dof_cdof_out: wp.array2d[int],
+  cdof_dof_out: wp.array2d[int],
+):
+  worldid, treeid = wp.tid()
+  if tree_awake_in[worldid, treeid] == 0:
+    return
+
+  singleton_count = nsingleton6_in[worldid]
+  general_count = ncdof_in[worldid] - 6 * singleton_count
+  general_end = int(0)
+  if general_count > 0:
+    general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
+
+  # Prefix counts preserve tree order while each tree maps independently.
+  general = int(0)
+  singleton = int(0)
+  for t in range(treeid):
+    if tree_awake_in[worldid, t] == 0:
+      continue
+    island_id = tree_island_in[worldid, t]
+    is_singleton = (
+      singleton < singleton_count and tree_dofnum[t] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
+    )
+    if is_singleton:
+      singleton += 1
+    else:
+      general += tree_dofnum[t]
+
+  island_id = tree_island_in[worldid, treeid]
+  is_singleton = (
+    singleton < singleton_count and tree_dofnum[treeid] == 6 and (island_id < 0 or island_nv_in[worldid, island_id] == 6)
+  )
+  start = general_end + 6 * singleton if is_singleton else general
+  adr = tree_dofadr[treeid]
+  for j in range(tree_dofnum[treeid]):
+    compact = start + j
+    if singleton_count > 0 or compact < nvmax_in:
+      dof = adr + j
+      dof_cdof_out[worldid, dof] = compact
+      cdof_dof_out[worldid, compact] = dof
 
 
 @event_scope
@@ -1199,11 +1218,10 @@ def update_active_dofs(m: types.Model, d: types.Data):
     outputs=[d.dof_cdof, d.cdof_dof],
   )
   wp.launch(
-    _compact_dofs,
+    _compact_dof_layout,
     dim=(d.nworld,),
     inputs=[
       m.ntree,
-      m.tree_dofadr,
       m.tree_dofnum,
       d.tree_awake,
       d.tree_island,
@@ -1213,5 +1231,21 @@ def update_active_dofs(m: types.Model, d: types.Data):
       types.TILE_SIZE_JTDAJ_DENSE,
       m.opt.warn_overflow,
     ],
-    outputs=[d.ncdof, d.nsingleton6, d.dof_cdof, d.cdof_dof, d.overflow],
+    outputs=[d.ncdof, d.nsingleton6, d.overflow],
+  )
+  wp.launch(
+    _map_compact_dofs,
+    dim=(d.nworld, m.ntree),
+    inputs=[
+      m.tree_dofadr,
+      m.tree_dofnum,
+      d.tree_awake,
+      d.tree_island,
+      d.island_nv,
+      d.ncdof,
+      d.nsingleton6,
+      d.nvmax,
+      types.TILE_SIZE_JTDAJ_DENSE,
+    ],
+    outputs=[d.dof_cdof, d.cdof_dof],
   )
