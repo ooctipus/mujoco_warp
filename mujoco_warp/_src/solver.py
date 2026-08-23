@@ -1677,9 +1677,8 @@ def _solve_init_efc(
 
 
 @cache_kernel
-def _solve_init_jaref_kernel(is_sparse: bool, nv: int, dofs_per_thread: int, compact: bool, world_warp: bool):
+def _solve_init_jaref_kernel(is_sparse: bool, nv: int, dofs_per_thread: int, compact: bool):
   COMPACT = compact
-  WORLD_WARP = world_warp
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=True)
   def kernel(
@@ -1692,29 +1691,12 @@ def _solve_init_jaref_kernel(is_sparse: bool, nv: int, dofs_per_thread: int, com
     efc_J_in: wp.array3d[float],
     efc_aref_in: wp.array2d[float],
     dof_cdof_in: wp.array2d[int],
-    njmax_in: int,
     # Out:
     ctx_Jaref_out: wp.array2d[float],
   ):
     worldid, efcid, dofstart = wp.tid()
 
-    if wp.static(is_sparse and WORLD_WARP):
-      for active_efcid in range(efcid, wp.min(nefc_in[worldid], njmax_in), 32):
-        jaref = float(0.0)
-        rownnz = efc_J_rownnz_in[worldid, active_efcid]
-        rowadr = efc_J_rowadr_in[worldid, active_efcid]
-        for i in range(rownnz):
-          sparseid = rowadr + i
-          colind = efc_J_colind_in[worldid, 0, sparseid]
-          if wp.static(COMPACT):
-            colind = dof_cdof_in[worldid, colind]
-            if colind < 0:
-              continue
-          jaref += efc_J_in[worldid, 0, sparseid] * qacc_in[worldid, colind]
-        ctx_Jaref_out[worldid, active_efcid] = jaref - efc_aref_in[worldid, active_efcid]
-      return
-
-    if efcid >= wp.min(nefc_in[worldid], njmax_in):
+    if efcid >= nefc_in[worldid]:
       return
 
     jaref = float(0.0)
@@ -4352,10 +4334,9 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
     dofs_per_thread = m.nv
     threads_per_efc = 1
   sparse = sc or m.is_sparse
-  world_warp = sparse and launch_world_warp_enabled(d.nworld, d.qacc.device)
   wp.launch(
-    _solve_init_jaref_kernel(sparse, m.nv, dofs_per_thread, sc, world_warp),
-    dim=(d.nworld, 32 if world_warp else d.njmax, threads_per_efc),
+    _solve_init_jaref_kernel(sparse, m.nv, dofs_per_thread, sc),
+    dim=(d.nworld, d.njmax, threads_per_efc),
     inputs=[
       d.nefc,
       d.qacc,
@@ -4365,7 +4346,6 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
       dj.efc.J,
       d.efc.aref,
       dj.dof_cdof,
-      d.njmax,
     ],
     outputs=[ctx.Jaref],
   )
