@@ -15,6 +15,8 @@
 
 """Tests for sensor functions."""
 
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -25,6 +27,7 @@ import mujoco_warp as mjw
 from mujoco_warp import DisableBit
 from mujoco_warp import GeomType
 from mujoco_warp import test_data
+from mujoco_warp._src import sensor
 from mujoco_warp._src.collision_core import create_collision_context
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
 from mujoco_warp._src.types import CollisionType
@@ -939,6 +942,30 @@ class SensorTest(parameterized.TestCase):
 
     # Verify Warp sensor is triggered
     self.assertTrue(warp_sensordata.any(), "Warp sensordata should not be all zeros")
+
+  def test_no_tactile_preprocessing_without_taxels(self):
+    """Models without tactile taxels skip contact preprocessing."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <geom type="plane" size="1 1 .01"/>
+          <body pos="0 0 .05">
+            <freejoint/>
+            <geom type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    self.assertEqual(m.nsensortaxel, 0)
+
+    launch = wp.launch
+    with mock.patch.object(sensor.wp, "launch", wraps=launch) as launch_mock:
+      mjw.sensor_acc(m, d)
+
+    launched_kernels = [call.args[0] for call in launch_mock.call_args_list]
+    self.assertNotIn(sensor._preprocess_tactile_contacts, launched_kernels)
 
 
 if __name__ == "__main__":
