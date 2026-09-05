@@ -4998,6 +4998,8 @@ def _solve_world_first(m: types.Model, d: types.Data):
   The stock fallback runs inside ``wp.capture_if(nstock)``; everything it needs is allocated
   before the conditional body so the call stays graph-capturable.
   """
+  # keep the compaction maps (dof_cdof, ncdof, nsingleton6) current like the stock path does
+  island.update_active_dofs(m, d)
   wctx = _world_solver_context(d)
   world_solver.world_solve(m, d, wctx)
   m2, d2, sctx = _compact_solver_setup(m, d)
@@ -5016,7 +5018,6 @@ def _solve_world_first(m: types.Model, d: types.Data):
 
 
 def _stock_fallback(m, d, m2, d2, sctx, nsolving, wctx):
-  island.update_active_dofs(m, d)
   _compact_gather(m, d)
   _solve(m2, d2, sctx, compact=True, stock_world=wctx.stock_world, nstock=wctx.nstock, nsolving=nsolving)
   _compact_scatter(m, d, stock_world=wctx.stock_world)
