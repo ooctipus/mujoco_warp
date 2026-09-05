@@ -993,6 +993,7 @@ class Model:
     njnt: number of joints
     ntree: number of kinematic trees
     has_gravcomp: whether any body has nonzero gravity compensation (host flag)
+    ngravcomp: number of bodies with nonzero gravity compensation in any world (host)
     nM: number of non-zeros in sparse inertia matrix
     nC: number of non-zeros in sparse body-dof matrix
     nD: number of non-zeros in sparse derivative matrix
@@ -1063,6 +1064,7 @@ class Model:
     body_inertia: diagonal inertia in ipos/iquat frame       (*, nbody, 3)
     body_invweight0: mean inv inert in qpos0 (trn, rot)      (*, nbody, 2)
     body_gravcomp: antigravity force, units of body weight   (*, nbody)
+    gravcomp_bodyid: bodies with nonzero gravcomp in any world       (ngravcomp,)
     body_contype: OR over all geom contypes                  (nbody,)
     body_conaffinity: OR over all geom conaffinities         (nbody,)
     oct_child: octree children                               (noct, 8)
@@ -1487,6 +1489,7 @@ class Model:
   njnt: int
   ntree: int
   has_gravcomp: bool
+  ngravcomp: int
   nM: int
   nC: int
   nD: int
@@ -1557,6 +1560,7 @@ class Model:
   body_inertia: array("*", "nbody", wp.vec3)
   body_invweight0: array("*", "nbody", wp.vec2)
   body_gravcomp: array("*", "nbody", float)
+  gravcomp_bodyid: array("ngravcomp", int)
   body_contype: array("nbody", int)
   body_conaffinity: array("nbody", int)
   oct_child: array("noct", vec8i)

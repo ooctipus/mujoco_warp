@@ -256,6 +256,21 @@ def _filter_tri_geoms(
   return is_self | is_parent | is_excluded
 
 
+def refresh_gravcomp_bodies(m: types.Model, body_gravcomp: np.ndarray | None = None) -> None:
+  """Recompute the compact list of bodies with nonzero gravity compensation.
+
+  Call after editing ``m.body_gravcomp`` outside graph capture. ``body_gravcomp``
+  may supply the host values (shape ``(nworld or 1, nbody)``) to avoid a device read.
+  """
+  if body_gravcomp is None:
+    body_gravcomp = m.body_gravcomp.numpy()
+  nonzero = np.nonzero(np.any(np.asarray(body_gravcomp) != 0.0, axis=0))[0]
+  nonzero = nonzero[nonzero > 0]  # world body never carries gravcomp
+  m.has_gravcomp = bool(nonzero.size)
+  m.ngravcomp = int(nonzero.size)
+  m.gravcomp_bodyid = wp.array(nonzero.astype(np.int32), dtype=int, device=m.body_gravcomp.device if hasattr(m.body_gravcomp, "device") else None)
+
+
 def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) -> types.Model:
   """Creates a model on device.
 
@@ -424,7 +439,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   # create model
   m = types.Model(**{f.name: getattr(mjm, f.name, None) for f in dataclasses.fields(types.Model)})
-  m.has_gravcomp = bool(np.any(mjm.body_gravcomp != 0.0))
+  refresh_gravcomp_bodies(m, np.asarray(mjm.body_gravcomp, dtype=np.float32).reshape(1, -1))
 
   m.opt = opt
   m.stat = stat

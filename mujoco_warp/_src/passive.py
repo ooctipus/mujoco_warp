@@ -279,6 +279,7 @@ def _gravity_force(
   body_rootid: wp.array[int],
   body_mass: wp.array2d[float],
   body_gravcomp: wp.array2d[float],
+  gravcomp_bodyid: wp.array[int],
   dof_bodyid: wp.array[int],
   body_isdofancestor: wp.array2d[int],
   # Data in:
@@ -288,8 +289,8 @@ def _gravity_force(
   # Data out:
   qfrc_gravcomp_out: wp.array2d[float],
 ):
-  worldid, bodyid, dofid = wp.tid()
-  bodyid += 1  # skip world body
+  worldid, gravcompid, dofid = wp.tid()
+  bodyid = gravcomp_bodyid[gravcompid]
   gravcomp = body_gravcomp[worldid % body_gravcomp.shape[0], bodyid]
   gravity = opt_gravity[worldid % opt_gravity.shape[0]]
 
@@ -1403,17 +1404,18 @@ def passive(m: Model, d: Data):
 
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
   d.qfrc_gravcomp.zero_()
-  # Skip the (nworld, nbody, nv) gravity-compensation launch when no body requests it.
-  if gravity_enabled and getattr(m, "has_gravcomp", True):
+  # Only bodies with nonzero gravity compensation contribute; launch over that compact list.
+  if gravity_enabled and m.ngravcomp > 0:
     wp.launch(
       _gravity_force,
-      dim=(d.nworld, m.nbody - 1, m.nv),
+      dim=(d.nworld, m.ngravcomp, m.nv),
       inputs=[
         m.opt.gravity,
         m.body_parentid,
         m.body_rootid,
         m.body_mass,
         m.body_gravcomp,
+        m.gravcomp_bodyid,
         m.dof_bodyid,
         m.body_isdofancestor,
         d.xipos,
