@@ -34,7 +34,9 @@ constraint solver for models that satisfy :func:`fused_world`:
   post-sleep ``fwd_velocity`` refresh when the step finalizes and ``sleep.update_sleep``.
 
 Every canonical ``Data`` field written by the replaced kernels is published so that downstream
-consumers see identical state. Integer and sleep/island state is reproduced exactly; floating point
+consumers see identical state, unless ``Option.fused_world_publish_derived`` is False (an opt-in
+that skips the derived fields no fused stage reads, see :class:`Option`). Integer and sleep/island
+state is reproduced exactly; floating point
 differs from the stock launches only through summation and factorization order (scalar instead of
 tile Cholesky for the dense inertia blocks: fp32 rounding, a few ulps in ``qLD``/``qacc_smooth``).
 Row order within a constraint family and the ``body_awake_ind``/``dof_awake_ind`` order are
@@ -762,6 +764,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     nsite: int,
     has_gravcomp: int,
     run_wake: int,
+    publish_derived: int,
     opt_disableflags: int,
     opt_gravity: wp.array[wp.vec3],
     qpos0: wp.array2d[float],
@@ -1156,14 +1159,18 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       xipos = xpos + math.rot_vec_quat(b_ipos, xquat)
       xpos_out[worldid, tid] = xpos
       _st_q(xquat_out, worldid, tid, xquat)
-      _st_m33(xmat_out, worldid, tid, math.quat_to_mat(xquat))
       xipos_out[worldid, tid] = xipos
-      _st_m33(ximat_out, worldid, tid, math.quat_to_mat(math.mul_quat(xquat, b_iquat)))
       _st_body_v3(mcom_sh, tid, xipos * b_mass)
-      if b_jntnum == 1:
-        xanchor_out[worldid, b_jntadr] = xanchor
-        xaxis_out[worldid, b_jntadr] = xaxis
-    for geomid in range(tid, ngeom, BLOCK):
+      if publish_derived != 0:
+        _st_m33(xmat_out, worldid, tid, math.quat_to_mat(xquat))
+        _st_m33(ximat_out, worldid, tid, math.quat_to_mat(math.mul_quat(xquat, b_iquat)))
+        if b_jntnum == 1:
+          xanchor_out[worldid, b_jntadr] = xanchor
+          xaxis_out[worldid, b_jntadr] = xaxis
+    # geom and site frames are derived publishes too
+    ngeom_pub = wp.where(publish_derived != 0, ngeom, 0)
+    nsite_pub = wp.where(publish_derived != 0, nsite, 0)
+    for geomid in range(tid, ngeom_pub, BLOCK):
       bodyid = g_body
       if geomid != tid:
         bodyid = geom_bodyid[geomid]
@@ -1177,7 +1184,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
           geomid,
           math.quat_to_mat(math.mul_quat(gquat, geom_quat[worldid % geom_quat.shape[0], geomid])),
         )
-    for siteid in range(tid, nsite, BLOCK):
+    for siteid in range(tid, nsite_pub, BLOCK):
       bodyid = s_body
       if siteid != tid:
         bodyid = site_bodyid[siteid]
@@ -1256,7 +1263,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     _sync()
 
     # ---------------------------------------------------------------- P4: crb and M
-    if is_body:
+    if is_body and publish_derived != 0:
       crb = cinert_sh[tid]
       # the world body never accumulates its children
       if tid > 0:
@@ -1302,12 +1309,13 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     a_velocity = float(0.0)
     if is_act:
       a_velocity = a_gear * qvel_sh[a_vadr]
-      actuator_length_out[worldid, tid] = a_length
-      moment_rownnz_out[worldid, tid] = 1
-      moment_rowadr_out[worldid, tid] = tid
-      moment_colind_out[worldid, tid] = a_vadr
-      actuator_moment_out[worldid, tid] = a_gear
-      actuator_velocity_out[worldid, tid] = a_velocity
+      if publish_derived != 0:
+        actuator_length_out[worldid, tid] = a_length
+        moment_rownnz_out[worldid, tid] = 1
+        moment_rowadr_out[worldid, tid] = tid
+        moment_colind_out[worldid, tid] = a_vadr
+        actuator_moment_out[worldid, tid] = a_gear
+        actuator_velocity_out[worldid, tid] = a_velocity
 
     # ----------------------------------------------------- P6: com_vel and cacc (ancestor sums)
     # the passive-force parameters of P7 are loaded first; the barriers hide their latency
@@ -1335,10 +1343,12 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       if j_type == JointType.FREE:
         for k in range(3):
           v_own += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
-          _st_sv(cdof_dot_out, worldid, b_dofadr + k, wp.spatial_vector())
+          if publish_derived != 0:
+            _st_sv(cdof_dot_out, worldid, b_dofadr + k, wp.spatial_vector())
         for k in range(3, 6):
           cdof_dot = math.motion_cross(v_own, cdof_sh[b_dofadr + k])
-          _st_sv(cdof_dot_out, worldid, b_dofadr + k, cdof_dot)
+          if publish_derived != 0:
+            _st_sv(cdof_dot_out, worldid, b_dofadr + k, cdof_dot)
           a_own += cdof_dot * qvel_sh[b_dofadr + k]
         for k in range(3, 6):
           v_own += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
@@ -1358,7 +1368,8 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
         p = binfo_sh[p] & 0xFF
       if b_jntnum == 1 and j_type != JointType.FREE:
         cdof_dot = math.motion_cross(cvel, cdof_sh[b_dofadr])
-        _st_sv(cdof_dot_out, worldid, b_dofadr, cdof_dot)
+        if publish_derived != 0:
+          _st_sv(cdof_dot_out, worldid, b_dofadr, cdof_dot)
         a_own = cdof_dot * qvel_sh[b_dofadr]
       cvel += v_own
     _sync()
@@ -1381,7 +1392,8 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       if tid > 0:
         _st_body_sv(cacc_sh, tid, cacc)
       _st_sv(cvel_out, worldid, tid, cvel)
-      _st_sv(cacc_out, worldid, tid, cacc)
+      if publish_derived != 0:
+        _st_sv(cacc_out, worldid, tid, cacc)
     _sync()
 
     # ---------------------------------------------------------------- P7: passive (per dof)
@@ -1447,11 +1459,12 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
           if actgravcomp == 0:
             qfrc_passive += qfrc_gravcomp
 
-      qfrc_spring_out[worldid, tid] = qfrc_spring
-      qfrc_damper_out[worldid, tid] = qfrc_damper
       qfrc_gravcomp_out[worldid, tid] = qfrc_gravcomp
-      qfrc_adhesion_out[worldid, tid] = 0.0
       qfrc_passive_out[worldid, tid] = qfrc_passive
+      if publish_derived != 0:
+        qfrc_spring_out[worldid, tid] = qfrc_spring
+        qfrc_damper_out[worldid, tid] = qfrc_damper
+        qfrc_adhesion_out[worldid, tid] = 0.0
 
     # ---------------------------------------------------------------- P8: rne (cfrc_int, qfrc_bias)
     # the actuation parameters of P9 are loaded first; the rne barriers hide their latency
@@ -1509,7 +1522,8 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     if is_body:
       # the cvel slot (dead since the traversal) now holds the interaction force
       _st_body_sv(cvel_sh, tid, cfrc)
-      _st_sv(cfrc_int_out, worldid, tid, cfrc)
+      if publish_derived != 0:
+        _st_sv(cfrc_int_out, worldid, tid, cfrc)
     _sync()
     if is_dof:
       qfrc_bias_out[worldid, tid] = wp.dot(cdof, cvel_sh[d_body])
@@ -3385,7 +3399,8 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
   forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`. The body/dof
   awake arrays are published once, by ``forward_m`` after ``wake_equality``. ``groups`` are the
   contact buckets shared with ``forward_m`` (their per-world counts are zeroed here). The wake pass
-  is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``).
+  is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``), and
+  the derived publishes when ``Option.fused_world_publish_derived`` is False on a sensorless model.
   """
   if groups is None:
     groups = contact_groups(d)
@@ -3401,6 +3416,8 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.nsite,
       int(m.ngravcomp > 0),
       int(getattr(m.opt, "run_sleep_wake", True)),
+      # sensors read the derived fields, so they force the full publish
+      int(getattr(m.opt, "fused_world_publish_derived", True) or m.nsensor > 0),
       m.opt.disableflags,
       m.opt.gravity,
       m.qpos0,

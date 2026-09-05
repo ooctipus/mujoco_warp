@@ -426,6 +426,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   opt.warn_overflow = True
   opt.fused_world = True
   opt.run_sleep_wake = True
+  opt.fused_world_publish_derived = True
   contact_sensor_maxmatch_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_NUMERIC, "contact_sensor_maxmatch")
   if contact_sensor_maxmatch_id > -1:
     opt.contact_sensor_maxmatch = mjm.numeric_data[mjm.numeric_adr[contact_sensor_maxmatch_id]]
@@ -2995,6 +2996,7 @@ def override_model(model: types.Model | mujoco.MjModel, overrides: dict[str, Any
     "opt.contact_sensor_maxmatch",
     "opt.fused_world",
     "opt.run_sleep_wake",
+    "opt.fused_world_publish_derived",
   }
   mj_only_fields = {"opt.jacobian", "vis.quality.offsamples"}
 

@@ -876,6 +876,12 @@ class Option:
     run_sleep_wake: if False, forward() skips its ``sleep.wake`` pass: the caller declares that it
       has already run ``sleep.wake`` on the current ``qvel``/``qfrc_applied``/``xfrc_applied`` and
       ``tree_awake`` (as Newton does before every step), so the pass would wake no tree
+    fused_world_publish_derived: if False, the fused forward (fused_world.py) leaves the derived
+      Data fields that none of its stages reads stale (xmat, ximat, xanchor, xaxis, geom_xpos,
+      geom_xmat, site_xpos, site_xmat, crb, actuator_length, actuator_velocity, actuator_moment
+      with its row layout, cdof_dot, qfrc_spring, qfrc_damper, qfrc_adhesion, cacc, cfrc_int);
+      honored only for models without sensors. Opt-in for callers that never read those fields
+      (Newton's body_qdd/body_parent_f conversion reads cacc and cfrc_int)
   """
 
   timestep: array("*", float)
@@ -908,6 +914,7 @@ class Option:
   warn_overflow: bool
   fused_world: bool
   run_sleep_wake: bool
+  fused_world_publish_derived: bool
 
   # TODO(team): remove in future version
   @property

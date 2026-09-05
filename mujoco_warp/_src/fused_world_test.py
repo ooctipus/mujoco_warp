@@ -452,7 +452,7 @@ class FusedWorldTest(absltest.TestCase):
     """Model variants the predicate admits behave like stock.
 
     Mocap body, actuator gravcomp and force range, a second wide tree, no actuators, disabled
-    spring/damper/gravity/actuation and an nvmax overflow.
+    spring/damper/gravity/actuation, an nvmax overflow and a 12-level chain.
     """
     mocap = '<body name="mocap0" mocap="true" pos="1 1 0.5"><geom type="sphere" size="0.02"/></body>'
     second_chain = (
@@ -485,6 +485,19 @@ class FusedWorldTest(absltest.TestCase):
       ),
       # only trees with constraint rows count towards nvmax (the arm, when one of its limits is hit)
       "nvmax_overflow": (factory_like_xml(), 0, 4),
+      # a fixed link8 between link7 and the hand: 12 tree levels like Factory's Franka, one deeper
+      # than the fixture, so the ancestor walks run past the depth the other variants exercise
+      "deep_chain": (
+        factory_like_xml()
+        .replace(
+          '<body name="hand" pos="0 0 0.06" gravcomp="1">',
+          '<body name="link8" pos="0 0 0.03"><body name="hand" pos="0 0 0.03" gravcomp="1">',
+          1,
+        )
+        .replace("</body>" * 8 + "\n    </body>", "</body>" * 9 + "\n    </body>", 1),
+        0,
+        None,
+      ),
     }
     exact_int = (
       "tree_asleep",
@@ -523,6 +536,8 @@ class FusedWorldTest(absltest.TestCase):
           self.assertEqual((m.tree_dofnum.numpy() > fused_world.NVTREE_SMALL).sum(), 2)
         if name == "no_actuators":
           self.assertEqual(m.nu, 0)
+        if name == "deep_chain":
+          self.assertEqual(len(m.body_tree), 12)
         for _ in range(3):
           self._run_step(m, d_ref, fused=False)
           self._run_step(m, d_fused, fused=True)
