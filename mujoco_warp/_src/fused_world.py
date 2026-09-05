@@ -621,7 +621,8 @@ def fused_world(m: Model, d: Data) -> bool:
     return False
   if m.sensor_rne_postconstraint:
     return False
-  if any(callback is not None for callback in vars(m.callback).values()):
+  # post_position only reads the poses forward_a publishes; the other callbacks may read fused state
+  if m.callback.observes_derived_state():
     return False
   if d.nworld == 0 or not d.qpos.device.is_cuda:
     return False

@@ -668,6 +668,59 @@ class ForwardTest(parameterized.TestCase):
     mjw.forward(m, d)
     self.assertEqual(d.ctrl.numpy()[0, 0], 5.0)
 
+  def test_post_position_callback(self):
+    """Tests post_position_callback sees the final body poses and feeds make_constraint."""
+    xml = """
+    <mujoco>
+      <worldbody>
+        <geom type="plane" size="1 1 0.1" condim="1"/>
+        <body pos="0 0 0.09">
+          <freejoint/>
+          <geom type="sphere" size="0.1" condim="1"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    _, _, m, d = test_data.fixture(xml=xml)
+    # an external contact supplier: collide once, then keep the contact list across forward passes
+    mjw.collision(m, d)
+    m.opt.run_collision_detection = False
+    self.assertEqual(d.nacon.numpy()[0], 1)
+    includemargin = float(d.contact.includemargin.numpy()[0])
+
+    @wp.kernel
+    def _refresh(xpos_in: wp.array2d[wp.vec3], xpos_out: wp.array2d[wp.vec3], contact_dist_out: wp.array[float]):
+      worldid, bodyid = wp.tid()
+      xpos_out[worldid, bodyid] = xpos_in[worldid, bodyid]
+      if worldid == 0 and bodyid == 0:
+        contact_dist_out[0] = -0.02
+
+    xpos_seen = wp.zeros_like(d.xpos)
+    calls = []
+
+    def post_position(m, d):
+      calls.append(1)
+      wp.launch(_refresh, dim=(d.nworld, m.nbody), inputs=[d.xpos], outputs=[xpos_seen, d.contact.dist])
+
+    m.callback.post_position = post_position
+    mjw.forward(m, d)
+    self.assertEqual(len(calls), 1)
+    # kinematics were final when the callback ran ...
+    np.testing.assert_array_equal(xpos_seen.numpy(), d.xpos.numpy())
+    # ... and make_constraint consumed the distance the callback wrote
+    efcid = int(d.contact.efc_address.numpy()[0, 0])
+    self.assertGreaterEqual(efcid, 0)
+    self.assertAlmostEqual(float(d.efc.pos.numpy()[0, efcid]), -0.02 - includemargin, places=6)
+
+    # invoked at capture time like the other callbacks: its kernels become part of the graph
+    if wp.get_device().is_cuda:
+      d.contact.dist.fill_(1.0)
+      with wp.ScopedCapture() as capture:
+        mjw.step(m, d)
+      self.assertEqual(len(calls), 2)
+      wp.capture_launch(capture.graph)
+      self.assertAlmostEqual(float(d.contact.dist.numpy()[0]), -0.02)
+
   @parameterized.product(
     frequency=(1.5, 0.5),
     timestamp=(0.2, 0.4),
