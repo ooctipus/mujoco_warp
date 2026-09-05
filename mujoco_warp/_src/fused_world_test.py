@@ -483,7 +483,7 @@ class FusedWorldTest(absltest.TestCase):
         DisableBit.SPRING | DisableBit.DAMPER | DisableBit.GRAVITY | DisableBit.ACTUATION,
         None,
       ),
-      # only trees with constraint rows count towards nvmax (the arm when one of its limits is active)
+      # only trees with constraint rows count towards nvmax (the arm, when one of its limits is hit)
       "nvmax_overflow": (factory_like_xml(), 0, 4),
     }
     exact_int = (
