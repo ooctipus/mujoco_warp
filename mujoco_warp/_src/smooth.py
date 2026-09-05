@@ -821,6 +821,67 @@ def _cdof(
     res[dofid] = wp.spatial_vector(xaxis, wp.cross(xaxis, offset))
 
 
+@cache_kernel
+def _tree_accumulate_fused(dtype, skip_world_parent: bool):
+  """Single-launch backward tree accumulation: one CTA per world walks the levels deepest-first."""
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    body_parentid: wp.array[int],
+    body_tree_all: wp.array[int],
+    body_tree_offsets: wp.array[int],
+    # Data out:
+    value_out: wp.array2d[dtype],
+  ):
+    worldid, tid = wp.tid()
+    BLOCK_DIM = wp.block_dim()
+    nlevel = body_tree_offsets.shape[0] - 1
+
+    # level 0 holds only the world body, which never accumulates into a parent
+    for i in range(nlevel - 1):
+      level = nlevel - 1 - i
+      beg = body_tree_offsets[level]
+      end = body_tree_offsets[level + 1]
+      for nodeid in range(beg + tid, end, BLOCK_DIM):
+        bodyid = body_tree_all[nodeid]
+        pid = body_parentid[bodyid]
+        if wp.static(skip_world_parent):
+          if pid != 0:
+            wp.atomic_add(value_out, worldid, pid, value_out[worldid, bodyid])
+        else:
+          wp.atomic_add(value_out, worldid, pid, value_out[worldid, bodyid])
+      # all children of this level must land before the next level reads them
+      _syncthreads()
+
+  return kernel
+
+
+def _tree_accumulate(m: Model, d: Data, value: wp.array2d, level_kernel, skip_world_parent: bool):
+  """Adds each body's value into its parent, from the deepest tree level up to the root.
+
+  On CUDA (and unless ``block_dim.tree_accumulate`` is 0) all levels run in one launch with a block
+  barrier between levels; otherwise one launch per level is issued with ``level_kernel``.
+  """
+  block_dim = m.block_dim.tree_accumulate
+  if block_dim > 0 and value.device.is_cuda:
+    wp.launch(
+      _tree_accumulate_fused(value.dtype, skip_world_parent),
+      dim=(d.nworld, block_dim),
+      inputs=[m.body_parentid, m.body_tree_all, m.body_tree_offsets],
+      outputs=[value],
+      block_dim=block_dim,
+    )
+    return
+
+  for body_tree in reversed(m.body_tree):
+    wp.launch(level_kernel, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, value, body_tree], outputs=[value])
+
+
 @event_scope
 def com_pos(m: Model, d: Data):
   """Computes subtree center of mass positions.
@@ -830,15 +891,7 @@ def com_pos(m: Model, d: Data):
   inertias and motion degrees of freedom in the subtree CoM frame.
   """
   wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
-
-  for i in reversed(range(len(m.body_tree))):
-    body_tree = m.body_tree[i]
-    wp.launch(
-      _subtree_com_acc,
-      dim=(d.nworld, body_tree.size),
-      inputs=[m.body_parentid, d.subtree_com, body_tree],
-      outputs=[d.subtree_com],
-    )
+  _tree_accumulate(m, d, d.subtree_com, _subtree_com_acc, skip_world_parent=False)
 
   wp.launch(_subtree_div, dim=(d.nworld, m.nbody), inputs=[m.body_subtreemass, d.subtree_com], outputs=[d.subtree_com])
   wp.launch(
@@ -1084,10 +1137,7 @@ def crb(m: Model, d: Data):
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
   wp.copy(d.crb, d.cinert)
-
-  for i in reversed(range(len(m.body_tree))):
-    body_tree = m.body_tree[i]
-    wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
+  _tree_accumulate(m, d, d.crb, _crb_accumulate, skip_world_parent=True)
 
   d.M.zero_()
   wp.launch(
@@ -1475,10 +1525,7 @@ def _cfrc_backward(
 
 
 def _rne_cfrc_backward(m: Model, d: Data):
-  for body_tree in reversed(m.body_tree):
-    wp.launch(
-      _cfrc_backward, dim=[d.nworld, body_tree.size], inputs=[m.body_parentid, d.cfrc_int, body_tree], outputs=[d.cfrc_int]
-    )
+  _tree_accumulate(m, d, d.cfrc_int, _cfrc_backward, skip_world_parent=False)
 
 
 @wp.kernel

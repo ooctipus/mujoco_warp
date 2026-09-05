@@ -515,6 +515,11 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     bodies.setdefault(body_depth[i], []).append(i)
   m.body_tree = tuple(wp.array(bodies[i], dtype=int) for i in sorted(bodies))
 
+  # flattened level table for the fused single-launch tree traversal
+  levels = [bodies[i] for i in sorted(bodies)]
+  m.body_tree_all = np.concatenate(levels).astype(int)
+  m.body_tree_offsets = np.cumsum([0] + [len(level) for level in levels]).astype(int)
+
   # branch-based traversal data
   children_count = np.bincount(mjm.body_parentid[1:], minlength=mjm.nbody)
   ancestor_chain = lambda b: ancestor_chain(mjm.body_parentid[b]) + [b] if b else []
@@ -1229,6 +1234,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   sizes = {f.name: getattr(m, f.name) for f in dataclasses.fields(types.Model) if f.type is int}
   sizes.update(
     {
+      "nbody_tree_offsets": len(m.body_tree_offsets),
       "nbody_branches": len(m.body_branches),
       "nbranch_start": len(m.body_branch_start),
       "nbody_fluid_ellipsoid": len(m.body_fluid_ellipsoid_adr),
