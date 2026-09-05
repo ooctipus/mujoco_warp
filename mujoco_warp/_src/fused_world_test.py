@@ -1185,6 +1185,132 @@ class FusedWorldTest(absltest.TestCase):
     with self.assertRaises(TypeError):
       mjw.forward_worlds(m, d_sub, wp.array(selected.astype(np.int64)))
 
+  def _poison_derived(self, d):
+    """Fill fused_world.DERIVED_FIELDS with NaN (floats) or -7 (ints) so that a read shows up."""
+    for name in fused_world.DERIVED_FIELDS:
+      arr = getattr(d, name)
+      host = arr.numpy()
+      if host.dtype.kind == "f":
+        arr.assign(np.full(host.shape, np.nan, dtype=host.dtype))
+      else:
+        arr.assign(np.full(host.shape, -7, dtype=host.dtype))
+
+  def _assert_poisoned(self, d, names, poisoned: bool):
+    for name in names:
+      host = getattr(d, name).numpy()
+      if host.size == 0:
+        continue
+      stale = np.isnan(host).all() if host.dtype.kind == "f" else (host == -7).all()
+      self.assertEqual(bool(stale), poisoned, f"{name} {'read or written' if poisoned else 'not rebuilt'}")
+
+  def test_publish_derived_opt_in(self):
+    """Option.fused_world_publish_derived=False leaves exactly fused_world.DERIVED_FIELDS stale.
+
+    The stale fields are poisoned with NaN before the step: every other field of an intermediate
+    and of a finalizing fused step matches the published run (an in-step consumer of a stale field
+    would propagate the NaN), the finalizing refresh rebuilds DERIVED_FIELDS_REFRESHED, and a model
+    with sensors forces the full publish.
+    """
+    mjm, m, datas = self._make(seed=8, contact=True, equality=True, resting=True)
+    d_ref, d_opt = datas
+    _share_contacts(m, d_ref, d_opt)
+    self.assertEqual(m.nsensor, 0)
+    self.assertTrue(fused_world.publish_derived(m))
+    exact_int = (
+      "tree_asleep",
+      "tree_awake",
+      "body_awake",
+      "ntree_awake",
+      "nbody_awake",
+      "nv_awake",
+      "ncdof",
+      "nefc",
+      "nisland",
+      "tree_island",
+      "overflow",
+    )
+    # the two compiled forward_a variants agree to fp32 rounding; the solver outputs carry its
+    # run-to-run tolerance noise (see test_constraints_match_stock)
+    fields = (
+      "time",
+      "xpos",
+      "xquat",
+      "xipos",
+      "subtree_com",
+      "cinert",
+      "cdof",
+      "M",
+      "actuator_force",
+      "qfrc_actuator",
+      "cvel",
+      "qfrc_gravcomp",
+      "qfrc_passive",
+      "qfrc_bias",
+      "qfrc_smooth",
+    )
+    solver_limited = ("qacc_smooth", "qacc", "qacc_warmstart", "qvel", "qpos")
+    # the finalizing forward_c recomputes these from the post-sleep (solver-limited) velocities
+    c_refresh = ("cvel", "qfrc_passive", "qfrc_bias") + fused_world.DERIVED_FIELDS_REFRESHED
+    self.assertFalse(set(fields + solver_limited) & set(fused_world.DERIVED_FIELDS))
+    state = ("qpos", "qvel", "qacc", "qacc_warmstart", "time", "tree_asleep", "tree_awake")
+    try:
+      for finalize in (False, True):
+        # identical inputs for both runs: the solver noise of the previous step is not carried over
+        for name in state:
+          wp.copy(getattr(d_opt, name), getattr(d_ref, name))
+        m.opt.fused_world_publish_derived = True
+        self._run_step(m, d_ref, fused=True, finalize=finalize)
+        self._poison_derived(d_opt)
+        m.opt.fused_world_publish_derived = False
+        self.assertFalse(fused_world.publish_derived(m))
+        self._run_step(m, d_opt, fused=True, finalize=finalize)
+        refreshed = fused_world.DERIVED_FIELDS_REFRESHED if finalize else ()
+        stale = tuple(name for name in fused_world.DERIVED_FIELDS if name not in refreshed)
+        self._assert_poisoned(d_opt, stale, True)
+        self._assert_poisoned(d_opt, refreshed, False)
+        self._assert_int_equal(d_opt, d_ref, exact_int)
+        self._assert_awake_sets_equal(d_opt, d_ref)
+        scaled = solver_limited + (c_refresh if finalize else ())
+        for name in fields:
+          if name not in scaled:
+            self._assert_close(name, getattr(d_opt, name).numpy(), getattr(d_ref, name).numpy())
+        for name in scaled:
+          self._assert_close_scaled(name, getattr(d_opt, name).numpy(), getattr(d_ref, name).numpy(), rel=1e-4)
+        self._assert_rows_equal(m, d_opt, d_ref)
+        self.assertGreater(int(d_ref.nefc.numpy().min()), 0)
+    finally:
+      m.opt.fused_world_publish_derived = True
+
+    # sensors read the derived fields: the option is ignored
+    xml = factory_like_xml(contact=True, equality=True).replace(
+      "</mujoco>", '<sensor><jointpos joint="j1"/></sensor></mujoco>', 1
+    )
+    mjm_s, mjd_s, m_s, _ = test_data.fixture(xml=xml, nworld=1)
+    m_s.opt.run_collision_detection = False
+    self.assertGreater(m_s.nsensor, 0)
+    m_s.opt.fused_world_publish_derived = False
+    self.assertTrue(fused_world.publish_derived(m_s))
+    d_s = mjw.put_data(mjm_s, mjd_s, nworld=2)
+    self.assertTrue(fused_world.fused_world(m_s, d_s))
+    self._poison_derived(d_s)
+    mjw.forward(m_s, d_s)
+    wp.synchronize()
+    # every entry the full publish writes is rebuilt (geom/site frames of static bodies are
+    # constants that only put_data writes)
+    dynamic = m_s.fused_world_body_info.numpy()[:, 2, 2] != 0
+    geom_dynamic = dynamic[m_s.geom_bodyid.numpy()]
+    self.assertTrue(geom_dynamic.any() and not geom_dynamic.all())
+    for name in fused_world.DERIVED_FIELDS:
+      host = getattr(d_s, name).numpy()
+      if name.startswith("geom_"):
+        host = host[:, geom_dynamic]
+      elif name.startswith("site_"):
+        host = host[:, dynamic[m_s.site_bodyid.numpy()]]
+      if host.dtype.kind == "f":
+        self.assertTrue(np.isfinite(host).all(), name)
+      else:
+        self.assertTrue((host != -7).all(), name)
+
 
 if __name__ == "__main__":
   wp.init()

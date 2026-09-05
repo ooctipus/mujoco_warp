@@ -35,8 +35,8 @@ constraint solver for models that satisfy :func:`fused_world`:
 
 Every canonical ``Data`` field written by the replaced kernels is published so that downstream
 consumers see identical state, unless ``Option.fused_world_publish_derived`` is False (an opt-in
-that skips the derived fields no fused stage reads, see :class:`Option`). Integer and sleep/island
-state is reproduced exactly; floating point
+that skips :data:`DERIVED_FIELDS`, which no fused stage reads; see :func:`publish_derived`).
+Integer and sleep/island state is reproduced exactly; floating point
 differs from the stock launches only through summation and factorization order (scalar instead of
 tile Cholesky for the dense inertia blocks: fp32 rounding, a few ulps in ``qLD``/``qacc_smooth``).
 Row order within a constraint family and the ``body_awake_ind``/``dof_awake_ind`` order are
@@ -569,6 +569,10 @@ def static_eligible(mjm, m: Model) -> bool:
     return False
   if m.has_fluid or m.flg_adhesion or not m.is_sparse:
     return False
+  # the fused constraint kernel adds no surface velocities (constraint._add_surface_vel reads the
+  # geom frames, which the publish opt-in may leave stale)
+  if m.flg_surfacevel:
+    return False
 
   jnt_type = np.asarray(mjm.jnt_type)
   if not np.isin(jnt_type, (JointType.FREE, JointType.HINGE, JointType.SLIDE)).all():
@@ -701,6 +705,51 @@ def fused_world(m: Model, d: Data) -> bool:
   if d.qLD.shape[1] != m.qLD_block_total:
     return False
   return True
+
+
+# Data fields that only forward_a derives and no later stage of a fused step reads: forward_m/b/c,
+# the constraint solver, camlight, the energy terms, the post_position callback and forward_worlds
+# consume the state (qpos, qvel, sleep arrays), xpos/xquat/xipos, subtree_com, cinert, cdof, M,
+# cvel, the qfrc_* forces and actuator_force, which are published unconditionally. When
+# publish_derived(m) is False, forward_a and forward_worlds leave these fields stale; the
+# finalizing forward_c rebuilds DERIVED_FIELDS_REFRESHED on the post-sleep velocities, so after a
+# finalizing step only the frames, crb and the actuator length/moment stay stale.
+DERIVED_FIELDS = (
+  "xmat",
+  "ximat",
+  "xanchor",
+  "xaxis",
+  "geom_xpos",
+  "geom_xmat",
+  "site_xpos",
+  "site_xmat",
+  "crb",
+  "actuator_length",
+  "moment_rownnz",
+  "moment_rowadr",
+  "moment_colind",
+  "actuator_moment",
+  "actuator_velocity",
+  "cdof_dot",
+  "qfrc_spring",
+  "qfrc_damper",
+  "qfrc_adhesion",
+  "cacc",
+  "cfrc_int",
+)
+DERIVED_FIELDS_REFRESHED = ("actuator_velocity", "cdof_dot", "qfrc_spring", "qfrc_damper", "cacc", "cfrc_int")
+
+
+def publish_derived(m: Model) -> bool:
+  """Return whether the fused forward publishes :data:`DERIVED_FIELDS`.
+
+  False only when ``Option.fused_world_publish_derived`` is False and the model has no sensors
+  (sensors read the derived frames, velocities and accelerations). Only host state is read, so the
+  helper is safe under graph capture. Callers that read a field of :data:`DERIVED_FIELDS` from
+  ``Data`` after a step (Newton's ``body_qdd``/``body_parent_f`` conversion reads ``cacc`` and
+  ``cfrc_int``) must leave the option on.
+  """
+  return bool(getattr(m.opt, "fused_world_publish_derived", True) or m.nsensor > 0)
 
 
 # resident CTAs per SM requested from the compiler for the fused position/velocity kernel: 7 CTAs/SM
@@ -3462,8 +3511,7 @@ def forward_a(
   contact buckets shared with ``forward_m`` (their per-world counts are zeroed here). The wake pass
   is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``);
   ``run_wake`` overrides that option (``tree_awake`` is republished from ``tree_asleep``
-  regardless). The derived publishes are skipped when ``Option.fused_world_publish_derived`` is
-  False on a sensorless model.
+  regardless). :data:`DERIVED_FIELDS` are left stale when :func:`publish_derived` is False.
 
   With ``world_ids`` (int32 world indices) only those worlds run, CTA ``slot`` serving world
   ``world_ids[slot]``; ``count`` bounds the valid entries as a host int or a one-element int32
@@ -3473,8 +3521,7 @@ def forward_a(
     groups = contact_groups(d)
   if run_wake is None:
     run_wake = getattr(m.opt, "run_sleep_wake", True)
-  # sensors read the derived fields, so they force the full publish
-  publish = bool(getattr(m.opt, "fused_world_publish_derived", True) or m.nsensor > 0)
+  publish = publish_derived(m)
   grid_worlds, world_count = subset_launch_dim(d, world_ids, count)
   wp.launch(
     _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, publish, world_ids is not None),
