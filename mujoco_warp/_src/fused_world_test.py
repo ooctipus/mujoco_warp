@@ -60,9 +60,13 @@ def factory_like_xml(n_free: int = 19, n_fixed: int = 19, n_hover: int = 3) -> s
       </body></body></body></body></body></body></body></body>
     </body>
   """
+  # alternate MuJoCo "simple" bodies (centered cubes: diagonal inertia blocks) and bodies with an
+  # offset, rotated inertial frame (dense 6x6 inertia blocks, like Factory's held parts)
+  simple_geom = '<geom type="box" size="0.02 0.02 0.02" mass="0.05"/>'
+  offset_geom = '<geom type="box" size="0.02 0.03 0.04" pos="0.01 0.005 0.0" euler="0.3 0.2 0.1" mass="0.05"/>'
   free = "".join(
     f'<body name="free{i}" pos="{0.5 + 0.1 * i} 0 0.3" gravcomp="{1 if i < n_hover else 0}">'
-    f'<freejoint/><geom type="box" size="0.02 0.02 0.02" mass="0.05"/></body>\n'
+    f"<freejoint/>{simple_geom if i % 2 == 0 else offset_geom}</body>\n"
     for i in range(n_free)
   )
   fixed = "".join(
@@ -118,6 +122,10 @@ class FusedWorldTest(absltest.TestCase):
     self.assertEqual(m.nbody, 1 + 11 + 19 + 19)
     self.assertEqual(m.ntree, 20)
     self.assertEqual(m.nu, 16)
+    # both factor paths are exercised: compact (diagonal) blocks and dense scalar Cholesky blocks
+    block_adr = m.qLD_block_adr.numpy()[m.tree_dofadr.numpy()]
+    self.assertGreater((block_adr == -2).sum(), 0)
+    self.assertGreater((block_adr >= 0).sum(), 1)
 
     rng = np.random.default_rng(seed)
     qpos, qvel, ctrl = _random_state(mjm, self.NWORLD, rng, qvel_scale)
