@@ -1114,7 +1114,8 @@ def _M(
 ):
   worldid, dofid = wp.tid()
   bodyid = dof_bodyid[dofid]
-  madr_ij = M_rowadr[dofid] + M_rownnz[dofid] - 1
+  rownnz = M_rownnz[dofid]
+  madr_ij = M_rowadr[dofid] + rownnz - 1
 
   # init M(i,i) with armature inertia
   M_out[worldid, madr_ij] = dof_armature[worldid % dof_armature.shape[0], dofid]
@@ -1122,8 +1123,10 @@ def _M(
   # precompute buf = crb_body_i * cdof_i
   buf = math.inert_vec(crb_in[worldid, bodyid], cdof_in[worldid, dofid])
 
-  # sparse backward pass over ancestors
-  while dofid >= 0:
+  # sparse backward pass over the ancestors stored in this CSR row. MuJoCo's "simple" dofs keep
+  # their parent chain but store only the diagonal (rownnz == 1); an unbounded walk would write
+  # their (analytically zero) ancestor terms into other rows' diagonal slots and race with them.
+  for _k in range(rownnz):
     M_out[worldid, madr_ij] += wp.dot(cdof_in[worldid, dofid], buf)
     madr_ij -= 1
     dofid = dof_parentid[dofid]

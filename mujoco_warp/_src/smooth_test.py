@@ -25,6 +25,7 @@ import mujoco_warp as mjw
 from mujoco_warp import ConeType
 from mujoco_warp import DisableBit
 from mujoco_warp import test_data
+from mujoco_warp._src import smooth
 from mujoco_warp._src import types
 
 # tolerance for difference between MuJoCo and MJWarp smooth calculations - mostly
@@ -194,6 +195,42 @@ class SmoothTest(parameterized.TestCase):
     _assert_eq(d.crb.numpy()[0], mjd.crb, "crb")
 
     _assert_eq(d.M.numpy()[0], mjd.M, "M")
+
+  def test_M_simple_dof_rows(self):
+    """The ancestor walk of smooth._M stays inside a dof's CSR row.
+
+    MuJoCo's "simple" dofs (free joints of bodies with diagonal inertia) keep their parent chain in
+    dof_parentid but store only their diagonal (M_rownnz == 1). Walking the chain past the row wrote
+    the (analytically zero, in fp32 non-zero) ancestor terms into other rows' diagonal slots. Two
+    synthetic dofs with a large cross term make the stray write visible: the correct M is diagonal.
+    """
+    nv = 2
+    dof_bodyid = wp.array([1, 2], dtype=int)
+    dof_parentid = wp.array([-1, 0], dtype=int)
+    dof_armature = wp.array([[0.5, 0.25]], dtype=float)
+    M_rownnz = wp.array([1, 1], dtype=int)
+    M_rowadr = wp.array([0, 1], dtype=int)
+    # both dofs rotate about z; body inertias are diagonal with Izz = 1 and 2 (no mass terms)
+    cdof = wp.array([[wp.spatial_vector(0.0, 0.0, 1.0, 0.0, 0.0, 0.0)] * nv], dtype=wp.spatial_vector)
+    crb = wp.array(
+      [
+        [
+          types.vec10(0.0),
+          types.vec10(0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+          types.vec10(0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ]
+      ],
+      dtype=types.vec10,
+    )
+    M = wp.full((1, nv), wp.inf, dtype=float)
+    wp.launch(
+      smooth._M,
+      dim=(1, nv),
+      inputs=[dof_bodyid, dof_parentid, dof_armature, M_rownnz, M_rowadr, cdof, crb],
+      outputs=[M],
+    )
+    # diagonal only: armature + cdof . (crb cdof); walking past the row adds dof 1's 2.0 to dof 0
+    np.testing.assert_array_equal(M.numpy()[0], np.array([1.5, 2.25], dtype=np.float32))
 
   @parameterized.parameters(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE)
   def test_factor_m(self, jacobian):
