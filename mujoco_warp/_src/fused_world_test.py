@@ -750,9 +750,9 @@ class FusedWorldTest(absltest.TestCase):
 
     nefc = d_ref.nefc.numpy()
     self.assertGreater(nefc.min(), d_ref.njmax)
-    self._assert_int_equal(
-      d_fused, d_ref, ("ne", "nf", "nl", "nefc", "overflow", "tree_asleep", "tree_awake", "nisland", "tree_island", "island_nv")
-    )
+    # which contact rows land below njmax follows the allocation order (stock: atomics, fused:
+    # bucket order), so the islands built from them are not comparable in the overflow case
+    self._assert_int_equal(d_fused, d_ref, ("ne", "nf", "nl", "nefc", "overflow", "tree_asleep", "tree_awake"))
     overflow = d_ref.overflow.numpy()
     self.assertTrue((overflow & OverflowType.NEFC).all())
     self.assertFalse((overflow & OverflowType.NJMAX_NNZ).any())
@@ -805,6 +805,36 @@ class FusedWorldTest(absltest.TestCase):
     self.assertFalse((overflow & OverflowType.NEFC).any())
     self.assertTrue(np.isfinite(d_fused.qacc.numpy()).all())
     self.assertTrue(np.isfinite(d_fused.qpos.numpy()).all())
+
+  def test_contact_bucket_capacity(self):
+    """Bucket capacity is exact when the budget allows; a saturated bucket flags NARROWPHASE."""
+    self.assertEqual(fused_world.bucket_capacity(8, 1024), 1024)
+    self.assertEqual(fused_world.bucket_capacity(1024, 1024 * 2400), (fused_world._GROUP_BUDGET_BYTES // 4) // 1024)
+    self.assertEqual(fused_world.bucket_capacity(1 << 20, 1 << 20), (fused_world._GROUP_BUDGET_BYTES // 4) >> 20)
+    mjm, m, datas = self._make(seed=8, contact=True, resting=True)
+    d_ref, d_fused = datas
+    for d in datas:
+      sleep.update_sleep(m, d)
+    _share_contacts(m, d_ref, d_fused)
+    self._run_forward(m, d_ref, fused=False)
+    # forward_m with buckets that hold two contacts per world
+    fused_world.forward_a(m, d_fused)
+    groups = fused_world.ContactGroups(2, wp.zeros((self.NWORLD,), dtype=int), wp.empty((2 * self.NWORLD,), dtype=int))
+    fused_world._bucket_contacts(m, d_fused, groups)
+    fused_world._launch_forward_m(m, d_fused, groups)
+    wp.synchronize()
+    self.assertTrue((d_fused.overflow.numpy() & OverflowType.NARROWPHASE).all())
+    self.assertEqual(int(d_ref.overflow.numpy().max()), 0)
+    self.assertTrue((groups.count.numpy() > 2).all())
+    self.assertTrue((d_fused.nefc.numpy() < d_ref.nefc.numpy()).all())
+    # the rows that were built are valid rows of the reference
+    for w in range(self.NWORLD):
+      rows_ref = _rows(m, d_ref, w)
+      for key, (scal, jac, _) in _rows(m, d_fused, w).items():
+        scal_ref, jac_ref, _ = rows_ref[key]
+        for name in scal:
+          np.testing.assert_allclose(scal[name], scal_ref[name], rtol=_RTOL, atol=_ATOL, err_msg=f"row {key} {name}")
+        self.assertEqual(sorted(jac), sorted(jac_ref))
 
   def test_integration_matches_stock(self):
     """One step with contacts: implicitfast integration, sleep bookkeeping and the refresh agree."""

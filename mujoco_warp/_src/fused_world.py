@@ -23,9 +23,8 @@ constraint solver for models that satisfy :func:`fused_world`:
   gravity compensation), RNE bias forces and the position/velocity servo actuator forces.
 * ``forward_m``: ``constraint.make_constraint`` (JOINT equalities, dof friction, slide/hinge limits
   and pyramidal contact rows from the world's contact list), ``sleep.wake_equality``,
-  ``sleep.update_sleep`` and the ``island`` bitset flood fill. Two small grouping launches (a
-  counting sort of the live contacts by world) precede it because externally supplied contacts carry
-  a global id order.
+  ``sleep.update_sleep`` and the ``island`` bitset flood fill. One small bucket launch (contact ids
+  per world) precedes it because externally supplied contacts carry a global id order.
 * ``forward_b``: ``qfrc_smooth`` (with the sleeping-tree freeze), ``xfrc_accumulate``, the per-tree
   factor/solve for ``qacc_smooth`` (``qLD``/``qLDiagInv``) and the active-DOF compaction maps that
   the compact constraint solver consumes.
@@ -52,6 +51,8 @@ Warp pitfalls handled here: tile element assignment embeds a block barrier, so s
 thread-divergent code use single-line native snippets; multi-line native snippets live at module
 scope.
 """
+
+import dataclasses
 
 import numpy as np
 import warp as wp
@@ -165,18 +166,6 @@ return value;
 def _warp_scan_inclusive(value: int) -> int: ...
 
 
-@wp.func_native(
-  snippet="""
-#if defined(__CUDA_ARCH__)
-return (int)threadIdx.x;
-#else
-return 0;
-#endif
-"""
-)
-def _thread_index() -> int: ...
-
-
 # module-level shared-store snippets for the tiles shared between the fused kernels and their
 # helpers
 @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
@@ -205,6 +194,10 @@ def _or_tree32_u(values: wp.tile[wp.uint32, NTREE_CAP], index: int, value: wp.ui
 
 @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
 def _st_chunk_i(values: wp.tile[int, NV_CAP], index: int, value: int): ...
+
+
+@wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
+def _st_chunk_f(values: wp.tile[float, NV_CAP], index: int, value: float): ...
 
 
 @wp.func
@@ -619,6 +612,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     # Data out:
     tree_asleep_out: wp.array2d[int],
     tree_awake_out: wp.array2d[int],
+    world_con_count_out: wp.array[int],
     xpos_out: wp.array2d[wp.vec3],
     xquat_out: wp.array2d[wp.quat],
     xmat_out: wp.array2d[wp.mat33],
@@ -685,6 +679,9 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     is_dof = tid < nv
     is_tree = tid < ntree
     nlevel = body_tree_offsets.shape[0] - 1
+    if tid == 0:
+      # the contact bucket pass between forward_a and forward_m appends to this count
+      world_con_count_out[worldid] = 0
 
     gravity_enabled = (opt_disableflags & DisableBit.GRAVITY) == 0
     dsbl_spring = (opt_disableflags & DisableBit.SPRING) != 0
@@ -1504,86 +1501,91 @@ def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG
 
 
 # ------------------------------------------------------------------------------------------------
-# Per-world contact grouping: Newton assigns contact ids with a global atomic counter, so the
-# contacts of one world are scattered over [0, nacon). A counting sort by world (count, then prefix
-# + scatter) gives every CTA a contiguous id list. Contacts may be appended every substep (wake
-# injection), so the grouping runs per substep. The slot order within a world follows the scatter
-# atomics, i.e. the contact row order is unspecified exactly as with the stock atomic row
-# allocation.
+# Per-world contact buckets: Newton assigns contact ids with a global atomic counter, so the
+# contacts of one world are scattered over [0, nacon). One pass over the live contacts appends every
+# id to its world's bucket. The bucket capacity is naconmax (exact: any distribution of the global
+# pool fits) while nworld * capacity stays within _GROUP_BUDGET_BYTES, otherwise the budget divided
+# by nworld (at least the nconmax share); a world with more contacts keeps the first ``capacity``
+# and raises OverflowType.NARROWPHASE, which is stricter than the stock global pool. Contacts may be
+# appended every substep (wake injection), so the pass runs per substep; forward_a zeroes the
+# per-world counts first. The slot order within a bucket follows the atomics, i.e. the contact row
+# order is unspecified exactly as with the stock atomic row allocation.
 # ------------------------------------------------------------------------------------------------
 
-# fixed grid for the grouping launches (they grid-stride over nacon, which is a device scalar)
+# fixed grid for the bucket pass (it grid-strides over nacon, which is a device scalar)
 _GROUP_THREADS = 65536
+# memory budget of the per-world contact buckets (ids): 16 MB is 4096 ids per world at 1024 worlds
+_GROUP_BUDGET_BYTES = 16 << 20
 
 
 @wp.kernel(enable_backward=False, grid_stride=False)
-def _world_contact_count(
+def _world_contact_bucket(
   # Data in:
   nacon_in: wp.array[int],
   contact_worldid_in: wp.array[int],
   # In:
+  capacity: int,
   total_threads: int,
   # Out:
   count_out: wp.array[int],
+  ids_out: wp.array[int],
+  overflow_out: wp.array[int],
 ):
   tid = wp.tid()
-  n = wp.min(nacon_in[0], contact_worldid_in.shape[0])
-  for cid in range(tid, n, total_threads):
-    wp.atomic_add(count_out, contact_worldid_in[cid], 1)
-
-
-@wp.kernel(enable_backward=False, grid_stride=False, launch_bounds=(NV_CAP,))
-def _world_contact_scatter(
-  # Data in:
-  nworld: int,
-  nacon_in: wp.array[int],
-  contact_worldid_in: wp.array[int],
-  # In:
-  count_in: wp.array[int],
-  total_threads: int,
-  # Out:
-  fill_out: wp.array[int],
-  start_out: wp.array[int],
-  list_out: wp.array[int],
-):
-  tid = wp.tid()
-  local = _thread_index()
-  lane = local & 31
-  warp = local >> 5
-  chunk_sh = wp.tile_empty(shape=(NV_CAP,), dtype=int, storage="shared")
-  scan_sh = wp.tile_empty(shape=(8,), dtype=int, storage="shared")
-
-  # every block recomputes the exclusive world prefix: thread-local chunk sums, block scan
-  chunk = (nworld + NV_CAP - 1) // NV_CAP
-  begin = wp.min(local * chunk, nworld)
-  end = wp.min(begin + chunk, nworld)
-  total = int(0)
-  for w in range(begin, end):
-    total += count_in[w]
-  prefix = _block_scan(scan_sh, total, lane, warp)
-  _st_chunk_i(chunk_sh, local, prefix)
-  if tid < NV_CAP:
-    # the first block publishes the per-world starts for the consumer kernel
-    running = int(prefix)
-    for w in range(begin, end):
-      start_out[w] = running
-      running += count_in[w]
-  _sync()
-
   n = wp.min(nacon_in[0], contact_worldid_in.shape[0])
   for cid in range(tid, n, total_threads):
     worldid = contact_worldid_in[cid]
-    c = worldid // chunk
-    base = chunk_sh[c]
-    for w in range(c * chunk, worldid):
-      base += count_in[w]
-    slot = wp.atomic_add(fill_out, worldid, 1)
-    list_out[base + slot] = cid
+    slot = wp.atomic_add(count_out, worldid, 1)
+    if slot < capacity:
+      ids_out[worldid * capacity + slot] = cid
+    else:
+      wp.atomic_or(overflow_out, worldid, OverflowType.NARROWPHASE)
 
 
-# resident CTAs per SM requested from the compiler for the register-bound middle kernel (two waves
-# at 1024 worlds on 170 SMs need >= 4 CTAs/SM)
-_FORWARD_M_MIN_BLOCKS = 4
+@dataclasses.dataclass
+class ContactGroups:
+  """Per-world contact id buckets consumed by ``forward_m``.
+
+  Attributes:
+    capacity: ids per world.
+    count: contacts per world, zeroed by ``forward_a``          (nworld,)
+    ids: contact ids of world w at [w * capacity, w * capacity + count[w]) (nworld * capacity,)
+  """
+
+  capacity: int
+  count: wp.array
+  ids: wp.array
+
+
+def bucket_capacity(nworld: int, naconmax: int) -> int:
+  """Contact ids per world bucket: naconmax (exact) within the budget, else the budget share."""
+  share = max(1, -(-naconmax // nworld))
+  budget = max(share, (_GROUP_BUDGET_BYTES // 4) // max(nworld, 1))
+  return max(1, min(naconmax, budget))
+
+
+def contact_groups(d: Data) -> ContactGroups:
+  """Allocate the per-world contact buckets for one fused forward pass."""
+  capacity = bucket_capacity(d.nworld, d.naconmax)
+  return ContactGroups(capacity, wp.empty((d.nworld,), dtype=int), wp.empty((d.nworld * capacity,), dtype=int))
+
+
+def _bucket_contacts(m: Model, d: Data, groups: ContactGroups):
+  """Append every live contact id to its world's bucket (``groups.count`` must be zero)."""
+  if m.opt.disableflags & DisableBit.CONTACT:
+    return
+  threads = min(_GROUP_THREADS, max(d.naconmax, 1))
+  wp.launch(
+    _world_contact_bucket,
+    dim=threads,
+    inputs=[d.nacon, d.contact.worldid, groups.capacity, threads],
+    outputs=[groups.count, groups.ids, d.overflow],
+  )
+
+
+# resident CTAs per SM requested from the compiler for the register-bound middle kernel: 7 CTAs/SM
+# hold 1024 worlds in one wave on 170 SMs (<= 73 registers; the small spill is L1-resident)
+_FORWARD_M_MIN_BLOCKS = 7
 
 
 @cache_kernel
@@ -1652,7 +1654,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
     contact_friction_in: wp.array[vec5],
     contact_solref_in: wp.array[wp.vec2],
     contact_solimp_in: wp.array[vec5],
-    world_con_start_in: wp.array[int],
+    world_con_capacity_in: int,
     world_con_count_in: wp.array[int],
     world_con_list_in: wp.array[int],
     # Data out:
@@ -1704,6 +1706,14 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
     c_rownnz_sh = wp.tile_empty(shape=(NV,), dtype=int, storage="shared")
     c_body1_sh = wp.tile_empty(shape=(NV,), dtype=int, storage="shared")
     c_body2_sh = wp.tile_empty(shape=(NV,), dtype=int, storage="shared")
+    c_pair_sh = wp.tile_empty(shape=(NV,), dtype=int, storage="shared")
+    c_type_sh = wp.tile_empty(shape=(NV,), dtype=int, storage="shared")
+    c_k_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
+    c_b_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
+    c_imp_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
+    c_D_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
+    c_pos_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
+    c_margin_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
 
     lane = tid & 31
     warp = tid >> 5
@@ -2030,13 +2040,14 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
     nl = row_base - ne - nf
 
     # pyramidal contacts of this world: ndim rows per active contact, one jtdaj block per contact.
-    # Per chunk of BLOCK contacts, one thread per contact allocates rows/nonzeros/blocks and writes
-    # the bookkeeping; the rows themselves are then distributed one per thread (a condim-6 contact
-    # owns ten).
+    # Per chunk of BLOCK contacts: one thread per contact allocates rows/nonzeros/blocks, writes the
+    # bookkeeping and evaluates the impedance once (it depends on the contact, not on the row); the
+    # Jacobian entries are then computed one (row, dof) pair per thread with contiguous stores, and
+    # finally one thread per row sums Jqvel in dof order and writes the row parameters.
     nblock = wp.min(row_base, njmax_in)
     if con_on:
-      ncon = world_con_count_in[worldid]
-      cstart = world_con_start_in[worldid]
+      ncon = wp.min(world_con_count_in[worldid], world_con_capacity_in)
+      cstart = worldid * world_con_capacity_in
       for i0 in range(0, ncon, BLOCK):
         i = i0 + tid
         chunk_n = wp.min(BLOCK, ncon - i0)
@@ -2049,17 +2060,23 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         body1 = int(0)
         body2 = int(0)
         geom = wp.vec2i(0, 0)
+        pos = float(0.0)
+        includemargin = float(0.0)
         if i < ncon:
           cid = world_con_list_in[cstart + i]
-          if contact_type_in[cid] & ContactType.CONSTRAINT:
-            if contact_dist_in[cid] - contact_includemargin_in[cid] < 0.0:
+          ctype = contact_type_in[cid]
+          dist = contact_dist_in[cid]
+          includemargin = contact_includemargin_in[cid]
+          condim = contact_dim_in[cid]
+          geom = contact_geom_in[cid]
+          pos = dist - includemargin
+          if ctype & ContactType.CONSTRAINT:
+            if pos < 0.0:
               active = 1
-              condim = contact_dim_in[cid]
               ndim = 1
               if condim > 1:
                 ndim = 2 * (condim - 1)
               rows = ndim
-              geom = contact_geom_in[cid]
               body1 = body_weldid[geom_bodyid[geom[0]]]
               body2 = body_weldid[geom_bodyid[geom[1]]]
               # count the merged ancestor chain excluding common dofs (constraint._efc_contact_init)
@@ -2088,7 +2105,13 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         nnz_ok = int(1)
         if rowadr + nnz > njmax_nnz_in:
           nnz_ok = 0
+        # the nonzero prefix doubles as the (row, dof) pair prefix; contacts whose nonzeros do not
+        # fit keep their pair slots but own no entries (rownnz stashed as 0)
+        pair_excl = rowadr - nnz_base
+        pairs_total = nnz_total
 
+        efc_type = int(ConstraintType.CONTACT_FRICTIONLESS)
+        kbid = wp.vec4(0.0)
         if active == 1:
           for dim in range(ndim):
             efcid = base + dim
@@ -2109,23 +2132,122 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
             efc_jtdaj_adr_out[worldid, jgid] = base
             efc_jtdaj_nrow_out[worldid, jgid] = wp.min(ndim, njmax_in - base)
             _mark_tree_edge(edge_sh, body_treeid[geom_bodyid[geom[0]]], body_treeid[geom_bodyid[geom[1]]])
+          # row parameters shared by the contact's rows (constraint._efc_contact_update); the
+          # inverse weight uses the geom bodies
+          body_invweight0_id = worldid % body_invweight0.shape[0]
+          invweight = (
+            body_invweight0[body_invweight0_id, geom_bodyid[geom[0]]][0]
+            + body_invweight0[body_invweight0_id, geom_bodyid[geom[1]]][0]
+          )
+          if ndim > 1:
+            fri0 = contact_friction_in[cid][0]
+            invweight = invweight + fri0 * fri0 * invweight
+            invweight = invweight * 2.0 * fri0 * fri0 * impratio_invsqrt * impratio_invsqrt
+            efc_type = int(ConstraintType.CONTACT_PYRAMIDAL)
+          kbid = constraint._efc_kbid(
+            opt_disableflags, timestep, pos, invweight, contact_solref_in[cid], contact_solimp_in[cid]
+          )
         else:
           cid = -1
-        # stash the chunk's contacts for the row phase
+        # stash the chunk's contacts for the pair and row phases
         _st_chunk_i(c_cid_sh, tid, cid)
         _st_chunk_i(c_row_sh, tid, row_excl)
+        _st_chunk_i(c_pair_sh, tid, pair_excl)
         _st_chunk_i(c_rowadr_sh, tid, rowadr)
         _st_chunk_i(c_rownnz_sh, tid, rownnz * nnz_ok)
         _st_chunk_i(c_body1_sh, tid, body1)
         _st_chunk_i(c_body2_sh, tid, body2)
+        _st_chunk_i(c_type_sh, tid, efc_type)
+        _st_chunk_f(c_k_sh, tid, kbid[0])
+        _st_chunk_f(c_b_sh, tid, kbid[1])
+        _st_chunk_f(c_imp_sh, tid, kbid[2])
+        _st_chunk_f(c_D_sh, tid, kbid[3])
+        _st_chunk_f(c_pos_sh, tid, pos)
+        _st_chunk_f(c_margin_sh, tid, includemargin)
         _sync()
 
+        # Jacobian entries, one (row, dof) pair per thread (constraint._efc_contact_jac_sparse)
+        for p in range(tid, pairs_total, BLOCK):
+          # owning contact: the last chunk entry whose pair prefix is <= p (contacts without pairs
+          # share the prefix of their successor, so the search never lands on one)
+          lo = int(0)
+          hi = chunk_n - 1
+          while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if c_pair_sh[mid] <= p:
+              lo = mid
+            else:
+              hi = mid - 1
+          rownnz = c_rownnz_sh[lo]
+          if rownnz == 0:
+            continue
+          local = p - c_pair_sh[lo]
+          dim = local / rownnz
+          k = local - dim * rownnz
+          efcid = row_base + c_row_sh[lo] + dim
+          if efcid >= njmax_in:
+            continue
+          cid = c_cid_sh[lo]
+          body1 = c_body1_sh[lo]
+          body2 = c_body2_sh[lo]
+          pyramidal = c_type_sh[lo] == ConstraintType.CONTACT_PYRAMIDAL
+          # k-th dof of the merged ancestor chain; common ancestors are excluded from rownnz, so one
+          # body owns it
+          da1 = body_dofadr[body1] + body_dofnum[body1] - 1
+          da2 = body_dofadr[body2] + body_dofnum[body2] - 1
+          da = wp.max(da1, da2)
+          for _step in range(k):
+            if da1 == da:
+              da1 = dof_parentid[da1]
+            if da2 == da:
+              da2 = dof_parentid[da2]
+            da = wp.max(da1, da2)
+          body = body2
+          sign = float(1.0)
+          if da1 == da:
+            body = body1
+            sign = -1.0
+          con_pos = contact_pos_in[cid]
+          frame_0 = contact_frame_in[cid, 0]
+          frame_i = wp.vec3(0.0)
+          dimid2 = int(0)
+          frii = float(0.0)
+          if pyramidal:
+            dimid2 = dim / 2 + 1
+            frii = contact_friction_in[cid][dimid2 - 1]
+            if dimid2 < 3:
+              frame_i = contact_frame_in[cid, dimid2]
+            else:
+              frame_i = contact_frame_in[cid, dimid2 - 3]
+          cdof = cdof_in[worldid, da]
+          cdof_ang = wp.spatial_top(cdof)
+          offset = con_pos - subtree_com_in[worldid, body_rootid[body]]
+          jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
+          jacr_dif = cdof_ang * sign
+          J = float(0.0)
+          Ji = float(0.0)
+          for xyz in range(3):
+            J += frame_0[xyz] * jacp_dif[xyz]
+            if pyramidal:
+              if dimid2 < 3:
+                Ji += frame_i[xyz] * jacp_dif[xyz]
+              else:
+                Ji += frame_i[xyz] * jacr_dif[xyz]
+          if pyramidal:
+            if dim % 2 == 0:
+              J += Ji * frii
+            else:
+              J -= Ji * frii
+          adr = c_rowadr_sh[lo] + dim * rownnz + k
+          efc_J_colind_out[worldid, 0, adr] = da
+          efc_J_out[worldid, 0, adr] = J
+        _sync()
+
+        # rows: Jqvel from the written entries in dof order, then the row parameters (_efc_row)
         for r in range(tid, rows_total, BLOCK):
           efcid = row_base + r
           if efcid >= njmax_in:
             continue
-          # owning contact: the last chunk entry whose row prefix is <= r (inactive contacts share
-          # the prefix of their successor, so the search never lands on one)
           lo = int(0)
           hi = chunk_n - 1
           while lo < hi:
@@ -2138,104 +2260,24 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
           dim = r - c_row_sh[lo]
           rownnz = c_rownnz_sh[lo]
           rowadr_dim = c_rowadr_sh[lo] + dim * rownnz
-          body1 = c_body1_sh[lo]
-          body2 = c_body2_sh[lo]
-
-          condim = contact_dim_in[cid]
-          geom = contact_geom_in[cid]
-          includemargin = contact_includemargin_in[cid]
-          pos = contact_dist_in[cid] - includemargin
-          friction = contact_friction_in[cid]
-          # row parameters (constraint._efc_contact_update): the inverse weight uses the geom bodies
-          body_invweight0_id = worldid % body_invweight0.shape[0]
-          invweight = (
-            body_invweight0[body_invweight0_id, geom_bodyid[geom[0]]][0]
-            + body_invweight0[body_invweight0_id, geom_bodyid[geom[1]]][0]
-          )
-          efc_type = int(ConstraintType.CONTACT_FRICTIONLESS)
-          dimid2 = int(0)
-          frii = float(0.0)
-          if condim > 1:
-            fri0 = friction[0]
-            invweight = invweight + fri0 * fri0 * invweight
-            invweight = invweight * 2.0 * fri0 * fri0 * impratio_invsqrt * impratio_invsqrt
-            efc_type = int(ConstraintType.CONTACT_PYRAMIDAL)
-            dimid2 = dim / 2 + 1
-            frii = friction[dimid2 - 1]
-
-          # pyramidal Jacobian row (constraint._efc_contact_jac_sparse); rownnz is 0 on nnz overflow
           Jqvel = float(0.0)
-          if rownnz > 0:
-            con_pos = contact_pos_in[cid]
-            frame_0 = contact_frame_in[cid, 0]
-            frame_i = wp.vec3(0.0)
-            if condim > 1:
-              if dimid2 < 3:
-                frame_i = contact_frame_in[cid, dimid2]
-              else:
-                frame_i = contact_frame_in[cid, dimid2 - 3]
-            da1 = body_dofadr[body1] + body_dofnum[body1] - 1
-            da2 = body_dofadr[body2] + body_dofnum[body2] - 1
-            da = wp.max(da1, da2)
-            for k in range(rownnz):
-              # common ancestors are excluded from rownnz, so one body owns this dof
-              body = body2
-              sign = float(1.0)
-              if da1 == da:
-                body = body1
-                sign = -1.0
-              cdof = cdof_in[worldid, da]
-              cdof_ang = wp.spatial_top(cdof)
-              offset = con_pos - subtree_com_in[worldid, body_rootid[body]]
-              jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
-              jacr_dif = cdof_ang * sign
-              J = float(0.0)
-              Ji = float(0.0)
-              for xyz in range(3):
-                J += frame_0[xyz] * jacp_dif[xyz]
-                if condim > 1:
-                  if dimid2 < 3:
-                    Ji += frame_i[xyz] * jacp_dif[xyz]
-                  else:
-                    Ji += frame_i[xyz] * jacr_dif[xyz]
-              if condim > 1:
-                if dim % 2 == 0:
-                  J += Ji * frii
-                else:
-                  J -= Ji * frii
-              efc_J_colind_out[worldid, 0, rowadr_dim + k] = da
-              efc_J_out[worldid, 0, rowadr_dim + k] = J
-              Jqvel += J * qvel_in[worldid, da]
-              if da1 == da:
-                da1 = dof_parentid[da1]
-              if da2 == da:
-                da2 = dof_parentid[da2]
-              da = wp.max(da1, da2)
+          for k in range(rownnz):
+            adr = rowadr_dim + k
+            Jqvel += efc_J_out[worldid, 0, adr] * qvel_in[worldid, efc_J_colind_out[worldid, 0, adr]]
+          kk = c_k_sh[lo]
+          b = c_b_sh[lo]
+          imp = c_imp_sh[lo]
+          pos = c_pos_sh[lo]
+          margin = c_margin_sh[lo]
           efc_Jqvel_out[worldid, efcid] = Jqvel
-          constraint._efc_row(
-            opt_disableflags,
-            worldid,
-            timestep,
-            efcid,
-            pos,
-            pos,
-            invweight,
-            contact_solref_in[cid],
-            contact_solimp_in[cid],
-            includemargin,
-            Jqvel,
-            0.0,
-            efc_type,
-            cid,
-            efc_type_out,
-            efc_id_out,
-            efc_pos_out,
-            efc_margin_out,
-            efc_D_out,
-            efc_vel_out,
-            efc_aref_out,
-            efc_frictionloss_out,
-          )
+          efc_D_out[worldid, efcid] = c_D_sh[lo]
+          efc_vel_out[worldid, efcid] = Jqvel
+          efc_aref_out[worldid, efcid] = -kk * imp * pos - b * Jqvel
+          efc_pos_out[worldid, efcid] = pos + margin
+          efc_margin_out[worldid, efcid] = margin
+          efc_frictionloss_out[worldid, efcid] = 0.0
+          efc_type_out[worldid, efcid] = c_type_sh[lo]
+          efc_id_out[worldid, efcid] = cid
         _sync()
         row_base += rows_total
         nnz_base += nnz_total
@@ -2905,14 +2947,17 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
 
 
 @event_scope
-def forward_a(m: Model, d: Data):
+def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
   """Fused sleep wake/update, position, velocity and actuation stages (one CTA per world).
 
   Replaces ``sleep.wake`` + ``sleep.update_sleep_trees``, ``smooth.kinematics``, ``smooth.com_pos``,
   ``smooth.crb``, ``smooth.transmission``, ``fwd_velocity`` (actuator velocity, ``com_vel``, passive
   forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`. The body/dof
-  awake arrays are published once, by ``forward_m`` after ``wake_equality``.
+  awake arrays are published once, by ``forward_m`` after ``wake_equality``. ``groups`` are the
+  contact buckets shared with ``forward_m`` (their per-world counts are zeroed here).
   """
+  if groups is None:
+    groups = contact_groups(d)
   wp.launch(
     _forward_a_kernel(NBODY_CAP, NV_CAP, NU_CAP, NTREE_CAP),
     dim=(d.nworld, NV_CAP),
@@ -2993,6 +3038,7 @@ def forward_a(m: Model, d: Data):
     outputs=[
       d.tree_asleep,
       d.tree_awake,
+      groups.count,
       d.xpos,
       d.xquat,
       d.xmat,
@@ -3089,41 +3135,24 @@ def forward_b(m: Model, d: Data):
   )
 
 
-def _group_contacts_by_world(m: Model, d: Data):
-  """Counting sort of the live contacts by world; returns (start, count, list) scratch arrays."""
-  count_fill = wp.zeros((2 * d.nworld,), dtype=int)
-  count = count_fill[: d.nworld]
-  fill = count_fill[d.nworld :]
-  start = wp.empty((d.nworld,), dtype=int)
-  con_list = wp.empty((max(d.naconmax, 1),), dtype=int)
-  if m.opt.disableflags & DisableBit.CONTACT:
-    return start, count, con_list
-  threads = min(_GROUP_THREADS, max(d.naconmax, 1))
-  wp.launch(_world_contact_count, dim=threads, inputs=[d.nacon, d.contact.worldid, threads], outputs=[count])
-  wp.launch(
-    _world_contact_scatter,
-    dim=threads,
-    inputs=[d.nworld, d.nacon, d.contact.worldid, count, threads],
-    outputs=[fill, start, con_list],
-    block_dim=NV_CAP,
-  )
-  return start, count, con_list
-
-
 @event_scope
-def forward_m(m: Model, d: Data):
+def forward_m(m: Model, d: Data, groups: ContactGroups | None = None):
   """Fused constraint assembly and sleep/island bookkeeping between ``forward_a`` and ``forward_b``.
 
   Replaces ``constraint.make_constraint`` (JOINT equalities, dof friction, slide/hinge limits and
   pyramidal contact rows), ``sleep.wake_equality``, ``sleep.update_sleep`` and ``island.island`` for
-  models accepted by :func:`fused_world`; two small grouping launches sort the contacts by world
-  first.
+  models accepted by :func:`fused_world`; one bucket launch sorts the contacts by world first. Pass
+  the ``groups`` given to ``forward_a`` (which zeroes the counts) or let this function allocate
+  them.
   """
-  start, count, con_list = _group_contacts_by_world(m, d)
-  _launch_forward_m(m, d, start, count, con_list)
+  if groups is None:
+    groups = contact_groups(d)
+    groups.count.zero_()
+  _bucket_contacts(m, d, groups)
+  _launch_forward_m(m, d, groups)
 
 
-def _launch_forward_m(m: Model, d: Data, start: wp.array, count: wp.array, con_list: wp.array):
+def _launch_forward_m(m: Model, d: Data, groups: ContactGroups):
   contact_frame_2d = wp.array(
     ptr=d.contact.frame.ptr, dtype=wp.vec3, shape=(d.naconmax, 3), device=d.contact.frame.device, copy=False
   )
@@ -3189,9 +3218,9 @@ def _launch_forward_m(m: Model, d: Data, start: wp.array, count: wp.array, con_l
       d.contact.friction,
       d.contact.solref,
       d.contact.solimp,
-      start,
-      count,
-      con_list,
+      groups.capacity,
+      groups.count,
+      groups.ids,
     ],
     outputs=[
       d.tree_asleep,
