@@ -678,10 +678,12 @@ _NATIVE_TEMPLATE = r"""
     constexpr int MNL = (int)sizeof(*tag);
     constexpr bool DENSE = MNL <= MNS;
     constexpr int TS = MNL + 4;                       // tile row stride
-    constexpr int TB = DENSE ? 32 : (TILE_FLOATS / TS);
+    // rows per tile: the sparse variant stages two lanes per row, so at most 16 rows
+    constexpr int TB = DENSE ? 32 : ((TILE_FLOATS / TS) < 16 ? (TILE_FLOATS / TS) : 16);
     constexpr int MPL = MNL * (MNL + 1) / 2;
     static_assert(MNL == MNS || MNL == MN, "mid variants: dense records up to MNS, sparse up to MN");
     static_assert(TS % 4 == 0 && TB >= 1 && TB * TS <= TILE_FLOATS, "tile rows fit the per-warp arena");
+    static_assert(DENSE || 2 * TB <= 32, "sparse staging uses two lanes per row");
     static_assert(DENSE ? (MPL <= MP) : (MPL <= TILE_FLOATS), "packed H / L fits its arena");
     static_assert(TB <= 32, "one lane per tile row");
     const int n = sh_comp_ndof[c];
