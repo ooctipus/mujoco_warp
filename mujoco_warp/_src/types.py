@@ -983,6 +983,15 @@ class Callback:
     act_bias: custom actuator biases, writes to ``Data.actuator_force``
     sensor: custom sensors, writes to ``Data.sensordata``
     contactfilter: custom contact filtering, writes to ``Data.contact``
+    post_position: runs once per forward pass after the position stage (``Data.xpos``,
+      ``Data.xquat``, ``Data.xipos``, ``com_pos``, ``crb`` and the inertia factorization are final
+      for this step) and before collision detection and ``make_constraint``, on the stock and the
+      fused per-world forward. Intended for external contact suppliers
+      (``Option.run_collision_detection=False``) that refresh the pose-dependent fields of
+      ``Data.contact`` (``dist``, ``pos``, ``efc_address``) from the body poses of the current
+      step; writes to ``Data.contact``. It must only read position-stage outputs, so it neither
+      disables the fused per-world forward nor forces the materialization of deferred derived data
+      on intermediate substeps.
   """
 
   passive: Callable | None = None
@@ -992,6 +1001,16 @@ class Callback:
   act_bias: Callable | None = None
   sensor: Callable | None = None
   contactfilter: Callable | None = None
+  post_position: Callable | None = None
+
+  def observes_derived_state(self) -> bool:
+    """Return whether a callback other than ``post_position`` is set.
+
+    Those callbacks may read intermediate derived data (island mapping, velocity-dependent
+    quantities) that the stepping paths otherwise defer or fuse; ``post_position`` only reads the
+    position-stage outputs, which every path publishes before invoking it.
+    """
+    return any(name != "post_position" and callback is not None for name, callback in vars(self).items())
 
 
 @dataclasses.dataclass

@@ -1006,6 +1006,61 @@ class FusedWorldTest(absltest.TestCase):
     self.assertLess(awake_counts[-1].max(), awake_counts[0].min())
     self.assertGreater(d_ref.nefc.numpy().min(), 0)
 
+  def test_post_position_callback_keeps_fused_path(self):
+    """post_position runs on final poses before make_constraint on both paths; predicate stays."""
+    mjm, m, datas = self._make(seed=7, contact=True, equality=True, resting=True)
+    d_ref, d_fused = datas
+    _share_contacts(m, d_ref, d_fused)
+    nacon = int(d_ref.nacon.numpy()[0])
+    self.assertGreater(nacon, 0)
+    dist_before = d_ref.contact.dist.numpy().copy()
+
+    @wp.kernel
+    def _shift_dist(nacon_in: wp.array[int], contact_dist_out: wp.array[float]):
+      conid = wp.tid()
+      if conid < nacon_in[0]:
+        contact_dist_out[conid] -= 0.001
+
+    xpos_seen = {id(d): wp.zeros_like(d.xpos) for d in datas}
+    calls = {id(d): 0 for d in datas}
+
+    def post_position(m_, d_):
+      calls[id(d_)] += 1
+      wp.copy(xpos_seen[id(d_)], d_.xpos)
+      wp.launch(_shift_dist, dim=d_.naconmax, inputs=[d_.nacon], outputs=[d_.contact.dist])
+
+    m.callback.post_position = post_position
+    try:
+      # the hook keeps the fused predicate; callbacks that may read fused intermediate state do not
+      self.assertTrue(fused_world.fused_world(m, d_fused))
+      m.callback.control = post_position
+      self.assertFalse(fused_world.fused_world(m, d_fused))
+      m.callback.control = None
+      self._run_step(m, d_ref, fused=False)
+      self._run_step(m, d_fused, fused=True)
+    finally:
+      m.callback.post_position = None
+
+    for d in datas:
+      self.assertEqual(calls[id(d)], 1)
+      # the poses were final when the hook ran (integration only advances qpos)
+      np.testing.assert_array_equal(xpos_seen[id(d)].numpy(), d.xpos.numpy())
+      np.testing.assert_allclose(d.contact.dist.numpy()[:nacon], dist_before[:nacon] - 0.001, rtol=0.0, atol=1e-7)
+    # make_constraint consumed the shifted distances ...
+    dist = d_ref.contact.dist.numpy()
+    includemargin = d_ref.contact.includemargin.numpy()
+    checked = 0
+    for w in range(d_ref.nworld):
+      for (t, i, dim), (scal, _, _) in _rows(m, d_ref, w).items():
+        if t in (ConstraintType.CONTACT_FRICTIONLESS, ConstraintType.CONTACT_PYRAMIDAL) and dim == 0:
+          np.testing.assert_allclose(scal["pos"], dist[i] - includemargin[i], rtol=1e-6, atol=1e-6)
+          checked += 1
+    self.assertGreater(checked, 0)
+    # ... identically on both paths
+    self._assert_rows_equal(m, d_fused, d_ref)
+    self._assert_int_equal(d_fused, d_ref, ("tree_asleep", "nefc"))
+    self._assert_close_scaled("qvel", d_fused.qvel.numpy(), d_ref.qvel.numpy(), rel=1e-4)
+
 
 if __name__ == "__main__":
   wp.init()

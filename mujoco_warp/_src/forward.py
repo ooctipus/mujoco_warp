@@ -275,8 +275,8 @@ def _next_time_builder(warn_overflow: bool):
 
 
 def _has_callback(m: Model) -> bool:
-  """Return whether a callback can observe intermediate derived state."""
-  return any(callback is not None for callback in vars(m.callback).values())
+  """Return whether a callback can observe intermediate derived state (``post_position`` cannot)."""
+  return m.callback.observes_derived_state()
 
 
 def _requires_post_sleep_velocity_refresh(m: Model) -> bool:
@@ -684,6 +684,9 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   smooth.tendon_armature(m, d)
   if factorize:
     smooth.factor_m(m, d)
+  # body poses are final: external contact suppliers refresh their contact rows here
+  if m.callback.post_position:
+    m.callback.post_position(m, d)
   if m.opt.run_collision_detection:
     if sleep_enabled:
       # pass 1
@@ -1378,6 +1381,9 @@ def _forward_fused(m: Model, d: Data, finalize: bool):
   fused_world.forward_a(m, d, groups)
   if m.ncam or m.nlight:
     smooth.camlight(m, d)
+  # body poses are final and the contact rows are not read before forward_m's bucket pass
+  if m.callback.post_position:
+    m.callback.post_position(m, d)
 
   # make_constraint, wake_equality, update_sleep and island discovery
   fused_world.forward_m(m, d, groups)
