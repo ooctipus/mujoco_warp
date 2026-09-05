@@ -1404,7 +1404,8 @@ def forward(m: Model, d: Data, *, _finalize: bool = True):
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
-    sleep.wake(m, d)
+    if getattr(m.opt, "run_sleep_wake", True):
+      sleep.wake(m, d)
     sleep.update_sleep(m, d)
 
   fwd_position(m, d, factorize=False)

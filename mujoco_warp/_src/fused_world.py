@@ -166,6 +166,90 @@ return value;
 def _warp_scan_inclusive(value: int) -> int: ...
 
 
+@wp.func_native(
+  snippet="""
+#if defined(__CUDA_ARCH__)
+for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffu, value, offset);
+return value;
+#else
+return value;
+#endif
+"""
+)
+def _warp_sum(value: float) -> float: ...
+
+
+# Vectorized publishes of the array-of-structures Data fields. Warp stores a struct element as
+# scalar 4-byte stores, so a warp writing 24/36/40-byte elements touches 6-10x more 32-byte sectors
+# than the data needs; these snippets write 8- or 16-byte words when the element address is aligned
+# (contiguous Data arrays) and fall back to the scalar stores otherwise.
+@wp.func_native(
+  snippet="""
+float* p = reinterpret_cast<float*>(&wp::index(arr, i, j));
+if ((reinterpret_cast<size_t>(p) & 7) == 0) {
+  float2* q = reinterpret_cast<float2*>(p);
+  q[0] = make_float2(value.c[0], value.c[1]);
+  q[1] = make_float2(value.c[2], value.c[3]);
+  q[2] = make_float2(value.c[4], value.c[5]);
+} else {
+  for (int k = 0; k < 6; ++k) p[k] = value.c[k];
+}
+"""
+)
+def _st_sv(arr: wp.array2d[wp.spatial_vector], i: int, j: int, value: wp.spatial_vector): ...
+
+
+@wp.func_native(
+  snippet="""
+float* p = reinterpret_cast<float*>(&wp::index(arr, i, j));
+if ((reinterpret_cast<size_t>(p) & 7) == 0) {
+  float2* q = reinterpret_cast<float2*>(p);
+  q[0] = make_float2(value.c[0], value.c[1]);
+  q[1] = make_float2(value.c[2], value.c[3]);
+  q[2] = make_float2(value.c[4], value.c[5]);
+  q[3] = make_float2(value.c[6], value.c[7]);
+  q[4] = make_float2(value.c[8], value.c[9]);
+} else {
+  for (int k = 0; k < 10; ++k) p[k] = value.c[k];
+}
+"""
+)
+def _st_v10(arr: wp.array2d[vec10], i: int, j: int, value: vec10): ...
+
+
+@wp.func_native(
+  snippet="""
+float* p = reinterpret_cast<float*>(&wp::index(arr, i, j));
+if ((reinterpret_cast<size_t>(p) & 15) == 0) {
+  *reinterpret_cast<float4*>(p) = make_float4(value.x, value.y, value.z, value.w);
+} else {
+  p[0] = value.x; p[1] = value.y; p[2] = value.z; p[3] = value.w;
+}
+"""
+)
+def _st_q(arr: wp.array2d[wp.quat], i: int, j: int, value: wp.quat): ...
+
+
+@wp.func_native(
+  snippet="""
+float* p = reinterpret_cast<float*>(&wp::index(arr, i, j));
+const float* v = reinterpret_cast<const float*>(&value);
+if ((reinterpret_cast<size_t>(p) & 7) == 0) {
+  float2* q = reinterpret_cast<float2*>(p);
+  q[0] = make_float2(v[0], v[1]); q[1] = make_float2(v[2], v[3]);
+  q[2] = make_float2(v[4], v[5]); q[3] = make_float2(v[6], v[7]);
+  p[8] = v[8];
+} else {
+  p[0] = v[0];
+  float2* q = reinterpret_cast<float2*>(p + 1);
+  q[0] = make_float2(v[1], v[2]); q[1] = make_float2(v[3], v[4]);
+  q[2] = make_float2(v[5], v[6]); q[3] = make_float2(v[7], v[8]);
+}
+"""
+)
+def _st_m33(arr: wp.array2d[wp.mat33], i: int, j: int, value: wp.mat33): ...
+
+
 # module-level shared-store snippets for the tiles shared between the fused kernels and their
 # helpers
 @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
@@ -491,6 +575,17 @@ def fused_world(m: Model, d: Data) -> bool:
   return True
 
 
+# resident CTAs per SM requested from the compiler for the fused position/velocity kernel: 7 CTAs/SM
+# hold 1024 worlds in one wave on 170 SMs (<= 72 registers; the shared arenas stay under the 13 KB
+# that seven CTAs can share on a 100 KB SM)
+_FORWARD_A_MIN_BLOCKS = 7
+
+
+def _pow2_at_least(n: int) -> int:
+  """Smallest power of two >= max(n, 1) (tile shapes must be positive)."""
+  return 1 << max(0, (n - 1).bit_length())
+
+
 @cache_kernel
 def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
   BLOCK = NV
@@ -513,6 +608,9 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
   def _st_body_i(values: wp.tile[int, NB], index: int, value: int): ...
 
   @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
+  def _st_body_f(values: wp.tile[float, NB], index: int, value: float): ...
+
+  @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
   def _st_dof_sv(values: wp.tile[wp.spatial_vector, NV], index: int, value: wp.spatial_vector): ...
 
   @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
@@ -533,7 +631,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
   @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
   def _st_misc_i(values: wp.tile[int, 16], index: int, value: int): ...
 
-  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK,))
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK, _FORWARD_A_MIN_BLOCKS))
   def kernel(
     # Model:
     nbody: int,
@@ -542,7 +640,8 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     ntree: int,
     ngeom: int,
     nsite: int,
-    ngravcomp: int,
+    has_gravcomp: int,
+    run_wake: int,
     opt_disableflags: int,
     opt_gravity: wp.array[wp.vec3],
     qpos0: wp.array2d[float],
@@ -565,7 +664,6 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     body_inertia: wp.array2d[wp.vec3],
     body_gravcomp: wp.array2d[float],
     body_tree_offsets: wp.array[int],
-    gravcomp_bodyid: wp.array[int],
     jnt_type: wp.array[int],
     jnt_qposadr: wp.array[int],
     jnt_dofadr: wp.array[int],
@@ -577,7 +675,6 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     jnt_actfrclimited: wp.array[bool],
     jnt_actfrcrange: wp.array2d[wp.vec2],
     dof_bodyid: wp.array[int],
-    dof_parentid: wp.array[int],
     dof_jntid: wp.array[int],
     dof_armature: wp.array2d[float],
     dof_damping: wp.array2d[float],
@@ -650,26 +747,24 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
   ):
     worldid, tid = wp.tid()
 
-    # shared arenas (per body / per dof / per actuator / per tree)
-    xpos_sh = wp.tile_empty(shape=(NB,), dtype=wp.vec3, storage="shared")
+    # shared arenas (per body / per dof / per actuator / per tree); several are reused by a later
+    # phase once their first contents are dead, see the phase comments
+    xpos_sh = wp.tile_empty(shape=(NB,), dtype=wp.vec3, storage="shared")  # P2-P2b: xpos; P3 on: subtree_com
     xquat_sh = wp.tile_empty(shape=(NB,), dtype=wp.quat, storage="shared")
-    xipos_sh = wp.tile_empty(shape=(NB,), dtype=wp.vec3, storage="shared")
-    com_sh = wp.tile_empty(shape=(NB,), dtype=wp.vec3, storage="shared")
-    gforce_sh = wp.tile_empty(shape=(NB,), dtype=wp.vec3, storage="shared")
+    mcom_sh = wp.tile_empty(shape=(NB,), dtype=wp.vec3, storage="shared")  # P2b-P3: mass * xipos; P3b on: xipos - com
     cinert_sh = wp.tile_empty(shape=(NB,), dtype=vec10, storage="shared")
-    crb_sh = wp.tile_empty(shape=(NB,), dtype=vec10, storage="shared")
-    cvel_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")
-    cacc_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")
-    parent_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
-    send_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
-    gc_body_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
+    cvel_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")  # P8: cfrc_int
+    cacc_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")  # P8: body-local force
+    # per-body packed layout: parent | subtree_end << 8 | dynamic << 16 | (dofadr + 1) << 17 |
+    # dofnum << 25
+    binfo_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
+    mass_sh = wp.tile_empty(shape=(NB,), dtype=float, storage="shared")
+    gcomp_sh = wp.tile_empty(shape=(NB,), dtype=float, storage="shared")
     cdof_sh = wp.tile_empty(shape=(NV,), dtype=wp.spatial_vector, storage="shared")
     qvel_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
-    dof_parent_sh = wp.tile_empty(shape=(NV,), dtype=int, storage="shared")
     act_force_sh = wp.tile_empty(shape=(NU,), dtype=float, storage="shared")
     act_dof_sh = wp.tile_empty(shape=(NU,), dtype=int, storage="shared")
     tree_asleep_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
-    tree_awake_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
     misc_sh = wp.tile_empty(shape=(16,), dtype=int, storage="shared")
 
     lane = tid & 31
@@ -677,38 +772,42 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
 
     is_body = tid < nbody
     is_dof = tid < nv
+    is_act = tid < nu  # nu <= NU <= BLOCK: one actuator per thread
     is_tree = tid < ntree
     nlevel = body_tree_offsets.shape[0] - 1
-    if tid == 0:
-      # the contact bucket pass between forward_a and forward_m appends to this count
-      world_con_count_out[worldid] = 0
 
     gravity_enabled = (opt_disableflags & DisableBit.GRAVITY) == 0
     dsbl_spring = (opt_disableflags & DisableBit.SPRING) != 0
     dsbl_damper = (opt_disableflags & DisableBit.DAMPER) != 0
     gravity = opt_gravity[worldid % opt_gravity.shape[0]]
+    if tid == 0:
+      # the contact bucket pass between forward_a and forward_m appends to this count
+      world_con_count_out[worldid] = 0
+      # roots of the com_vel / cacc traversal (P6)
+      _st_body_sv(cvel_sh, 0, wp.spatial_vector())
+      cacc0 = wp.spatial_vector()
+      if gravity_enabled:
+        cacc0 = wp.spatial_vector(wp.vec3(0.0), -gravity)
+      _st_body_sv(cacc_sh, 0, cacc0)
 
-    # ------------------------------------------------------------- P0: prefetch (one latency round)
-    # body-owned parameters (bodies have at most one joint, see fused_world())
+    # ------------------------------------------------------- P0: prefetch (three dependent rounds)
+    # body-owned parameters (bodies have at most one joint, see fused_world()); the body frame holds
+    # the free joint pose for free bodies and the mocap pose for mocap bodies
     b_parent = int(0)
     b_tree = int(-1)
     b_root = int(0)
-    b_mocap = int(-1)
     b_jntadr = int(-1)
     b_jntnum = int(0)
     b_dofadr = int(-1)
     b_dofnum = int(0)
     b_mass = float(0.0)
-    b_gravcomp = float(0.0)
     b_xfrc_nz = int(0)
+    b_dyn = int(0)
     j_type = int(-1)
-    j_qadr = int(0)
     j_axis = wp.vec3(0.0)
     j_pos = wp.vec3(0.0)
     j_q = float(0.0)
     j_q0 = float(0.0)
-    f_pos = wp.vec3(0.0)
-    f_quat = wp.quat(1.0, 0.0, 0.0, 0.0)
     b_pos = wp.vec3(0.0)
     b_quat = wp.quat(1.0, 0.0, 0.0, 0.0)
     if is_body:
@@ -721,12 +820,17 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       b_dofadr = body_dofadr[tid]
       b_dofnum = body_dofnum[tid]
       b_mass = body_mass[worldid % body_mass.shape[0], tid]
-      b_gravcomp = body_gravcomp[worldid % body_gravcomp.shape[0], tid]
       b_pos = body_pos[worldid % body_pos.shape[0], tid]
       b_quat = body_quat[worldid % body_quat.shape[0], tid]
-      if not (xfrc_applied_in[worldid, tid] == wp.spatial_vector()):
-        b_xfrc_nz = 1
-      _st_body_i(parent_sh, tid, b_parent)
+      _st_body_f(mass_sh, tid, b_mass)
+      _st_body_f(gcomp_sh, tid, body_gravcomp[worldid % body_gravcomp.shape[0], tid])
+      _st_body_i(binfo_sh, tid, b_parent)
+      if run_wake != 0:
+        if not (xfrc_applied_in[worldid, tid] == wp.spatial_vector()):
+          b_xfrc_nz = 1
+      # geoms of world-attached bodies are static unless the body descends from a mocap root
+      if body_weldid[tid] != 0 or body_mocapid[b_root] != -1:
+        b_dyn = 1
       if b_jntnum == 1:
         j_type = jnt_type[b_jntadr]
         j_qadr = jnt_qposadr[b_jntadr]
@@ -734,81 +838,112 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
         j_pos = jnt_pos[worldid % jnt_pos.shape[0], b_jntadr]
         if j_type == JointType.FREE:
           qpos = qpos_in[worldid]
-          f_pos = wp.vec3(qpos[j_qadr], qpos[j_qadr + 1], qpos[j_qadr + 2])
-          f_quat = wp.quat(qpos[j_qadr + 3], qpos[j_qadr + 4], qpos[j_qadr + 5], qpos[j_qadr + 6])
+          b_pos = wp.vec3(qpos[j_qadr], qpos[j_qadr + 1], qpos[j_qadr + 2])
+          b_quat = wp.quat(qpos[j_qadr + 3], qpos[j_qadr + 4], qpos[j_qadr + 5], qpos[j_qadr + 6])
         else:
           j_q = qpos_in[worldid, j_qadr]
           j_q0 = qpos0[worldid % qpos0.shape[0], j_qadr]
+      elif b_mocap >= 0:
+        b_pos = mocap_pos_in[worldid, b_mocap]
+        b_quat = mocap_quat_in[worldid, b_mocap]
       if tid == 0:
         # the world body keeps whatever pose Data carries (kinematics never writes body 0)
         _st_body_v3(xpos_sh, 0, xpos_out[worldid, 0])
         _st_body_q(xquat_sh, 0, xquat_out[worldid, 0])
-    # dof-owned parameters
+    # dof-owned parameters; the dof's joint is its body's single joint
     d_body = int(0)
     d_tree = int(-1)
     d_jnt = int(0)
     d_qvel = float(0.0)
     d_qfrc_nz = int(0)
+    dj_type = int(0)
+    dj_qadr = int(0)
+    dj_dofadr = int(0)
     if is_dof:
       d_body = dof_bodyid[tid]
       d_tree = body_treeid[d_body]
       d_jnt = dof_jntid[tid]
       d_qvel = qvel_in[worldid, tid]
-      if qfrc_applied_in[worldid, tid] != 0.0:
-        d_qfrc_nz = 1
+      if run_wake != 0:
+        if qfrc_applied_in[worldid, tid] != 0.0:
+          d_qfrc_nz = 1
       _st_dof_f(qvel_sh, tid, d_qvel)
-      _st_dof_i(dof_parent_sh, tid, dof_parentid[tid])
+      dj_type = jnt_type[d_jnt]
+      dj_qadr = jnt_qposadr[d_jnt]
+      dj_dofadr = jnt_dofadr[d_jnt]
+    # actuator-owned parameters (joint transmissions on hinge/slide joints)
+    a_vadr = int(0)
+    a_gear = float(0.0)
+    a_length = float(0.0)
+    if is_act:
+      jntid = actuator_trnid[tid][0]
+      a_gear = actuator_gear[worldid % actuator_gear.shape[0], tid][0]
+      a_vadr = jnt_dofadr[jntid]
+      a_length = qpos_in[worldid, jnt_qposadr[jntid]] * a_gear
+      _st_act_i(act_dof_sh, tid, a_vadr)
+    # tree-owned state
+    t_awake = int(0)
     if is_tree:
       _st_tree_i(tree_asleep_sh, tid, tree_asleep_out[worldid, tid])
-      _st_tree_i(tree_awake_sh, tid, tree_awake_out[worldid, tid])
-    if tid < ngravcomp:
-      _st_body_i(gc_body_sh, tid, gravcomp_bodyid[tid])
+      t_awake = tree_awake_out[worldid, tid]
+    # first geom / site of this thread (the P2b loops load the rest)
+    g_body = int(0)
+    if tid < ngeom:
+      g_body = geom_bodyid[tid]
+    s_body = int(0)
+    if tid < nsite:
+      s_body = site_bodyid[tid]
 
     # per-tree wake masks (ntree <= 32): applied Cartesian force, applied generalized force,
     # velocity
-    xfrc_bits = wp.uint32(0)
-    if is_body and b_xfrc_nz != 0 and b_tree >= 0:
-      xfrc_bits = wp.uint32(1) << wp.uint32(b_tree)
-    qfrc_bits = wp.uint32(0)
-    qvel_bits = wp.uint32(0)
-    if is_dof and d_tree >= 0:
-      if d_qfrc_nz != 0:
-        qfrc_bits = wp.uint32(1) << wp.uint32(d_tree)
-      if d_qvel != 0.0:
-        qvel_bits = wp.uint32(1) << wp.uint32(d_tree)
-    xfrc_bits = _warp_or(xfrc_bits)
-    qfrc_bits = _warp_or(qfrc_bits)
-    qvel_bits = _warp_or(qvel_bits)
-    if lane == 0:
-      _st_misc_i(misc_sh, warp, int(xfrc_bits))
-      _st_misc_i(misc_sh, 4 + warp, int(qfrc_bits))
-      _st_misc_i(misc_sh, 8 + warp, int(qvel_bits))
+    if run_wake != 0:
+      xfrc_bits = wp.uint32(0)
+      if is_body and b_xfrc_nz != 0 and b_tree >= 0:
+        xfrc_bits = wp.uint32(1) << wp.uint32(b_tree)
+      qfrc_bits = wp.uint32(0)
+      qvel_bits = wp.uint32(0)
+      if is_dof and d_tree >= 0:
+        if d_qfrc_nz != 0:
+          qfrc_bits = wp.uint32(1) << wp.uint32(d_tree)
+        if d_qvel != 0.0:
+          qvel_bits = wp.uint32(1) << wp.uint32(d_tree)
+      xfrc_bits = _warp_or(xfrc_bits)
+      qfrc_bits = _warp_or(qfrc_bits)
+      qvel_bits = _warp_or(qvel_bits)
+      if lane == 0:
+        _st_misc_i(misc_sh, warp, int(xfrc_bits))
+        _st_misc_i(misc_sh, 4 + warp, int(qfrc_bits))
+        _st_misc_i(misc_sh, 8 + warp, int(qvel_bits))
     _sync()
 
     # depth-first numbering: the subtree of tid is [tid, subtree_end); body level from the parent
-    # walk
+    # walk. The parent field is read masked, so the packed rewrite of this thread's own slot below
+    # is safe while other threads still walk parents.
     subtree_end = int(0)
     b_level = int(0)
     if is_body:
-      subtree_end = tid + 1
-      while subtree_end < nbody:
-        if parent_sh[subtree_end] < tid:
-          break
-        subtree_end += 1
-      _st_body_i(send_sh, tid, subtree_end)
-      p = int(tid)
-      while p != 0:
-        p = parent_sh[p]
-        b_level += 1
+      subtree_end = nbody
+      if tid > 0:
+        subtree_end = tid + 1
+        while subtree_end < nbody:
+          if (binfo_sh[subtree_end] & 0xFF) < tid:
+            break
+          subtree_end += 1
+        p = int(tid)
+        while p != 0:
+          p = binfo_sh[p] & 0xFF
+          b_level += 1
+      _st_body_i(binfo_sh, tid, b_parent | (subtree_end << 8) | (b_dyn << 16) | ((b_dofadr + 1) << 17) | (b_dofnum << 25))
 
     # ---------------------------------------------------------------- P1: sleep.wake
-    if is_tree:
+    # skipped when the caller declares it already ran sleep.wake on these inputs
+    if run_wake != 0 and is_tree:
       if tree_asleep_sh[tid] >= 0:
         wake_bits = wp.uint32(0)
         for w in range(4):
           wake_bits |= wp.uint32(misc_sh[w]) | wp.uint32(misc_sh[4 + w]) | wp.uint32(misc_sh[8 + w])
         wake = int(0)
-        if tree_awake_sh[tid] == 1:
+        if t_awake == 1:
           wake = 1
         elif tree_sleep_policy[tid] == SleepPolicy.AUTO_NEVER:
           wake = 1
@@ -825,19 +960,30 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
             current = next_tree
             if current == tid:
               break
-    _sync()
-
-    # ---------------------------------------------------------------- P1b: update_sleep (trees)
-    # tree_awake feeds wake_equality in forward_m, which then publishes the body/dof awake arrays
-    if is_tree:
-      asleep = tree_asleep_sh[tid]
-      tree_asleep_out[worldid, tid] = asleep
-      awake_flag = int(0)
-      if asleep < 0:
-        awake_flag = 1
-      tree_awake_out[worldid, tid] = awake_flag
 
     # ----------------------------------------------------------- P2: kinematics (level-synchronous)
+    # parameters of P2b-P4 are loaded first so that the level barriers hide their latency
+    b_ipos = wp.vec3(0.0)
+    b_iquat = wp.quat(1.0, 0.0, 0.0, 0.0)
+    b_inertia = wp.vec3(0.0)
+    b_submass = float(0.0)
+    if is_body:
+      b_ipos = body_ipos[worldid % body_ipos.shape[0], tid]
+      b_iquat = body_iquat[worldid % body_iquat.shape[0], tid]
+      b_inertia = body_inertia[worldid % body_inertia.shape[0], tid]
+      b_submass = body_subtreemass[worldid % body_subtreemass.shape[0], tid]
+    d_armature = float(0.0)
+    d_rownnz = int(0)
+    d_rowadr = int(0)
+    if is_dof:
+      d_armature = dof_armature[worldid % dof_armature.shape[0], tid]
+      d_rownnz = M_rownnz[tid]
+      d_rowadr = M_rowadr[tid]
+    # the joint's own rotation does not depend on the parent: evaluate it before the level loop
+    j_dq = j_q - j_q0
+    j_quat = wp.quat(1.0, 0.0, 0.0, 0.0)
+    if is_body and j_type == JointType.HINGE:
+      j_quat = math.axis_angle_to_quat(j_axis, j_dq)
     xanchor = wp.vec3(0.0)
     xaxis = wp.vec3(0.0)
     xpos = wp.vec3(0.0)
@@ -845,33 +991,37 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     for level in range(1, nlevel):
       if is_body and b_level == level:
         if b_jntnum == 1 and j_type == JointType.FREE:
-          xpos = f_pos
-          xquat = wp.normalize(f_quat)
+          xpos = b_pos
+          xquat = wp.normalize(b_quat)
           xanchor = xpos
           xaxis = j_axis
         else:
-          if b_mocap >= 0:
-            xpos = mocap_pos_in[worldid, b_mocap]
-            xquat = mocap_quat_in[worldid, b_mocap]
-          else:
-            xpos = b_pos
-            xquat = b_quat
           pquat = xquat_sh[b_parent]
-          xpos = math.rot_vec_quat(xpos, pquat) + xpos_sh[b_parent]
-          xquat = math.mul_quat(pquat, xquat)
+          xpos = math.rot_vec_quat(b_pos, pquat) + xpos_sh[b_parent]
+          xquat = math.mul_quat(pquat, b_quat)
           if b_jntnum == 1:
             xanchor = math.rot_vec_quat(j_pos, xquat) + xpos
             xaxis = math.rot_vec_quat(j_axis, xquat)
             if j_type == JointType.SLIDE:
-              xpos += xaxis * (j_q - j_q0)
+              xpos += xaxis * j_dq
             elif j_type == JointType.HINGE:
-              xquat = math.mul_quat(xquat, math.axis_angle_to_quat(j_axis, j_q - j_q0))
+              xquat = math.mul_quat(xquat, j_quat)
               # correct for off-center rotation
               xpos = xanchor - math.rot_vec_quat(j_pos, xquat)
           xquat = wp.normalize(xquat)
         _st_body_v3(xpos_sh, tid, xpos)
         _st_body_q(xquat_sh, tid, xquat)
       _sync()
+      if level == 1:
+        # P1b: update_sleep (trees). tree_awake feeds wake_equality in forward_m, which then
+        # publishes the body/dof awake arrays
+        if is_tree:
+          asleep = tree_asleep_sh[tid]
+          tree_asleep_out[worldid, tid] = asleep
+          awake_flag = int(0)
+          if asleep < 0:
+            awake_flag = 1
+          tree_awake_out[worldid, tid] = awake_flag
 
     # ------------------------------------------------------- P2b: body frames, joints, geoms, sites
     xipos = wp.vec3(0.0)
@@ -879,62 +1029,72 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       if tid == 0:
         xpos = xpos_sh[0]
         xquat = xquat_sh[0]
-      xipos = xpos + math.rot_vec_quat(body_ipos[worldid % body_ipos.shape[0], tid], xquat)
-      ximat = math.quat_to_mat(math.mul_quat(xquat, body_iquat[worldid % body_iquat.shape[0], tid]))
+      xipos = xpos + math.rot_vec_quat(b_ipos, xquat)
       xpos_out[worldid, tid] = xpos
-      xquat_out[worldid, tid] = xquat
-      xmat_out[worldid, tid] = math.quat_to_mat(xquat)
+      _st_q(xquat_out, worldid, tid, xquat)
+      _st_m33(xmat_out, worldid, tid, math.quat_to_mat(xquat))
       xipos_out[worldid, tid] = xipos
-      ximat_out[worldid, tid] = ximat
-      _st_body_v3(xipos_sh, tid, xipos)
-      _st_body_v3(com_sh, tid, xipos * b_mass)
+      _st_m33(ximat_out, worldid, tid, math.quat_to_mat(math.mul_quat(xquat, b_iquat)))
+      _st_body_v3(mcom_sh, tid, xipos * b_mass)
       if b_jntnum == 1:
         xanchor_out[worldid, b_jntadr] = xanchor
         xaxis_out[worldid, b_jntadr] = xaxis
     for geomid in range(tid, ngeom, BLOCK):
-      bodyid = geom_bodyid[geomid]
-      # geoms attached to the world are static (unless descended from mocap bodies)
-      if body_weldid[bodyid] != 0 or body_mocapid[body_rootid[bodyid]] != -1:
+      bodyid = g_body
+      if geomid != tid:
+        bodyid = geom_bodyid[geomid]
+      if (binfo_sh[bodyid] >> 16) != 0:
         gpos = xpos_sh[bodyid]
         gquat = xquat_sh[bodyid]
         geom_xpos_out[worldid, geomid] = gpos + math.rot_vec_quat(geom_pos[worldid % geom_pos.shape[0], geomid], gquat)
-        geom_xmat_out[worldid, geomid] = math.quat_to_mat(math.mul_quat(gquat, geom_quat[worldid % geom_quat.shape[0], geomid]))
+        _st_m33(
+          geom_xmat_out,
+          worldid,
+          geomid,
+          math.quat_to_mat(math.mul_quat(gquat, geom_quat[worldid % geom_quat.shape[0], geomid])),
+        )
     for siteid in range(tid, nsite, BLOCK):
-      bodyid = site_bodyid[siteid]
+      bodyid = s_body
+      if siteid != tid:
+        bodyid = site_bodyid[siteid]
       gpos = xpos_sh[bodyid]
       gquat = xquat_sh[bodyid]
       site_xpos_out[worldid, siteid] = gpos + math.rot_vec_quat(site_pos[worldid % site_pos.shape[0], siteid], gquat)
-      site_xmat_out[worldid, siteid] = math.quat_to_mat(math.mul_quat(gquat, site_quat[worldid % site_quat.shape[0], siteid]))
+      _st_m33(
+        site_xmat_out, worldid, siteid, math.quat_to_mat(math.mul_quat(gquat, site_quat[worldid % site_quat.shape[0], siteid]))
+      )
     _sync()
 
     # ---------------------------------------------------------------- P3: subtree_com
+    # gathered from the mass-weighted positions; the result lives in the (now dead) xpos arena
     com = wp.vec3(0.0)
     if is_body:
-      com = com_sh[tid]
-      for c in range(tid + 1, subtree_end):
-        com += com_sh[c]
-      mass = body_subtreemass[worldid % body_subtreemass.shape[0], tid]
-      if mass != 0.0:
-        com = com / mass
-    _sync()
+      com = mcom_sh[tid]
+      if tid > 0:
+        for c in range(tid + 1, subtree_end):
+          com += mcom_sh[c]
+    # the world body's gather spans every body: the first warp shares it (lane-strided partial sums)
+    if warp == 0:
+      part = wp.vec3(0.0)
+      for c in range(lane + 1, nbody, 32):
+        part += mcom_sh[c]
+      part = wp.vec3(_warp_sum(part[0]), _warp_sum(part[1]), _warp_sum(part[2]))
+      if tid == 0:
+        com += part
     if is_body:
-      _st_body_v3(com_sh, tid, com)
+      if b_submass != 0.0:
+        com = com / b_submass
+      _st_body_v3(xpos_sh, tid, com)
       subtree_com_out[worldid, tid] = com
-      # gravity compensation force of this body (zero unless compensated)
-      gforce = wp.vec3(0.0)
-      if gravity_enabled and b_gravcomp != 0.0:
-        gforce = -gravity * b_mass * b_gravcomp
-      _st_body_v3(gforce_sh, tid, gforce)
     _sync()
 
     # ---------------------------------------------------------------- P3b: cinert, cdof
     if is_body:
-      mat = math.quat_to_mat(math.mul_quat(xquat, body_iquat[worldid % body_iquat.shape[0], tid]))
-      inert = body_inertia[worldid % body_inertia.shape[0], tid]
-      dif = xipos - com_sh[b_root]
+      mat = math.quat_to_mat(math.mul_quat(xquat, b_iquat))
+      dif = xipos - xpos_sh[b_root]
       # express inertia in com-based frame (mju_inertCom)
       res = vec10()
-      tmp = mat @ wp.diag(inert) @ wp.transpose(mat)
+      tmp = mat @ wp.diag(b_inertia) @ wp.transpose(mat)
       res[0] = tmp[0, 0]
       res[1] = tmp[1, 1]
       res[2] = tmp[2, 2]
@@ -952,10 +1112,12 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       res[8] = b_mass * dif[2]
       res[9] = b_mass
       _st_body_v10(cinert_sh, tid, res)
-      cinert_out[worldid, tid] = res
+      _st_v10(cinert_out, worldid, tid, res)
+      # lever arm of the gravity compensation force (P7) replaces the dead mass-weighted position
+      _st_body_v3(mcom_sh, tid, dif)
       if b_jntnum == 1:
         xmat = wp.transpose(math.quat_to_mat(xquat))
-        offset = com_sh[b_root] - xanchor
+        offset = xpos_sh[b_root] - xanchor
         if j_type == JointType.FREE:
           _st_dof_sv(cdof_sh, b_dofadr + 0, wp.spatial_vector(0.0, 0.0, 0.0, 1.0, 0.0, 0.0))
           _st_dof_sv(cdof_sh, b_dofadr + 1, wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0, 0.0))
@@ -970,56 +1132,79 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     _sync()
 
     # ---------------------------------------------------------------- P4: crb and M
-    crb = vec10()
     if is_body:
       crb = cinert_sh[tid]
       # the world body never accumulates its children
       if tid > 0:
         for c in range(tid + 1, subtree_end):
           crb += cinert_sh[c]
-      crb_out[worldid, tid] = crb
-      _st_body_v10(crb_sh, tid, crb)
+      _st_v10(crb_out, worldid, tid, crb)
     cdof = wp.spatial_vector()
+    d_send = int(0)
     if is_dof:
       cdof = cdof_sh[tid]
-      cdof_out[worldid, tid] = cdof
-    _sync()
-    if is_dof:
-      rownnz = M_rownnz[tid]
-      madr_ij = M_rowadr[tid] + rownnz - 1
-      buf = math.inert_vec(crb_sh[d_body], cdof)
+      _st_sv(cdof_out, worldid, tid, cdof)
+      # composite inertia of the dof's body, gathered in the same order as the body's crb above
+      d_send = (binfo_sh[d_body] >> 8) & 0xFF
+      crb_d = cinert_sh[d_body]
+      for c in range(d_body + 1, d_send):
+        crb_d += cinert_sh[c]
+      madr_ij = d_rowadr + d_rownnz - 1
+      buf = math.inert_vec(crb_d, cdof)
       # diagonal: armature inertia plus the composite inertia term
-      M_out[worldid, madr_ij] = dof_armature[worldid % dof_armature.shape[0], tid] + wp.dot(cdof, buf)
-      # ancestors fill the rest of the CSR row; "simple" dofs (rownnz == 1) keep their in-joint
-      # parent chain but store only the diagonal, so the walk is bounded by the row length
+      M_out[worldid, madr_ij] = d_armature + wp.dot(cdof, buf)
+      # ancestors fill the rest of the CSR row, walking dof_parentid through the packed body
+      # layout: the previous dof of the same joint, then the last dof of the closest ancestor body
+      # with dofs. "Simple" dofs (rownnz == 1) store only the diagonal, so the walk is bounded by
+      # the row length
       dofid = int(tid)
-      for _k in range(rownnz - 1):
+      info = binfo_sh[d_body]
+      jstart = ((info >> 17) & 0xFF) - 1
+      for _k in range(d_rownnz - 1):
         madr_ij -= 1
-        dofid = dof_parent_sh[dofid]
+        if dofid > jstart:
+          dofid -= 1
+        else:
+          body = info & 0xFF
+          info = binfo_sh[body]
+          while body != 0 and ((info >> 25) & 0x7) == 0:
+            body = info & 0xFF
+            info = binfo_sh[body]
+          jstart = ((info >> 17) & 0xFF) - 1
+          dofid = jstart + ((info >> 25) & 0x7) - 1
         M_out[worldid, madr_ij] = wp.dot(cdof_sh[dofid], buf)
 
     # ---------------------------------------------------------- P5: transmission, actuator velocity
-    for actid in range(tid, nu, BLOCK):
-      jntid = actuator_trnid[actid][0]
-      gear0 = actuator_gear[worldid % actuator_gear.shape[0], actid][0]
-      qadr = jnt_qposadr[jntid]
-      vadr = jnt_dofadr[jntid]
-      actuator_length_out[worldid, actid] = qpos_in[worldid, qadr] * gear0
-      moment_rownnz_out[worldid, actid] = 1
-      moment_rowadr_out[worldid, actid] = actid
-      moment_colind_out[worldid, actid] = vadr
-      actuator_moment_out[worldid, actid] = gear0
-      actuator_velocity_out[worldid, actid] = gear0 * qvel_sh[vadr]
-      _st_act_i(act_dof_sh, actid, vadr)
+    a_velocity = float(0.0)
+    if is_act:
+      a_velocity = a_gear * qvel_sh[a_vadr]
+      actuator_length_out[worldid, tid] = a_length
+      moment_rownnz_out[worldid, tid] = 1
+      moment_rowadr_out[worldid, tid] = tid
+      moment_colind_out[worldid, tid] = a_vadr
+      actuator_moment_out[worldid, tid] = a_gear
+      actuator_velocity_out[worldid, tid] = a_velocity
 
     # ----------------------------------------------------- P6: com_vel and cacc (level-synchronous)
-    if tid == 0:
-      _st_body_sv(cvel_sh, 0, wp.spatial_vector())
-      cacc0 = wp.spatial_vector()
-      if gravity_enabled:
-        cacc0 = wp.spatial_vector(wp.vec3(0.0), -gravity)
-      _st_body_sv(cacc_sh, 0, cacc0)
-    _sync()
+    # the passive-force parameters of P7 are loaded first; the level barriers hide their latency
+    stiffness = float(0.0)
+    spoly = wp.vec2(0.0)
+    damping = float(0.0)
+    dpoly = wp.vec2(0.0)
+    q = float(0.0)
+    q_spring = float(0.0)
+    actgravcomp = int(0)
+    if is_dof:
+      actgravcomp = jnt_actgravcomp[d_jnt]
+      if not (dsbl_spring and dsbl_damper):
+        stiffness = jnt_stiffness[worldid % jnt_stiffness.shape[0], d_jnt]
+        spoly = jnt_stiffnesspoly[worldid % jnt_stiffnesspoly.shape[0], d_jnt]
+        # the joint's first dof supplies the damping of all its dofs (as _spring_damper_dof_passive)
+        damping = dof_damping[worldid % dof_damping.shape[0], dj_dofadr]
+        dpoly = dof_dampingpoly[worldid % dof_dampingpoly.shape[0], dj_dofadr]
+        if dj_type != JointType.FREE:
+          q = qpos_in[worldid, dj_qadr]
+          q_spring = qpos_spring[worldid % qpos_spring.shape[0], dj_qadr]
     for level in range(1, nlevel):
       if is_body and b_level == level:
         cvel = cvel_sh[b_parent]
@@ -1028,24 +1213,24 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
           if j_type == JointType.FREE:
             for k in range(3):
               cvel += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
-              cdof_dot_out[worldid, b_dofadr + k] = wp.spatial_vector()
+              _st_sv(cdof_dot_out, worldid, b_dofadr + k, wp.spatial_vector())
             for k in range(3, 6):
               cdof_dot = math.motion_cross(cvel, cdof_sh[b_dofadr + k])
-              cdof_dot_out[worldid, b_dofadr + k] = cdof_dot
+              _st_sv(cdof_dot_out, worldid, b_dofadr + k, cdof_dot)
               cacc += cdof_dot * qvel_sh[b_dofadr + k]
             for k in range(3, 6):
               cvel += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
           else:
             cdof_dot = math.motion_cross(cvel, cdof_sh[b_dofadr])
-            cdof_dot_out[worldid, b_dofadr] = cdof_dot
+            _st_sv(cdof_dot_out, worldid, b_dofadr, cdof_dot)
             cacc += cdof_dot * qvel_sh[b_dofadr]
             cvel += cdof_sh[b_dofadr] * qvel_sh[b_dofadr]
         _st_body_sv(cvel_sh, tid, cvel)
         _st_body_sv(cacc_sh, tid, cacc)
       _sync()
     if is_body:
-      cvel_out[worldid, tid] = cvel_sh[tid]
-      cacc_out[worldid, tid] = cacc_sh[tid]
+      _st_sv(cvel_out, worldid, tid, cvel_sh[tid])
+      _st_sv(cacc_out, worldid, tid, cacc_sh[tid])
 
     # ---------------------------------------------------------------- P7: passive (per dof)
     qfrc_spring = float(0.0)
@@ -1054,41 +1239,33 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     qfrc_passive = float(0.0)
     if is_dof:
       if not (dsbl_spring and dsbl_damper):
-        jnttype = jnt_type[d_jnt]
-        jdof = jnt_dofadr[d_jnt]
-        qposid = jnt_qposadr[d_jnt]
-        stiffness = jnt_stiffness[worldid % jnt_stiffness.shape[0], d_jnt]
-        spoly = jnt_stiffnesspoly[worldid % jnt_stiffnesspoly.shape[0], d_jnt]
-        # the joint's first dof supplies the damping of all its dofs (as _spring_damper_dof_passive)
-        damping = dof_damping[worldid % dof_damping.shape[0], jdof]
-        dpoly = dof_dampingpoly[worldid % dof_dampingpoly.shape[0], jdof]
         has_stiffness = (stiffness != 0.0 or spoly[0] != 0.0 or spoly[1] != 0.0) and not dsbl_spring
         has_damping = (damping != 0.0 or dpoly[0] != 0.0 or dpoly[1] != 0.0) and not dsbl_damper
-        qpos_spring_id = worldid % qpos_spring.shape[0]
-        if jnttype == JointType.FREE:
+        if dj_type == JointType.FREE:
           if has_stiffness:
-            k = tid - jdof
+            qpos_spring_id = worldid % qpos_spring.shape[0]
+            k = tid - dj_dofadr
             if k < 3:
               dif = wp.vec3(
-                qpos_in[worldid, qposid + 0] - qpos_spring[qpos_spring_id, qposid + 0],
-                qpos_in[worldid, qposid + 1] - qpos_spring[qpos_spring_id, qposid + 1],
-                qpos_in[worldid, qposid + 2] - qpos_spring[qpos_spring_id, qposid + 2],
+                qpos_in[worldid, dj_qadr + 0] - qpos_spring[qpos_spring_id, dj_qadr + 0],
+                qpos_in[worldid, dj_qadr + 1] - qpos_spring[qpos_spring_id, dj_qadr + 1],
+                qpos_in[worldid, dj_qadr + 2] - qpos_spring[qpos_spring_id, dj_qadr + 2],
               )
               kf = util_misc._poly_force(stiffness, spoly, wp.length(dif), 0)
               qfrc_spring = -kf * dif[k]
             else:
               rot = wp.quat(
-                qpos_in[worldid, qposid + 3],
-                qpos_in[worldid, qposid + 4],
-                qpos_in[worldid, qposid + 5],
-                qpos_in[worldid, qposid + 6],
+                qpos_in[worldid, dj_qadr + 3],
+                qpos_in[worldid, dj_qadr + 4],
+                qpos_in[worldid, dj_qadr + 5],
+                qpos_in[worldid, dj_qadr + 6],
               )
               rot = wp.normalize(rot)
               ref = wp.quat(
-                qpos_spring[qpos_spring_id, qposid + 3],
-                qpos_spring[qpos_spring_id, qposid + 4],
-                qpos_spring[qpos_spring_id, qposid + 5],
-                qpos_spring[qpos_spring_id, qposid + 6],
+                qpos_spring[qpos_spring_id, dj_qadr + 3],
+                qpos_spring[qpos_spring_id, dj_qadr + 4],
+                qpos_spring[qpos_spring_id, dj_qadr + 5],
+                qpos_spring[qpos_spring_id, dj_qadr + 6],
               )
               dif = math.quat_sub(rot, ref)
               k_rot = util_misc._poly_force(stiffness, spoly, wp.length(dif), 0)
@@ -1097,27 +1274,25 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
             qfrc_damper = -d_qvel * util_misc._poly_force(damping, dpoly, d_qvel, 1)
         else:  # SLIDE, HINGE
           if has_stiffness:
-            fdif = qpos_in[worldid, qposid] - qpos_spring[qpos_spring_id, qposid]
+            fdif = q - q_spring
             qfrc_spring = -fdif * util_misc._poly_force(stiffness, spoly, fdif, 0)
           if has_damping:
             qfrc_damper = -d_qvel * util_misc._poly_force(damping, dpoly, d_qvel, 1)
 
-        # gravity compensation: bodies in this dof's subtree (support.jac_dof via
-        # body_isdofancestor)
-        if gravity_enabled:
+        # gravity compensation: compensated bodies in this dof's subtree (support.jac_dof via
+        # body_isdofancestor), in body order
+        if gravity_enabled and has_gravcomp != 0:
           cdof_ang = wp.spatial_top(cdof)
           cdof_lin = wp.spatial_bottom(cdof)
-          dof_send = send_sh[d_body]
-          for g in range(ngravcomp):
-            bodyid = gc_body_sh[g]
-            if bodyid >= d_body and bodyid < dof_send:
-              offset = xipos_sh[bodyid] - com_sh[body_rootid[bodyid]]
-              jacp = cdof_lin + wp.cross(cdof_ang, offset)
-              qfrc_gravcomp += wp.dot(jacp, gforce_sh[bodyid])
+          for bodyid in range(d_body, d_send):
+            gcomp = gcomp_sh[bodyid]
+            if gcomp != 0.0:
+              jacp = cdof_lin + wp.cross(cdof_ang, mcom_sh[bodyid])
+              qfrc_gravcomp += wp.dot(jacp, -gravity * mass_sh[bodyid] * gcomp)
 
         qfrc_passive = qfrc_spring + qfrc_damper
         if gravity_enabled:
-          if jnt_actgravcomp[d_jnt] == 0:
+          if actgravcomp == 0:
             qfrc_passive += qfrc_gravcomp
 
       qfrc_spring_out[worldid, tid] = qfrc_spring
@@ -1127,6 +1302,37 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       qfrc_passive_out[worldid, tid] = qfrc_passive
 
     # ---------------------------------------------------------------- P8: rne (cfrc_int, qfrc_bias)
+    # the actuation parameters of P9 are loaded first; the rne barriers hide their latency
+    actuation_on = nu > 0 and (opt_disableflags & DisableBit.ACTUATION) == 0
+    ctrl = float(0.0)
+    ctrlrange = wp.vec2(0.0)
+    ctrllimited = int(0)
+    gain = float(0.0)
+    bias = float(0.0)
+    forcelimited = int(0)
+    forcerange = wp.vec2(0.0)
+    if is_act and actuation_on:
+      ctrl = ctrl_in[worldid, tid]
+      if actuator_ctrllimited[tid] and (opt_disableflags & DisableBit.CLAMPCTRL) == 0:
+        ctrllimited = 1
+        ctrlrange = actuator_ctrlrange[worldid % actuator_ctrlrange.shape[0], tid]
+      gainprm = actuator_gainprm[worldid % actuator_gainprm.shape[0], tid]
+      gain = gainprm[0]
+      if actuator_gaintype[tid] == GainType.AFFINE:
+        gain = gainprm[0] + gainprm[1] * a_length + gainprm[2] * a_velocity
+      if actuator_biastype[tid] == BiasType.AFFINE:
+        biasprm = actuator_biasprm[worldid % actuator_biasprm.shape[0], tid]
+        bias = biasprm[0] + biasprm[1] * a_length + biasprm[2] * a_velocity
+      if actuator_forcelimited[tid]:
+        forcelimited = 1
+        forcerange = actuator_forcerange[worldid % actuator_forcerange.shape[0], tid]
+    d_frclimited = int(0)
+    d_frcrange = wp.vec2(0.0)
+    if is_dof and actuation_on:
+      if jnt_actfrclimited[d_jnt]:
+        d_frclimited = 1
+        d_frcrange = jnt_actfrcrange[worldid % jnt_actfrcrange.shape[0], d_jnt]
+
     if is_body:
       frc = wp.spatial_vector()
       if tid > 0:
@@ -1140,50 +1346,41 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     cfrc = wp.spatial_vector()
     if is_body:
       cfrc = cacc_sh[tid]
-      for c in range(tid + 1, subtree_end):
-        cfrc += cacc_sh[c]
-    _sync()
+      if tid > 0:
+        for c in range(tid + 1, subtree_end):
+          cfrc += cacc_sh[c]
+    if warp == 0:
+      part6 = wp.spatial_vector()
+      for c in range(lane + 1, nbody, 32):
+        part6 += cacc_sh[c]
+      for k in range(6):
+        part6[k] = _warp_sum(part6[k])
+      if tid == 0:
+        cfrc += part6
     if is_body:
-      _st_body_sv(cacc_sh, tid, cfrc)
-      cfrc_int_out[worldid, tid] = cfrc
+      # the cvel slot (dead since the traversal) now holds the interaction force
+      _st_body_sv(cvel_sh, tid, cfrc)
+      _st_sv(cfrc_int_out, worldid, tid, cfrc)
     _sync()
     if is_dof:
-      qfrc_bias_out[worldid, tid] = wp.dot(cdof, cacc_sh[d_body])
+      qfrc_bias_out[worldid, tid] = wp.dot(cdof, cvel_sh[d_body])
 
     # ---------------------------------------------------------------- P9: actuation
-    if nu == 0 or (opt_disableflags & DisableBit.ACTUATION) != 0:
-      for actid in range(tid, nu, BLOCK):
-        actuator_force_out[worldid, actid] = 0.0
+    if not actuation_on:
+      if is_act:
+        actuator_force_out[worldid, tid] = 0.0
       if is_dof:
         qfrc_actuator_out[worldid, tid] = 0.0
     else:
-      for actid in range(tid, nu, BLOCK):
-        ctrl = ctrl_in[worldid, actid]
-        if actuator_ctrllimited[actid] and (opt_disableflags & DisableBit.CLAMPCTRL) == 0:
-          ctrlrange = actuator_ctrlrange[worldid % actuator_ctrlrange.shape[0], actid]
+      if is_act:
+        if ctrllimited != 0:
           ctrl = wp.clamp(ctrl, ctrlrange[0], ctrlrange[1])
-        jntid = actuator_trnid[actid][0]
-        gear0 = actuator_gear[worldid % actuator_gear.shape[0], actid][0]
-        length = qpos_in[worldid, jnt_qposadr[jntid]] * gear0
-        velocity = gear0 * qvel_sh[act_dof_sh[actid]]
-
-        gainprm = actuator_gainprm[worldid % actuator_gainprm.shape[0], actid]
-        gain = gainprm[0]
-        if actuator_gaintype[actid] == GainType.AFFINE:
-          gain = gainprm[0] + gainprm[1] * length + gainprm[2] * velocity
-
-        bias = float(0.0)
-        if actuator_biastype[actid] == BiasType.AFFINE:
-          biasprm = actuator_biasprm[worldid % actuator_biasprm.shape[0], actid]
-          bias = biasprm[0] + biasprm[1] * length + biasprm[2] * velocity
-
         force = gain * ctrl + bias
-        if actuator_forcelimited[actid]:
-          forcerange = actuator_forcerange[worldid % actuator_forcerange.shape[0], actid]
+        if forcelimited != 0:
           force = wp.clamp(force, forcerange[0], forcerange[1])
-        actuator_force_out[worldid, actid] = force
+        actuator_force_out[worldid, tid] = force
         # moment of a joint transmission is the gear ratio
-        _st_act_f(act_force_sh, actid, force * gear0)
+        _st_act_f(act_force_sh, tid, force * a_gear)
       _sync()
       if is_dof:
         qfrc = float(0.0)
@@ -1191,11 +1388,10 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
           if act_dof_sh[actid] == tid:
             qfrc += act_force_sh[actid]
         # actuator-level gravity compensation, skip if added as passive force
-        if gravity_enabled and jnt_actgravcomp[d_jnt] != 0:
+        if gravity_enabled and actgravcomp != 0:
           qfrc += qfrc_gravcomp
-        if jnt_actfrclimited[d_jnt]:
-          frcrange = jnt_actfrcrange[worldid % jnt_actfrcrange.shape[0], d_jnt]
-          qfrc = wp.clamp(qfrc, frcrange[0], frcrange[1])
+        if d_frclimited != 0:
+          qfrc = wp.clamp(qfrc, d_frcrange[0], d_frcrange[1])
         qfrc_actuator_out[worldid, tid] = qfrc
 
   return kernel
@@ -2954,12 +3150,13 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
   ``smooth.crb``, ``smooth.transmission``, ``fwd_velocity`` (actuator velocity, ``com_vel``, passive
   forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`. The body/dof
   awake arrays are published once, by ``forward_m`` after ``wake_equality``. ``groups`` are the
-  contact buckets shared with ``forward_m`` (their per-world counts are zeroed here).
+  contact buckets shared with ``forward_m`` (their per-world counts are zeroed here). The wake pass
+  is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``).
   """
   if groups is None:
     groups = contact_groups(d)
   wp.launch(
-    _forward_a_kernel(NBODY_CAP, NV_CAP, NU_CAP, NTREE_CAP),
+    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nbody,
@@ -2968,7 +3165,8 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.ntree,
       m.ngeom,
       m.nsite,
-      m.ngravcomp,
+      int(m.ngravcomp > 0),
+      int(getattr(m.opt, "run_sleep_wake", True)),
       m.opt.disableflags,
       m.opt.gravity,
       m.qpos0,
@@ -2991,7 +3189,6 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.body_inertia,
       m.body_gravcomp,
       m.body_tree_offsets,
-      m.gravcomp_bodyid,
       m.jnt_type,
       m.jnt_qposadr,
       m.jnt_dofadr,
@@ -3003,7 +3200,6 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.jnt_actfrclimited,
       m.jnt_actfrcrange,
       m.dof_bodyid,
-      m.dof_parentid,
       m.dof_jntid,
       m.dof_armature,
       m.dof_damping,

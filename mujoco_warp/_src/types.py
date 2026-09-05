@@ -873,6 +873,9 @@ class Option:
                              contacts matched after this value is exceded will be ignored
     warn_overflow: warn if overflow is encountered
     fused_world: use the per-world fused CTA kernels (fused_world.py) when the model qualifies
+    run_sleep_wake: if False, forward() skips its ``sleep.wake`` pass: the caller declares that it
+      has already run ``sleep.wake`` on the current ``qvel``/``qfrc_applied``/``xfrc_applied`` and
+      ``tree_awake`` (as Newton does before every step), so the pass would wake no tree
   """
 
   timestep: array("*", float)
@@ -904,6 +907,7 @@ class Option:
   contact_sensor_maxmatch: int
   warn_overflow: bool
   fused_world: bool
+  run_sleep_wake: bool
 
   # TODO(team): remove in future version
   @property
