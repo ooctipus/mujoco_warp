@@ -4466,13 +4466,14 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data):
+def solve(m: types.Model, d: types.Data, *, materialize_island_mapping: bool = True):
+  """Solve constraints and optionally publish the public island mapping."""
   if m.opt.enableflags & types.EnableBit.SLEEP:
     # Self-contained like the island branch below: rebuild the active-DOF mapping from
     # tree_awake so solve() works when called directly (not only via fwd_acceleration).
     island.update_active_dofs(m, d)
     solve_compact(m, d)
-    if m.ntree > 1:
+    if materialize_island_mapping and m.ntree > 1:
       island.compute_island_mapping(m, d)
     return
 

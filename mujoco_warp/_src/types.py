@@ -992,6 +992,7 @@ class Model:
     noct: number of total octree cells in all meshes
     njnt: number of joints
     ntree: number of kinematic trees
+    has_gravcomp: whether any body has nonzero gravity compensation (host flag)
     nM: number of non-zeros in sparse inertia matrix
     nC: number of non-zeros in sparse body-dof matrix
     nD: number of non-zeros in sparse derivative matrix
@@ -1485,6 +1486,7 @@ class Model:
   noct: int
   njnt: int
   ntree: int
+  has_gravcomp: bool
   nM: int
   nC: int
   nD: int

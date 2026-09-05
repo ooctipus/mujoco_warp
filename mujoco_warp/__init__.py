@@ -24,6 +24,7 @@ except metadata.PackageNotFoundError:
 
 # isort: off
 from mujoco_warp._src.forward import step as step
+from mujoco_warp._src.forward import _step_intermediate as _step_intermediate
 from mujoco_warp._src.types import Model as Model
 from mujoco_warp._src.types import Data as Data
 # isort: on

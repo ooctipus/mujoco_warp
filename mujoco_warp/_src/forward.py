@@ -273,7 +273,25 @@ def _next_time_builder(warn_overflow: bool):
   return _next_time
 
 
-def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None):
+def _has_callback(m: Model) -> bool:
+  """Return whether a callback can observe intermediate derived state."""
+  return any(callback is not None for callback in vars(m.callback).values())
+
+
+def _requires_post_sleep_velocity_refresh(m: Model) -> bool:
+  """Return whether later work can observe velocity-derived data before the next refresh."""
+  has_spatial_equality = m.eq_connect_adr.size > 0 or m.eq_wld_adr.size > 0
+  return has_spatial_equality or _has_callback(m)
+
+
+def _advance(
+  m: Model,
+  d: Data,
+  qacc: wp.array,
+  qvel: Optional[wp.array] = None,
+  *,
+  finalize: bool,
+):
   """Advance state and time given activation derivatives and acceleration."""
   # TODO(team): can we assume static timesteps?
 
@@ -345,7 +363,8 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
     sleep.sleep(m, d)
-    fwd_velocity(m, d)
+    if finalize or _requires_post_sleep_velocity_refresh(m):
+      fwd_velocity(m, d)
     sleep.update_sleep(m, d)
 
 
@@ -384,8 +403,7 @@ def _euler_damp_qfrc(
   M_integration_out[worldid, adr] += timestep * damp_deriv[worldid, tid]
 
 
-@event_scope
-def euler(m: Model, d: Data):
+def _euler(m: Model, d: Data, finalize: bool):
   """Euler integrator, semi-implicit in velocity."""
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
@@ -412,9 +430,15 @@ def euler(m: Model, d: Data):
       outputs=[M],
     )
     smooth.factor_solve_i(m, d, M, qLD, qLDiagInv, qacc, d.efc.Ma)
-    _advance(m, d, qacc)
+    _advance(m, d, qacc, finalize=finalize)
   else:
-    _advance(m, d, d.qacc)
+    _advance(m, d, d.qacc, finalize=finalize)
+
+
+@event_scope
+def euler(m: Model, d: Data):
+  """Euler integrator, semi-implicit in velocity."""
+  _euler(m, d, finalize=True)
 
 
 def _rk_perturb_state(
@@ -520,8 +544,7 @@ def _rk_accumulate(
     )
 
 
-@event_scope
-def rungekutta4(m: Model, d: Data):
+def _rungekutta4(m: Model, d: Data, finalize: bool):
   """Runge-Kutta explicit order 4 integrator."""
   # RK4 tableau
   A = [0.5, 0.5, 1.0]  # diagonal only
@@ -544,7 +567,7 @@ def rungekutta4(m: Model, d: Data):
   for i in range(3):
     a, b = float(A[i]), B[i + 1]
     _rk_perturb_state(m, d, a, qpos_t0, qvel_t0, act_t0)
-    forward(m, d)
+    forward(m, d, _finalize=finalize and i == 2)
     _rk_accumulate(m, d, b, qvel_rk, qacc_rk, act_dot_rk)
 
   wp.copy(d.qpos, qpos_t0)
@@ -554,7 +577,13 @@ def rungekutta4(m: Model, d: Data):
     wp.copy(d.act, act_t0)
     wp.copy(d.act_dot, act_dot_rk)
 
-  _advance(m, d, qacc_rk, qvel_rk)
+  _advance(m, d, qacc_rk, qvel_rk, finalize=finalize)
+
+
+@event_scope
+def rungekutta4(m: Model, d: Data):
+  """Runge-Kutta explicit order 4 integrator."""
+  _rungekutta4(m, d, finalize=True)
 
 
 @wp.kernel
@@ -575,8 +604,7 @@ def _map_m2d(
     qLU_out[worldid, elemid] = 0.0
 
 
-@event_scope
-def implicit(m: Model, d: Data):
+def _implicit(m: Model, d: Data, finalize: bool):
   """Integrates fully implicit in velocity."""
   if m.opt.integrator == IntegratorType.IMPLICIT:
     qH_M = wp.empty(d.M.shape, dtype=float)
@@ -598,7 +626,7 @@ def implicit(m: Model, d: Data):
     # 4. Factorize and solve: qacc = qLU \ Ma
     qacc = wp.empty((d.nworld, m.nv), dtype=float)
     smooth.factor_solve_lu(m, d, d.qLU, qacc, d.efc.Ma)
-    _advance(m, d, qacc)
+    _advance(m, d, qacc, finalize=finalize)
   elif ~(m.opt.disableflags | ~(DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)):
     # qDeriv is in M-structure; the scratch qLD matches d.qLD (per-block).
     qDeriv = wp.empty((d.nworld, m.nC), dtype=float)
@@ -607,9 +635,15 @@ def implicit(m: Model, d: Data):
     derivative.deriv_smooth_vel(m, d, qDeriv)
     qacc = wp.empty((d.nworld, m.nv), dtype=float)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
-    _advance(m, d, qacc)
+    _advance(m, d, qacc, finalize=finalize)
   else:
-    _advance(m, d, d.qacc)
+    _advance(m, d, d.qacc, finalize=finalize)
+
+
+@event_scope
+def implicit(m: Model, d: Data):
+  """Integrate fully implicitly in velocity."""
+  _implicit(m, d, finalize=True)
 
 
 @event_scope
@@ -1336,7 +1370,7 @@ def _energy_vel(m: Model, d: Data):
 
 
 @event_scope
-def forward(m: Model, d: Data):
+def forward(m: Model, d: Data, *, _finalize: bool = True):
   """Forward dynamics."""
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
@@ -1358,23 +1392,45 @@ def forward(m: Model, d: Data):
   fwd_actuation(m, d)
   fwd_acceleration(m, d, factorize=True)
 
-  solver.solve(m, d)
+  solver.solve(m, d, materialize_island_mapping=_finalize or _has_callback(m))
   sensor.sensor_acc(m, d)
+
+
+def _step(m: Model, d: Data, finalize: bool):
+  """Advance simulation and defer only intermediate derived data that is safe to rebuild."""
+  # RK4 performs three additional forward passes below. Its public mapping must
+  # reflect the final forward state, not the initial state.
+  forward(m, d, _finalize=finalize and m.opt.integrator != IntegratorType.RK4)
+
+  if m.opt.integrator == IntegratorType.EULER:
+    if finalize:
+      euler(m, d)
+    else:
+      _euler(m, d, finalize=False)
+  elif m.opt.integrator == IntegratorType.RK4:
+    if finalize:
+      rungekutta4(m, d)
+    else:
+      _rungekutta4(m, d, finalize=False)
+  elif m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
+    if finalize:
+      implicit(m, d)
+    else:
+      _implicit(m, d, finalize=False)
+  else:
+    raise NotImplementedError(f"integrator {m.opt.integrator} not implemented.")
 
 
 @event_scope
 def step(m: Model, d: Data):
   """Advance simulation."""
-  forward(m, d)
+  _step(m, d, finalize=True)
 
-  if m.opt.integrator == IntegratorType.EULER:
-    euler(m, d)
-  elif m.opt.integrator == IntegratorType.RK4:
-    rungekutta4(m, d)
-  elif m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
-    implicit(m, d)
-  else:
-    raise NotImplementedError(f"integrator {m.opt.integrator} not implemented.")
+
+@event_scope
+def _step_intermediate(m: Model, d: Data):
+  """Advance an intermediate substep while deferring safe derived-data materialization."""
+  _step(m, d, finalize=False)
 
 
 @event_scope

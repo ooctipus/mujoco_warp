@@ -424,6 +424,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
 
   # create model
   m = types.Model(**{f.name: getattr(mjm, f.name, None) for f in dataclasses.fields(types.Model)})
+  m.has_gravcomp = bool(np.any(mjm.body_gravcomp != 0.0))
 
   m.opt = opt
   m.stat = stat

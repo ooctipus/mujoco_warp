@@ -901,46 +901,34 @@ def _build_cycles(  # kernel_analyzer: ignore
   qvel_out: wp.array2d[float],  # kernel_analyzer: ignore
   qacc_out: wp.array2d[float],  # kernel_analyzer: ignore
 ):
-  worldid = wp.tid()
-
+  worldid, treeid = wp.tid()
   num_islands = nisland_in[worldid]
-  for island_id in range(num_islands):
-    if island_can_sleep_in[worldid, island_id] == 1:
-      first_tree = int(-1)
-      prev_tree = int(-1)
-      for t in range(ntree):
-        if tree_island_in[worldid, t] == island_id:
-          if first_tree == -1:
-            first_tree = t
-          if prev_tree != -1:
-            tree_asleep_out[worldid, prev_tree] = t
-          prev_tree = t
+  island_id = tree_island_in[worldid, treeid]
+  if island_id >= 0 and island_id < num_islands:
+    if island_can_sleep_in[worldid, island_id] == 0:
+      return
 
-          # Zero velocities and accelerations
-          dofadr = tree_dofadr[t]
-          dofnum = tree_dofnum[t]
-          for d in range(dofnum):
-            qvel_out[worldid, dofadr + d] = 0.0
-            qacc_out[worldid, dofadr + d] = 0.0
+    next_tree = treeid
+    for offset in range(1, ntree):
+      candidate = treeid + offset
+      if candidate >= ntree:
+        candidate -= ntree
+      if tree_island_in[worldid, candidate] == island_id:
+        next_tree = candidate
+        break
+    tree_asleep_out[worldid, treeid] = next_tree
+  else:
+    if tree_asleep_out[worldid, treeid] == -1:
+      tree_asleep_out[worldid, treeid] = treeid  # self-cycle
+    if tree_asleep_out[worldid, treeid] < 0:
+      return
 
-      if first_tree != -1:
-        tree_asleep_out[worldid, prev_tree] = first_tree
-
-  # Sleep unconstrained trees
-  for t in range(ntree):
-    island_id = tree_island_in[worldid, t]
-    if island_id < 0 or island_id >= num_islands:
-      if tree_asleep_out[worldid, t] == -1:
-        tree_asleep_out[worldid, t] = t  # self-cycle
-
-      # Ensure sleeping tree dof velocity and acceleration remain exactly zero
-      if tree_asleep_out[worldid, t] >= 0:
-        dofadr = tree_dofadr[t]
-        dofnum = tree_dofnum[t]
-        for d in range(dofnum):
-          # TODO(team): shouldn't be necessary to zero if island is already asleep
-          qvel_out[worldid, dofadr + d] = 0.0
-          qacc_out[worldid, dofadr + d] = 0.0
+  # Zero velocities and accelerations for sleeping trees.
+  dofadr = tree_dofadr[treeid]
+  dofnum = tree_dofnum[treeid]
+  for d in range(dofnum):
+    qvel_out[worldid, dofadr + d] = 0.0
+    qacc_out[worldid, dofadr + d] = 0.0
 
 
 @event_scope
@@ -982,7 +970,7 @@ def sleep(m: types.Model, d: types.Data):
   # 3. Build sleep cycles for sleeping islands and sleep unconstrained trees
   wp.launch(
     _build_cycles,
-    dim=d.nworld,
+    dim=(d.nworld, m.ntree),
     inputs=[
       m.ntree,
       m.tree_dofadr,
