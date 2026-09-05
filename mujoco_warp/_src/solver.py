@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import dataclasses
+import os
 from math import ceil
 from typing import Any
 
@@ -24,6 +25,7 @@ from mujoco_warp._src import math
 from mujoco_warp._src import smooth
 from mujoco_warp._src import support
 from mujoco_warp._src import types
+from mujoco_warp._src import world_solver
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_augmented_factorize_solve_newton_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_factorize_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
@@ -40,6 +42,14 @@ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
 _BLOCK_CHOLESKY_DIM = 32
 _LINESEARCH_MV_JV_ROW_SPAN = 512
+
+# Opt-in: on the sleeping (compact) path, solve every world with the per-world component-local
+# solver (world_solver.py) and run the stock compact Newton recurrence only for the worlds it
+# did not certify, inside a conditional graph node on ``nstock``. Set the module flag or
+# MJWARP_WORLD_SOLVER=1 in the environment.
+WORLD_SOLVER_ENABLED = os.environ.get("MJWARP_WORLD_SOLVER", "0") == "1"
+_WORLD_SOLVER_CTX: dict[int, world_solver.WorldSolverContext] = {}
+_WORLD_SOLVER_WARNED: set[str] = set()
 
 
 def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
@@ -1701,6 +1711,25 @@ def _solve_init_efc(
   worldid = wp.tid()
   solver_niter_out[worldid] = 0
   ctx_done_out[worldid] = False
+  ctx_search_dot_out[worldid] = 0.0
+
+
+@wp.kernel(grid_stride=True)
+def _solve_init_efc_masked(
+  # In:
+  stock_world_in: wp.array[int],
+  # Data out:
+  solver_niter_out: wp.array[int],
+  # Out:
+  ctx_search_dot_out: wp.array[float],
+  ctx_done_out: wp.array[bool],
+):
+  """Stock-fallback variant: worlds certified by the world solver start done and keep their niter."""
+  worldid = wp.tid()
+  stock = stock_world_in[worldid] != 0
+  if stock:
+    solver_niter_out[worldid] = 0
+  ctx_done_out[worldid] = not stock
   ctx_search_dot_out[worldid] = 0.0
 
 
@@ -4407,13 +4436,28 @@ def _solver_iteration(
     )
 
 
-def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, grad: bool = True, compact: bool = False):
+def init_context(
+  m: types.Model,
+  d: types.Data,
+  ctx: SolverContext | InverseContext,
+  grad: bool = True,
+  compact: bool = False,
+  stock_world: wp.array | None = None,
+):
   # initialize some efc arrays
-  wp.launch(
-    _solve_init_efc,
-    dim=d.nworld,
-    outputs=[d.solver_niter, ctx.search_dot, ctx.done],
-  )
+  if stock_world is None:
+    wp.launch(
+      _solve_init_efc,
+      dim=d.nworld,
+      outputs=[d.solver_niter, ctx.search_dot, ctx.done],
+    )
+  else:
+    wp.launch(
+      _solve_init_efc_masked,
+      dim=d.nworld,
+      inputs=[stock_world],
+      outputs=[d.solver_niter, ctx.search_dot, ctx.done],
+    )
 
   # jaref = d.efc_J @ d.qacc - d.efc_aref
 
@@ -4469,10 +4513,13 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 def solve(m: types.Model, d: types.Data, *, materialize_island_mapping: bool = True):
   """Solve constraints and optionally publish the public island mapping."""
   if m.opt.enableflags & types.EnableBit.SLEEP:
-    # Self-contained like the island branch below: rebuild the active-DOF mapping from
-    # tree_awake so solve() works when called directly (not only via fwd_acceleration).
-    island.update_active_dofs(m, d)
-    solve_compact(m, d)
+    if WORLD_SOLVER_ENABLED and _world_solver_applicable(m, d):
+      _solve_world_first(m, d)
+    else:
+      # Self-contained like the island branch below: rebuild the active-DOF mapping from
+      # tree_awake so solve() works when called directly (not only via fwd_acceleration).
+      island.update_active_dofs(m, d)
+      solve_compact(m, d)
     if materialize_island_mapping and m.ntree > 1:
       island.compute_island_mapping(m, d)
     return
@@ -4485,8 +4532,20 @@ def solve(m: types.Model, d: types.Data, *, materialize_island_mapping: bool = T
     _solve(m, d, ctx)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
-  """Finds forces that satisfy constraints."""
+def _solve(
+  m: types.Model,
+  d: types.Data,
+  ctx: SolverContext,
+  compact: bool = False,
+  stock_world: wp.array | None = None,
+  nstock: wp.array | None = None,
+  nsolving: wp.array | None = None,
+):
+  """Finds forces that satisfy constraints.
+
+  With ``stock_world``/``nstock`` (world-solver fallback) only the flagged worlds iterate: the
+  others start done, keep their ``solver_niter`` and their outputs are never touched.
+  """
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse),
@@ -4496,7 +4555,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   )
 
   #  context
-  init_context(m, d, ctx, grad=True, compact=compact)
+  init_context(m, d, ctx, grad=True, compact=compact, stock_world=stock_world)
 
   if m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC:
     # A new solve computes a new search direction: invalidate the mv/jv reuse
@@ -4513,7 +4572,11 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       block_dim=m.block_dim.solve_init_search_cg,
     )
 
-  nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
+  if nstock is not None:
+    # the conditional-graph body may not allocate: nsolving is provided by the caller
+    wp.copy(nsolving, nstock)
+  else:
+    nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
     # as long as condition_iteration is not zero.
@@ -4795,6 +4858,32 @@ def _scatter_dof_vecs(
 
 
 @wp.kernel
+def _scatter_dof_vecs_masked(
+  # Data in:
+  dof_cdof_in: wp.array2d[int],
+  qacc_smooth_in: wp.array2d[float],
+  # In:
+  stock_world_in: wp.array[int],
+  qacc_c_in: wp.array2d[float],
+  qfrc_constraint_c_in: wp.array2d[float],
+  # Data out:
+  qacc_out: wp.array2d[float],
+  qfrc_constraint_out: wp.array2d[float],
+):
+  """Scatter only the worlds solved by the stock fallback (the others hold world-solver output)."""
+  worldid, i = wp.tid()
+  if stock_world_in[worldid] == 0:
+    return
+  ci = dof_cdof_in[worldid, i]
+  if ci >= 0:
+    qacc_out[worldid, i] = qacc_c_in[worldid, ci]
+    qfrc_constraint_out[worldid, i] = qfrc_constraint_c_in[worldid, ci]
+  else:
+    qacc_out[worldid, i] = qacc_smooth_in[worldid, i]
+    qfrc_constraint_out[worldid, i] = 0.0
+
+
+@wp.kernel
 def _gather_J_sparse(
   # Data in:
   nefc_in: wp.array[int],
@@ -4849,8 +4938,14 @@ def solve_compact(m: types.Model, d: types.Data):
   On the incremental Newton path the solver kernels read the sparse M and J directly
   through the compaction maps.
   """
+  m2, d2, sctx = _compact_solver_setup(m, d)
   _compact_gather(m, d)
+  _solve(m2, d2, sctx, compact=True)
+  _compact_scatter(m, d)
 
+
+def _compact_solver_setup(m: types.Model, d: types.Data):
+  """Shallow-replaced (m, d) at nvmax_pad plus a fresh SolverContext for the compact solve."""
   # shallow-replace (m, d) so the stock dense Newton solver runs at nvmax_pad.
   # Keep graph-conditional early-exit on CUDA (matches baseline: stops at convergence
   # instead of running all iterations); fall back to the plain loop on CPU.
@@ -4877,9 +4972,53 @@ def solve_compact(m: types.Model, d: types.Data):
   # the compaction maps instead of dense products on gathered blocks
   sctx.compact_m_full = m
   sctx.compact_d_full = d
-  _solve(m2, d2, sctx, compact=True)
+  return m2, d2, sctx
 
-  _compact_scatter(m, d)
+
+def _world_solver_applicable(m: types.Model, d: types.Data) -> bool:
+  reason = world_solver.world_solver_unsupported_reason(m, d)
+  if reason is not None and reason not in _WORLD_SOLVER_WARNED:
+    _WORLD_SOLVER_WARNED.add(reason)
+    wp.utils.warn(f"world solver disabled for this model: {reason}")
+  return reason is None
+
+
+def _world_solver_context(d: types.Data) -> world_solver.WorldSolverContext:
+  ctx = _WORLD_SOLVER_CTX.get(id(d))
+  if ctx is None or ctx.stock_world.shape[0] != d.nworld or ctx.dense_rows.device != d.qacc.device:
+    ctx = world_solver.create_world_solver_context(d.nworld, device=d.qacc.device)
+    _WORLD_SOLVER_CTX[id(d)] = ctx
+  return ctx
+
+
+def _solve_world_first(m: types.Model, d: types.Data):
+  """World solver for every world, stock compact solve only for the uncertified ones.
+
+  The stock fallback runs inside ``wp.capture_if(nstock)``; everything it needs is allocated
+  before the conditional body so the call stays graph-capturable.
+  """
+  wctx = _world_solver_context(d)
+  world_solver.world_solve(m, d, wctx)
+  m2, d2, sctx = _compact_solver_setup(m, d)
+  nsolving = wp.empty(shape=(1,), dtype=int)
+  wp.capture_if(
+    wctx.nstock,
+    on_true=_stock_fallback,
+    m=m,
+    d=d,
+    m2=m2,
+    d2=d2,
+    sctx=sctx,
+    nsolving=nsolving,
+    wctx=wctx,
+  )
+
+
+def _stock_fallback(m, d, m2, d2, sctx, nsolving, wctx):
+  island.update_active_dofs(m, d)
+  _compact_gather(m, d)
+  _solve(m2, d2, sctx, compact=True, stock_world=wctx.stock_world, nstock=wctx.nstock, nsolving=nsolving)
+  _compact_scatter(m, d, stock_world=wctx.stock_world)
 
 
 @event_scope
@@ -4926,14 +5065,22 @@ def _compact_gather(m: types.Model, d: types.Data):
 
 
 @event_scope
-def _compact_scatter(m: types.Model, d: types.Data):
+def _compact_scatter(m: types.Model, d: types.Data, stock_world: wp.array | None = None):
   # scatter results back to full DOF space in one launch
-  wp.launch(
-    _scatter_dof_vecs,
-    dim=(d.nworld, m.nv),
-    inputs=[d.dof_cdof, d.qacc_smooth, d.cqacc, d.cqfrc_constraint],
-    outputs=[d.qacc, d.qfrc_constraint],
-  )
+  if stock_world is None:
+    wp.launch(
+      _scatter_dof_vecs,
+      dim=(d.nworld, m.nv),
+      inputs=[d.dof_cdof, d.qacc_smooth, d.cqacc, d.cqfrc_constraint],
+      outputs=[d.qacc, d.qfrc_constraint],
+    )
+  else:
+    wp.launch(
+      _scatter_dof_vecs_masked,
+      dim=(d.nworld, m.nv),
+      inputs=[d.dof_cdof, d.qacc_smooth, stock_world, d.cqacc, d.cqfrc_constraint],
+      outputs=[d.qacc, d.qfrc_constraint],
+    )
 
   # Refresh full d.efc.Ma = M @ qacc. The integrators (Euler/implicit damping) use Ma as
   # the RHS; the compact solve only populated the compacted Ma, so recompute it in full

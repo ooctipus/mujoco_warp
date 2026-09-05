@@ -32,15 +32,15 @@ their rows in registers, reduce the packed 6x6 Hessian with xor-butterfly shuffl
 every lane factors and solves it redundantly in registers. Components with 7..16 DOFs
 stage 32-row tiles in per-warp shared memory (resident when the component fits one
 tile), accumulate packed Hessian entries per lane and factor with a lane-per-row packed
-Cholesky in registers; 17..32 DOFs use the same scheme from the sparse Jacobian on a
-block-level scratch (warp 0).
+Cholesky in registers; 17..32 DOFs stage 17-row tiles from a second (wide) record
+scratch and accumulate lane-owned Hessian rows.
 
 Every iterate is certified with the history-free clauses of ``solver._solve_done``
 (rescaled gradient or half Newton decrement below ``d.ctol`` with
 ``_rescale(nvmax_pad, meaninertia)``), so a certified world stops at a point at which
 the stock solver would also have stopped. Uncertified worlds and worlds that exceed
-the compile-time capacities (component DOFs > 32, active DOFs > 128, rows > 1024,
-``nf > 0``) are flagged in ``stock_world`` and counted in ``nstock`` for the stock
+the compile-time capacities (component DOFs > 32, active DOFs > 128, rows > 1024, more
+than 256 rows in 17..32 DOF components, ``nf > 0``) are flagged in ``stock_world`` and counted in ``nstock`` for the stock
 fallback.
 
 All reductions run in a fixed order (stable row bucketing, fixed lane-to-row
@@ -58,6 +58,8 @@ from mujoco_warp._src import types
 BLOCK_DIM = 128
 ROW_CAP = 1024
 DENSE_ROW_FLOATS = 20
+WIDE_ROW_CAP = 256
+WIDE_ROW_FLOATS = 36
 LIGHT_DOF_CAP = 6
 COMP_DOF_CAP = 32
 NCDOF_CAP = 128
@@ -71,7 +73,7 @@ STATUS_UNCERTIFIED = 1
 STATUS_NOT_PD = 3
 STATUS_NONFINITE = 4
 # capacity routing sub-codes (>= 20): nisland, friction rows, component DOFs, active DOFs,
-# rows, row spanning islands, row nnz
+# rows, row spanning islands, row nnz, wide (17..32 DOF) rows
 STATUS_CAPACITY = 20
 
 _NATIVE_TEMPLATE = r"""
@@ -85,7 +87,9 @@ _NATIVE_TEMPLATE = r"""
   constexpr int MN = __MN__;                 // mid component DOF cap
   constexpr int MNS = 16;                    // mid components up to MNS DOFs read dense row records
   constexpr int MP = MNS * (MNS + 1) / 2;    // packed per-warp Hessian entries (n <= MNS)
-  constexpr int DR4 = __DR4__;               // float4 per dense row record (MNS + 2 floats, padded)
+  constexpr int DR4 = __DR4__;               // float4 per dense row record (MNS + D, aref, coef, F)
+  constexpr int WIDE_CAP = __WIDE_CAP__;     // rows of 17..32 DOF components per world (compact index)
+  constexpr int WR4 = __WR4__;               // float4 per wide row record (MN + D, aref, coef, F)
   constexpr int TILE_FLOATS = 32 * (MNS + 4); // per-warp tile: 32 rows x (MNS + D, aref, coef, F)
   constexpr int NCDOF = __NCDOF__;
   constexpr int NTREE = __NTREE__;
@@ -99,13 +103,14 @@ _NATIVE_TEMPLATE = r"""
   constexpr int ROW_NONE = 255;
   constexpr int STATUS_CERTIFIED = 0, STATUS_UNCERTIFIED = 1, STATUS_NOT_PD = 3, STATUS_NONFINITE = 4;
   constexpr int STATUS_CAP_NISLAND = 20, STATUS_CAP_FRICTION = 21, STATUS_CAP_COMP_DOF = 22, STATUS_CAP_NCDOF = 23,
-                STATUS_CAP_ROWS = 24, STATUS_CAP_ROW_ISLANDS = 25, STATUS_CAP_ROW_NNZ = 26;
+                STATUS_CAP_ROWS = 24, STATUS_CAP_ROW_ISLANDS = 25, STATUS_CAP_ROW_NNZ = 26, STATUS_CAP_WIDE_ROWS = 27;
   static_assert(BLOCK % 32 == 0, "block must be whole warps");
   static_assert(NTREE <= 32, "island bitsets are 32 wide");
   static_assert(LP <= 32, "light Hessian must fit one entry per lane for the M gather");
   static_assert(LN <= 6, "dense row record holds 6 values + D + aref");
   static_assert(MN <= 32, "mid components use one lane per DOF");
-  static_assert(MNS % 4 == 0 && 4 * DR4 >= MNS + 2, "dense record holds MNS values + D + aref");
+  static_assert(MNS % 4 == 0 && 4 * DR4 == MNS + 4, "dense record: MNS values + D, aref, coef, F");
+  static_assert(MN % 4 == 0 && 4 * WR4 == MN + 4, "wide record: MN values + D, aref, coef, F");
   static_assert(2 * 4 >= LN + 2, "light rows use the first two float4 of the record");
   static_assert(LP + LN <= MP, "light M_c/qfrc scratch fits the per-warp H arena");
   const unsigned FULL = 0xffffffffu;
@@ -128,6 +133,7 @@ _NATIVE_TEMPLATE = r"""
   __shared__ unsigned char sh_comp_order[NTREE];
   __shared__ unsigned short sh_comp_nrow[NTREE];
   __shared__ unsigned short sh_comp_row_begin[NTREE];
+  __shared__ unsigned short sh_comp_wbegin[NTREE];
   __shared__ int sh_comp_cnt[NTREE];
   __shared__ float sh_comp_gd[NTREE];
   __shared__ float sh_comp_dec[NTREE];
@@ -167,6 +173,7 @@ _NATIVE_TEMPLATE = r"""
   const float* const ctol_p = reinterpret_cast<const float*>(ctol_in.data);
   // dense row records (DR4 float4 per row), per world
   float4* const dense4_p = reinterpret_cast<float4*>(dense_rows.data) + (size_t)worldid * ROW_CAP * DR4;
+  float4* const wide4_p = reinterpret_cast<float4*>(wide_rows.data) + (size_t)worldid * WIDE_CAP * WR4;
   float* const qacc_o = reinterpret_cast<float*>(qacc_out.data) + worldid * (qacc_out.strides[0] / 4);
   float* const qfrc_o = reinterpret_cast<float*>(qfrc_constraint_out.data) + worldid * (qfrc_constraint_out.strides[0] / 4);
   float* const force_o = reinterpret_cast<float*>(efc_force_out.data) + worldid * (efc_force_out.strides[0] / 4);
@@ -175,6 +182,7 @@ _NATIVE_TEMPLATE = r"""
   int* const niter_o = reinterpret_cast<int*>(solver_niter_out.data);
   int* const stock_o = reinterpret_cast<int*>(stock_world_out.data);
   int* const nstock_o = reinterpret_cast<int*>(nstock_out.data);
+  int* const nstock_total_o = reinterpret_cast<int*>(nstock_total_out.data);
   int* const status_o = reinterpret_cast<int*>(world_status_out.data);
   float* const gradient_o = reinterpret_cast<float*>(world_gradient_out.data);
   float* const decrement_o = reinterpret_cast<float*>(world_decrement_out.data);
@@ -196,6 +204,7 @@ _NATIVE_TEMPLATE = r"""
     if (tid == 0) {
       stock_o[worldid] = 1;
       atomicAdd(nstock_o, 1);
+      atomicAdd(nstock_total_o, 1);
       status_o[worldid] = status;
       gradient_o[worldid] = 0.0f;
       decrement_o[worldid] = 0.0f;
@@ -368,16 +377,33 @@ _NATIVE_TEMPLATE = r"""
       if (k2 > key || (k2 == key && c2 < lane)) ++rank;
     }
     const unsigned act_mask = __ballot_sync(FULL, active);
+    // rows of 17..32 DOF components get compact indices into the wide record scratch
+    const bool wide = active && (nd > MNS);
+    int inclw = wide ? nrow : 0;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int v = __shfl_up_sync(FULL, inclw, o);
+      if (lane >= o) inclw += v;
+    }
+    const int nwide = __shfl_sync(FULL, inclw, 31);
     sh_comp_nrow[c] = (unsigned short)nrow;
     sh_comp_row_begin[c] = (unsigned short)rbegin;
+    sh_comp_wbegin[c] = (unsigned short)(inclw - (wide ? nrow : 0));
     if (active) sh_comp_order[rank] = (unsigned char)c;
     if (lane == 0) {
       sh_flags[2] = __popc(act_mask);
       sh_flags[3] = 0;  // next component to pull
+      sh_flags[5] = nwide;
+      if (nwide > WIDE_CAP) sh_flags[0] = STATUS_CAP_WIDE_ROWS;
     }
   }
   __syncthreads();
+  if (sh_flags[0] != STATUS_CERTIFIED) {
+    route_to_stock(sh_flags[0]);
+    return;
+  }
   const int ncomp_active = sh_flags[2];
+  const int nwide = sh_flags[5];
 
   // ---------------------------------------------------------------- phase 0d: stable bucketing
   for (int c = warp; c < nisland; c += NWARPS) {
@@ -394,6 +420,36 @@ _NATIVE_TEMPLATE = r"""
     }
   }
   __syncthreads();
+  // ---------------------------------------------------------------- phase 0e: wide row records
+  // rows of 17..32 DOF components as dense records (j[0..MN), D, aref) at their compact index
+  if (nwide > 0) {
+    for (int i = tid; i < nwide; i += BLOCK) {
+      int c = 0;
+      for (; c < nisland; ++c) {
+        if ((int)sh_comp_ndof[c] > MNS && i >= (int)sh_comp_wbegin[c] && i < (int)sh_comp_wbegin[c] + (int)sh_comp_nrow[c]) break;
+      }
+      const int r = sh_row_order[(int)sh_comp_row_begin[c] + (i - (int)sh_comp_wbegin[c])];
+      const int sb = sh_comp_begin[c];
+      const int nnz = rownnz_p[r];
+      const int adr = rowadr_p[r];
+      float jd[MN];
+#pragma unroll
+      for (int a = 0; a < MN; ++a) jd[a] = 0.0f;
+#pragma unroll
+      for (int k = 0; k < NNZ_CAP; ++k) {
+        const int col = (k < nnz) ? colind_p[adr + k] : 0;
+        const float val = (k < nnz) ? J_p[adr + k] : 0.0f;
+        const int s = (k < nnz) ? (int)sh_dof_slot[col] : -1;
+        const int a = s - sb;
+#pragma unroll
+        for (int i2 = 0; i2 < MN; ++i2) jd[i2] = (s >= 0 && a == i2) ? val : jd[i2];
+      }
+#pragma unroll
+      for (int q4 = 0; q4 < MN / 4; ++q4) wide4_p[WR4 * i + q4] = make_float4(jd[4 * q4], jd[4 * q4 + 1], jd[4 * q4 + 2], jd[4 * q4 + 3]);
+      wide4_p[WR4 * i + MN / 4] = make_float4(D_p[r], aref_p[r], 0.0f, 0.0f);
+    }
+    __syncthreads();
+  }
   if (DEBUG_EXIT == 1) {
     if (tid == 0) status_o[worldid] = 0;
     return;
@@ -678,12 +734,12 @@ _NATIVE_TEMPLATE = r"""
     constexpr int MNL = (int)sizeof(*tag);
     constexpr bool DENSE = MNL <= MNS;
     constexpr int TS = MNL + 4;                       // tile row stride
-    // rows per tile: the sparse variant stages two lanes per row, so at most 16 rows
-    constexpr int TB = DENSE ? 32 : ((TILE_FLOATS / TS) < 16 ? (TILE_FLOATS / TS) : 16);
+    constexpr int TB = (TILE_FLOATS / TS) < 32 ? (TILE_FLOATS / TS) : 32;  // rows per tile
+    constexpr int R4 = TS / 4;                                                // float4 per record / tile row
     constexpr int MPL = MNL * (MNL + 1) / 2;
-    static_assert(MNL == MNS || MNL == MN, "mid variants: dense records up to MNS, sparse up to MN");
+    static_assert(MNL == MNS || MNL == MN, "mid variants: dense records up to MNS, wide records up to MN");
     static_assert(TS % 4 == 0 && TB >= 1 && TB * TS <= TILE_FLOATS, "tile rows fit the per-warp arena");
-    static_assert(DENSE || 2 * TB <= 32, "sparse staging uses two lanes per row");
+    static_assert(DENSE ? (R4 == DR4) : (R4 == WR4), "tile rows are record copies");
     static_assert(DENSE ? (MPL <= MP) : (MPL <= TILE_FLOATS), "packed H / L fits its arena");
     static_assert(TB <= 32, "one lane per tile row");
     const int n = sh_comp_ndof[c];
@@ -691,12 +747,14 @@ _NATIVE_TEMPLATE = r"""
     const int nrow = sh_comp_nrow[c];
     const int rb = sh_comp_row_begin[c];
     const bool own_row = lane < n;
-    // the single tile stays staged across rounds (the sparse variant reuses the tile for L)
+    // the single tile stays staged across rounds (the wide variant reuses the tile for L)
     const bool resident = DENSE && nrow <= TB;
     float* const tile = sh_tile[warp];
     float* const Lpk = DENSE ? sh_Hacc[warp] : tile;   // packed L for the backward solve
     float* const Mpk = sh_Hw[warp];                     // packed M_c (dense variant only)
     float* const qc = sh_qw[warp];
+    const float4* const rec4 = DENSE ? dense4_p : wide4_p;
+    const int wbeg = DENSE ? 0 : (int)sh_comp_wbegin[c];
     // packed M_c: lane a gathers its row (b <= a)
     if (DENSE && own_row) {
       const int ga = sh_slot_dof[sb + lane];
@@ -740,79 +798,36 @@ _NATIVE_TEMPLATE = r"""
       mc[k] = v;
     }
     __syncwarp();
-    // stage rows [tb, tb+rows) row-major: tile[t * TS + a] = J[row t, slot a]; D, aref, coef, F
-    // follow. Dense streamed batches classify straight from the loaded registers.
+    // stage rows [tb, tb+rows): copy the dense record (j[0..MNL), D, aref) into tile row t;
+    // streamed batches classify straight from the loaded registers (coef, F fill the record)
     auto stage_batch = [&](const int tb, const int rows, const bool classify) {
-      if (DENSE) {
-        const int t = lane;
-        if (t < rows) {
-          const int r = sh_row_order[rb + tb + t];
-          float4 w[MNS / 4 + 1];
+      const int t = lane;
+      if (t < rows) {
+        const int r = sh_row_order[rb + tb + t];
+        const int rec = DENSE ? r : (wbeg + tb + t);
+        float4 w[R4];
 #pragma unroll
-          for (int i = 0; i <= MNS / 4; ++i) w[i] = dense4_p[DR4 * r + i];
-          if (classify) {
-            float x = -w[MNS / 4].y;
+        for (int i = 0; i < R4; ++i) w[i] = rec4[R4 * rec + i];
+        if (classify) {
+          float x = -w[R4 - 1].y;
 #pragma unroll
-            for (int b = 0; b < MNS; ++b) {
-              if (b >= n) break;
-              const float4 wb = w[b >> 2];
-              const float vb = ((b & 3) == 0) ? wb.x : (((b & 3) == 1) ? wb.y : (((b & 3) == 2) ? wb.z : wb.w));
-              x += vb * qc[b];
-            }
-            const bool quad = (r < ne) || (x < 0.0f);
-            const float Dv = w[MNS / 4].x;
-            const float f = quad ? -Dv * x : 0.0f;
-            w[MNS / 4].z = quad ? Dv : 0.0f;
-            w[MNS / 4].w = f;
-            force_o[r] = f;
-            state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
+          for (int b = 0; b < MNL; ++b) {
+            if (b >= n) break;
+            const float4 wb = w[b >> 2];
+            const float vb = ((b & 3) == 0) ? wb.x : (((b & 3) == 1) ? wb.y : (((b & 3) == 2) ? wb.z : wb.w));
+            x += vb * qc[b];
           }
-          float4* const row4 = reinterpret_cast<float4*>(tile + t * TS);
-#pragma unroll
-          for (int i = 0; i <= MNS / 4; ++i) row4[i] = w[i];
+          const bool quad = (r < ne) || (x < 0.0f);
+          const float Dv = w[R4 - 1].x;
+          const float f = quad ? -Dv * x : 0.0f;
+          w[R4 - 1].z = quad ? Dv : 0.0f;
+          w[R4 - 1].w = f;
+          force_o[r] = f;
+          state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
         }
-      } else {
-        const int t = lane >> 1;
-        const int half = lane & 1;
-        const bool own = t < rows;
-        int r = -1;
-        int nnz = 0;
-        int k0 = 0;
-        int k1 = 0;
-        int cols[NNZ_HALF];
-        float vals[NNZ_HALF];
-        if (own) {
-          r = sh_row_order[rb + tb + t];
-          nnz = rownnz_p[r];
-          const int adr = rowadr_p[r];
-          k0 = half ? (nnz + 1) / 2 : 0;
-          k1 = half ? nnz : (nnz + 1) / 2;
+        float4* const row4 = reinterpret_cast<float4*>(tile + t * TS);
 #pragma unroll
-          for (int i = 0; i < NNZ_HALF; ++i) {
-            const int k = k0 + i;
-            cols[i] = (k < k1) ? colind_p[adr + k] : 0;
-            vals[i] = (k < k1) ? J_p[adr + k] : 0.0f;
-          }
-          if (half == 0) {
-            tile[t * TS + MNL] = D_p[r];
-            tile[t * TS + MNL + 1] = aref_p[r];
-          }
-          for (int a = half; a < n; a += 2) tile[t * TS + a] = 0.0f;
-        } else {
-#pragma unroll
-          for (int i = 0; i < NNZ_HALF; ++i) {
-            cols[i] = 0;
-            vals[i] = 0.0f;
-          }
-        }
-        __syncwarp();
-        if (own) {
-#pragma unroll
-          for (int i = 0; i < NNZ_HALF; ++i) {
-            const int s = (k0 + i < k1) ? (int)sh_dof_slot[cols[i]] : -1;
-            if (s >= 0) tile[t * TS + (s - sb)] = vals[i];
-          }
-        }
+        for (int i = 0; i < R4; ++i) row4[i] = w[i];
       }
       __syncwarp();
     };
@@ -900,7 +915,7 @@ _NATIVE_TEMPLATE = r"""
         }
         __syncwarp();
       } else {
-        // sparse variant: lane a accumulates its own Hessian row (M row from global)
+        // wide variant: lane a accumulates its own Hessian row (M row from global)
 #pragma unroll
         for (int b = 0; b < MNL; ++b) Hrow[b] = 0.0f;
         if (own_row) {
@@ -917,8 +932,8 @@ _NATIVE_TEMPLATE = r"""
         }
         for (int tb = 0; tb < nrow; tb += TB) {
           const int rows = min(TB, nrow - tb);
-          if (!DBG_NO_STAGE) stage_batch(tb, rows, false);
-          classify_tile(tb, rows);
+          if (!DBG_NO_STAGE) stage_batch(tb, rows, true);
+#pragma unroll 2
           for (int tt = 0; tt < (DBG_NO_ACC ? 0 : rows); ++tt) {
             const float* const row = tile + tt * TS;
             const float ja = row[trow];
@@ -1059,6 +1074,7 @@ _NATIVE_TEMPLATE = r"""
     if (status != STATUS_CERTIFIED) {
       stock_o[worldid] = 1;
       atomicAdd(nstock_o, 1);
+      atomicAdd(nstock_total_o, 1);
     } else {
       stock_o[worldid] = 0;
     }
@@ -1120,6 +1136,8 @@ def _render(nv: int, njmax: int, debug_exit: int = 0) -> str:
     "__LN__": str(LIGHT_DOF_CAP),
     "__RES__": str(RESIDENT_ROWS_PER_LANE),
     "__DR4__": str(DENSE_ROW_FLOATS // 4),
+    "__WIDE_CAP__": str(WIDE_ROW_CAP),
+    "__WR4__": str(WIDE_ROW_FLOATS // 4),
     "__MN__": str(COMP_DOF_CAP),
     "__NCDOF__": str(NCDOF_CAP),
     "__NTREE__": str(NTREE_CAP),
@@ -1178,6 +1196,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     qfrc_smooth_in: wp.array2d(dtype=float),
     qacc_warmstart_in: wp.array2d(dtype=float),
     dense_rows: wp.array3d(dtype=float),
+    wide_rows: wp.array3d(dtype=float),
     qacc_out: wp.array2d(dtype=float),
     qfrc_constraint_out: wp.array2d(dtype=float),
     efc_force_out: wp.array2d(dtype=float),
@@ -1186,6 +1205,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     solver_niter_out: wp.array(dtype=int),
     stock_world_out: wp.array(dtype=int),
     nstock_out: wp.array(dtype=int),
+    nstock_total_out: wp.array(dtype=int),
     world_status_out: wp.array(dtype=int),
     world_gradient_out: wp.array(dtype=float),
     world_decrement_out: wp.array(dtype=float),
@@ -1223,6 +1243,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     qfrc_smooth_in: wp.array2d(dtype=float),
     qacc_warmstart_in: wp.array2d(dtype=float),
     dense_rows: wp.array3d(dtype=float),
+    wide_rows: wp.array3d(dtype=float),
     qacc_out: wp.array2d(dtype=float),
     qfrc_constraint_out: wp.array2d(dtype=float),
     efc_force_out: wp.array2d(dtype=float),
@@ -1231,6 +1252,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     solver_niter_out: wp.array(dtype=int),
     stock_world_out: wp.array(dtype=int),
     nstock_out: wp.array(dtype=int),
+    nstock_total_out: wp.array(dtype=int),
     world_status_out: wp.array(dtype=int),
     world_gradient_out: wp.array(dtype=float),
     world_decrement_out: wp.array(dtype=float),
@@ -1271,6 +1293,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
       qfrc_smooth_in,
       qacc_warmstart_in,
       dense_rows,
+      wide_rows,
       qacc_out,
       qfrc_constraint_out,
       efc_force_out,
@@ -1279,6 +1302,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
       solver_niter_out,
       stock_world_out,
       nstock_out,
+      nstock_total_out,
       world_status_out,
       world_gradient_out,
       world_decrement_out,
@@ -1306,31 +1330,37 @@ class WorldSolverContext:
   Attributes:
     stock_world: 1 if the world must take the stock solve, else 0    (nworld,)
     nstock: number of worlds routed to the stock solve                (1,)
+    nstock_total: cumulative stock-routed worlds over all launches     (1,)
     status: STATUS_* code per world                                   (nworld,)
     gradient: rescaled gradient norm of the world certificate         (nworld,)
     decrement: rescaled half Newton decrement of the certificate      (nworld,)
     world_order: CTA -> world permutation (heavy worlds first)        (nworld,)
     dense_rows: dense row records (j[0..16), D, aref)                  (nworld, ROW_CAP, 20)
+    wide_rows: dense records of rows of 17..32 DOF components           (nworld, WIDE_ROW_CAP, 36)
   """
 
   stock_world: wp.array
   nstock: wp.array
+  nstock_total: wp.array
   status: wp.array
   gradient: wp.array
   decrement: wp.array
   world_order: wp.array
   dense_rows: wp.array
+  wide_rows: wp.array
 
 
 def create_world_solver_context(nworld: int, device=None) -> WorldSolverContext:
   return WorldSolverContext(
     stock_world=wp.zeros(nworld, dtype=int, device=device),
     nstock=wp.zeros(1, dtype=int, device=device),
+    nstock_total=wp.zeros(1, dtype=int, device=device),
     status=wp.zeros(nworld, dtype=int, device=device),
     gradient=wp.zeros(nworld, dtype=float, device=device),
     decrement=wp.zeros(nworld, dtype=float, device=device),
     world_order=wp.zeros(nworld, dtype=int, device=device),
     dense_rows=wp.empty((nworld, ROW_CAP, DENSE_ROW_FLOATS), dtype=float, device=device),
+    wide_rows=wp.empty((nworld, WIDE_ROW_CAP, WIDE_ROW_FLOATS), dtype=float, device=device),
   )
 
 
@@ -1449,6 +1479,7 @@ def launch_world_solver(
       qfrc_smooth,
       qacc_warmstart,
       ctx.dense_rows,
+      ctx.wide_rows,
     ],
     outputs=[
       qacc,
@@ -1459,6 +1490,7 @@ def launch_world_solver(
       solver_niter,
       ctx.stock_world,
       ctx.nstock,
+      ctx.nstock_total,
       ctx.status,
       ctx.gradient,
       ctx.decrement,
