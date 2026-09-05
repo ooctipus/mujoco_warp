@@ -601,6 +601,70 @@ def static_eligible(mjm, m: Model) -> bool:
   return _dfs_contiguous(np.asarray(mjm.body_parentid))
 
 
+def static_tables(mjm, m: Model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """Packed topology tables of the fused forward kernel, built once from host data in put_model.
+
+  The kernel loads one 16-byte word per table row instead of a dependent chain of scalar lookups
+  (body -> joint -> qpos address). Rows are int32 vec4:
+
+  * ``body_info[b, 0] = (parentid, treeid, rootid, mocapid)``
+  * ``body_info[b, 1] = (jntadr, jntnum, dofadr, dofnum)``
+  * ``body_info[b, 2] = (type of the body's joint or -1, its qpos address, dynamic, 0)`` where
+    ``dynamic`` marks bodies whose geoms move (not welded to the world, or under a mocap root)
+  * ``dof_info[d, 0] = (bodyid, treeid, jntid, jnt_type | actgravcomp << 8 | actfrclimited << 9)``
+  * ``dof_info[d, 1] = (jnt_qposadr, jnt_dofadr, M_rownnz, M_rowadr)``
+  * ``act_info[u] = (dofadr and qpos address of the transmission joint,
+    gaintype | biastype << 4 | ctrllimited << 8 | forcelimited << 9, 0)``
+
+  The tables freeze the same topology as :func:`static_eligible` and are only meaningful for
+  models that predicate accepts (multi-joint bodies keep their first joint, non-joint
+  transmissions their first target clipped to the joint range).
+
+  Args:
+    mjm: The MuJoCo model (host arrays).
+    m: The partially built MJWarp model; ``M_rownnz``/``M_rowadr`` are read as host arrays.
+
+  Returns:
+    ``(body_info, dof_info, act_info)`` with shapes ``(nbody, 3, 4)``, ``(nv, 2, 4)``, ``(nu, 4)``.
+  """
+  nbody, nv, nu, njnt = mjm.nbody, mjm.nv, mjm.nu, mjm.njnt
+  i32 = lambda a: np.asarray(a, dtype=np.int32)  # noqa: E731
+  parentid, treeid, rootid = i32(mjm.body_parentid), i32(mjm.body_treeid), i32(mjm.body_rootid)
+  mocapid, weldid = i32(mjm.body_mocapid), i32(mjm.body_weldid)
+  jntadr, jntnum, dofadr, dofnum = i32(mjm.body_jntadr), i32(mjm.body_jntnum), i32(mjm.body_dofadr), i32(mjm.body_dofnum)
+  jnt_type, jnt_qposadr, jnt_dofadr = i32(mjm.jnt_type), i32(mjm.jnt_qposadr), i32(mjm.jnt_dofadr)
+  zeros_b = np.zeros(nbody, dtype=np.int32)
+
+  body_info = np.zeros((nbody, 3, 4), dtype=np.int32)
+  body_info[:, 0] = np.stack([parentid, treeid, rootid, mocapid], axis=1)
+  body_info[:, 1] = np.stack([jntadr, jntnum, dofadr, dofnum], axis=1)
+  has_jnt = jntnum > 0
+  jnt_of_body = np.where(has_jnt, jntadr, 0)
+  j_type = np.where(has_jnt, jnt_type[jnt_of_body], -1).astype(np.int32) if njnt else zeros_b - 1
+  j_qadr = np.where(has_jnt, jnt_qposadr[jnt_of_body], 0).astype(np.int32) if njnt else zeros_b
+  dynamic = ((weldid != 0) | (mocapid[rootid] != -1)).astype(np.int32)
+  body_info[:, 2] = np.stack([j_type, j_qadr, dynamic, zeros_b], axis=1)
+
+  dof_info = np.zeros((nv, 2, 4), dtype=np.int32)
+  if nv:
+    dof_body, dof_jnt = i32(mjm.dof_bodyid), i32(mjm.dof_jntid)
+    flags = jnt_type[dof_jnt] | (i32(mjm.jnt_actgravcomp)[dof_jnt] << 8) | (i32(mjm.jnt_actfrclimited)[dof_jnt] << 9)
+    dof_info[:, 0] = np.stack([dof_body, treeid[dof_body], dof_jnt, flags], axis=1)
+    dof_info[:, 1] = np.stack([jnt_qposadr[dof_jnt], jnt_dofadr[dof_jnt], i32(m.M_rownnz), i32(m.M_rowadr)], axis=1)
+
+  act_info = np.zeros((nu, 4), dtype=np.int32)
+  if nu and njnt:
+    jnt = np.clip(i32(mjm.actuator_trnid)[:, 0], 0, njnt - 1)
+    flags = (
+      i32(mjm.actuator_gaintype)
+      | (i32(mjm.actuator_biastype) << 4)
+      | (i32(mjm.actuator_ctrllimited) << 8)
+      | (i32(mjm.actuator_forcelimited) << 9)
+    )
+    act_info[:] = np.stack([jnt_dofadr[jnt], jnt_qposadr[jnt], flags, np.zeros(nu, dtype=np.int32)], axis=1)
+  return body_info, dof_info, act_info
+
+
 def fused_world(m: Model, d: Data) -> bool:
   """Return whether the fused per-world forward kernels apply to ``(m, d)``.
 
@@ -702,15 +766,9 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     opt_gravity: wp.array[wp.vec3],
     qpos0: wp.array2d[float],
     qpos_spring: wp.array2d[float],
-    body_parentid: wp.array[int],
-    body_rootid: wp.array[int],
-    body_weldid: wp.array[int],
-    body_mocapid: wp.array[int],
-    body_jntnum: wp.array[int],
-    body_jntadr: wp.array[int],
-    body_dofnum: wp.array[int],
-    body_dofadr: wp.array[int],
-    body_treeid: wp.array[int],
+    body_info: wp.array2d[wp.vec4i],
+    dof_info: wp.array2d[wp.vec4i],
+    act_info: wp.array[wp.vec4i],
     body_pos: wp.array2d[wp.vec3],
     body_quat: wp.array2d[wp.quat],
     body_ipos: wp.array2d[wp.vec3],
@@ -719,39 +777,25 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     body_subtreemass: wp.array2d[float],
     body_inertia: wp.array2d[wp.vec3],
     body_gravcomp: wp.array2d[float],
-    jnt_type: wp.array[int],
-    jnt_qposadr: wp.array[int],
-    jnt_dofadr: wp.array[int],
     jnt_pos: wp.array2d[wp.vec3],
     jnt_axis: wp.array2d[wp.vec3],
     jnt_stiffness: wp.array2d[float],
     jnt_stiffnesspoly: wp.array2d[wp.vec2],
-    jnt_actgravcomp: wp.array[int],
-    jnt_actfrclimited: wp.array[bool],
     jnt_actfrcrange: wp.array2d[wp.vec2],
-    dof_bodyid: wp.array[int],
-    dof_jntid: wp.array[int],
     dof_armature: wp.array2d[float],
     dof_damping: wp.array2d[float],
     dof_dampingpoly: wp.array2d[wp.vec2],
     tree_sleep_policy: wp.array[int],
-    M_rownnz: wp.array[int],
-    M_rowadr: wp.array[int],
     geom_bodyid: wp.array[int],
     geom_pos: wp.array2d[wp.vec3],
     geom_quat: wp.array2d[wp.quat],
     site_bodyid: wp.array[int],
     site_pos: wp.array2d[wp.vec3],
     site_quat: wp.array2d[wp.quat],
-    actuator_trnid: wp.array[wp.vec2i],
     actuator_gear: wp.array2d[wp.spatial_vector],
-    actuator_gaintype: wp.array[int],
-    actuator_biastype: wp.array[int],
     actuator_gainprm: wp.array2d[vec10],
     actuator_biasprm: wp.array2d[vec10],
-    actuator_ctrllimited: wp.array[bool],
     actuator_ctrlrange: wp.array2d[wp.vec2],
-    actuator_forcelimited: wp.array[bool],
     actuator_forcerange: wp.array2d[wp.vec2],
     # Data in:
     qpos_in: wp.array2d[float],
@@ -844,9 +888,10 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
         cacc0 = wp.spatial_vector(wp.vec3(0.0), -gravity)
       _st_body_sv(cacc_sh, 0, cacc0)
 
-    # ------------------------------------------------------- P0: prefetch (three dependent rounds)
-    # body-owned parameters (bodies have at most one joint, see fused_world()); the body frame holds
-    # the free joint pose for free bodies and the mocap pose for mocap bodies
+    # -------------------------------------------------------- P0: prefetch (two dependent rounds)
+    # packed topology tables (static_tables) first, then the per-world parameters they address.
+    # Bodies have at most one joint (fused_world()); the body frame holds the free joint pose for
+    # free bodies and the mocap pose for mocap bodies
     b_parent = int(0)
     b_tree = int(-1)
     b_root = int(0)
@@ -865,14 +910,21 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     b_pos = wp.vec3(0.0)
     b_quat = wp.quat(1.0, 0.0, 0.0, 0.0)
     if is_body:
-      b_parent = body_parentid[tid]
-      b_tree = body_treeid[tid]
-      b_root = body_rootid[tid]
-      b_mocap = body_mocapid[tid]
-      b_jntadr = body_jntadr[tid]
-      b_jntnum = body_jntnum[tid]
-      b_dofadr = body_dofadr[tid]
-      b_dofnum = body_dofnum[tid]
+      binfo0 = body_info[tid, 0]
+      binfo1 = body_info[tid, 1]
+      binfo2 = body_info[tid, 2]
+      b_parent = binfo0[0]
+      b_tree = binfo0[1]
+      b_root = binfo0[2]
+      b_mocap = binfo0[3]
+      b_jntadr = binfo1[0]
+      b_jntnum = binfo1[1]
+      b_dofadr = binfo1[2]
+      b_dofnum = binfo1[3]
+      j_type = binfo2[0]
+      j_qadr = binfo2[1]
+      # geoms of world-attached bodies are static unless the body descends from a mocap root
+      b_dyn = binfo2[2]
       b_mass = body_mass[worldid % body_mass.shape[0], tid]
       b_pos = body_pos[worldid % body_pos.shape[0], tid]
       b_quat = body_quat[worldid % body_quat.shape[0], tid]
@@ -882,12 +934,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       if run_wake != 0:
         if not (xfrc_applied_in[worldid, tid] == wp.spatial_vector()):
           b_xfrc_nz = 1
-      # geoms of world-attached bodies are static unless the body descends from a mocap root
-      if body_weldid[tid] != 0 or body_mocapid[b_root] != -1:
-        b_dyn = 1
       if b_jntnum == 1:
-        j_type = jnt_type[b_jntadr]
-        j_qadr = jnt_qposadr[b_jntadr]
         j_axis = jnt_axis[worldid % jnt_axis.shape[0], b_jntadr]
         j_pos = jnt_pos[worldid % jnt_pos.shape[0], b_jntadr]
         if j_type == JointType.FREE:
@@ -913,27 +960,39 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     dj_type = int(0)
     dj_qadr = int(0)
     dj_dofadr = int(0)
+    d_rownnz = int(0)
+    d_rowadr = int(0)
+    actgravcomp = int(0)
+    d_frclimited = int(0)
     if is_dof:
-      d_body = dof_bodyid[tid]
-      d_tree = body_treeid[d_body]
-      d_jnt = dof_jntid[tid]
+      dinfo0 = dof_info[tid, 0]
+      dinfo1 = dof_info[tid, 1]
+      d_body = dinfo0[0]
+      d_tree = dinfo0[1]
+      d_jnt = dinfo0[2]
+      dj_type = dinfo0[3] & 0xFF
+      actgravcomp = (dinfo0[3] >> 8) & 1
+      d_frclimited = (dinfo0[3] >> 9) & 1
+      dj_qadr = dinfo1[0]
+      dj_dofadr = dinfo1[1]
+      d_rownnz = dinfo1[2]
+      d_rowadr = dinfo1[3]
       d_qvel = qvel_in[worldid, tid]
       if run_wake != 0:
         if qfrc_applied_in[worldid, tid] != 0.0:
           d_qfrc_nz = 1
       _st_dof_f(qvel_sh, tid, d_qvel)
-      dj_type = jnt_type[d_jnt]
-      dj_qadr = jnt_qposadr[d_jnt]
-      dj_dofadr = jnt_dofadr[d_jnt]
     # actuator-owned parameters (joint transmissions on hinge/slide joints)
     a_vadr = int(0)
     a_gear = float(0.0)
     a_length = float(0.0)
+    a_flags = int(0)
     if is_act:
-      jntid = actuator_trnid[tid][0]
+      ainfo = act_info[tid]
+      a_vadr = ainfo[0]
+      a_flags = ainfo[2]
       a_gear = actuator_gear[worldid % actuator_gear.shape[0], tid][0]
-      a_vadr = jnt_dofadr[jntid]
-      a_length = qpos_in[worldid, jnt_qposadr[jntid]] * a_gear
+      a_length = qpos_in[worldid, ainfo[1]] * a_gear
       _st_act_i(act_dof_sh, tid, a_vadr)
     # tree-owned state
     t_awake = int(0)
@@ -1022,12 +1081,8 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       b_inertia = body_inertia[worldid % body_inertia.shape[0], tid]
       b_submass = body_subtreemass[worldid % body_subtreemass.shape[0], tid]
     d_armature = float(0.0)
-    d_rownnz = int(0)
-    d_rowadr = int(0)
     if is_dof:
       d_armature = dof_armature[worldid % dof_armature.shape[0], tid]
-      d_rownnz = M_rownnz[tid]
-      d_rowadr = M_rowadr[tid]
     # Local transform of each body relative to its parent, with the joint folded in: hinge
     # xquat = xquat_p * b_quat * j_quat and xpos = xpos_p + R_p (b_pos + R_b (j_pos - R_j j_pos)),
     # slide xpos = xpos_p + R_p (b_pos + R_b j_axis * dq). Free bodies carry their world pose.
@@ -1262,9 +1317,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     dpoly = wp.vec2(0.0)
     q = float(0.0)
     q_spring = float(0.0)
-    actgravcomp = int(0)
     if is_dof:
-      actgravcomp = jnt_actgravcomp[d_jnt]
       if not (dsbl_spring and dsbl_damper):
         stiffness = jnt_stiffness[worldid % jnt_stiffness.shape[0], d_jnt]
         spoly = jnt_stiffnesspoly[worldid % jnt_stiffnesspoly.shape[0], d_jnt]
@@ -1412,25 +1465,22 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     forcerange = wp.vec2(0.0)
     if is_act and actuation_on:
       ctrl = ctrl_in[worldid, tid]
-      if actuator_ctrllimited[tid] and (opt_disableflags & DisableBit.CLAMPCTRL) == 0:
+      if ((a_flags >> 8) & 1) != 0 and (opt_disableflags & DisableBit.CLAMPCTRL) == 0:
         ctrllimited = 1
         ctrlrange = actuator_ctrlrange[worldid % actuator_ctrlrange.shape[0], tid]
       gainprm = actuator_gainprm[worldid % actuator_gainprm.shape[0], tid]
       gain = gainprm[0]
-      if actuator_gaintype[tid] == GainType.AFFINE:
+      if (a_flags & 0xF) == GainType.AFFINE:
         gain = gainprm[0] + gainprm[1] * a_length + gainprm[2] * a_velocity
-      if actuator_biastype[tid] == BiasType.AFFINE:
+      if ((a_flags >> 4) & 0xF) == BiasType.AFFINE:
         biasprm = actuator_biasprm[worldid % actuator_biasprm.shape[0], tid]
         bias = biasprm[0] + biasprm[1] * a_length + biasprm[2] * a_velocity
-      if actuator_forcelimited[tid]:
+      if ((a_flags >> 9) & 1) != 0:
         forcelimited = 1
         forcerange = actuator_forcerange[worldid % actuator_forcerange.shape[0], tid]
-    d_frclimited = int(0)
     d_frcrange = wp.vec2(0.0)
-    if is_dof and actuation_on:
-      if jnt_actfrclimited[d_jnt]:
-        d_frclimited = 1
-        d_frcrange = jnt_actfrcrange[worldid % jnt_actfrcrange.shape[0], d_jnt]
+    if is_dof and actuation_on and d_frclimited != 0:
+      d_frcrange = jnt_actfrcrange[worldid % jnt_actfrcrange.shape[0], d_jnt]
 
     if is_body:
       frc = wp.spatial_vector()
@@ -3355,15 +3405,9 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.opt.gravity,
       m.qpos0,
       m.qpos_spring,
-      m.body_parentid,
-      m.body_rootid,
-      m.body_weldid,
-      m.body_mocapid,
-      m.body_jntnum,
-      m.body_jntadr,
-      m.body_dofnum,
-      m.body_dofadr,
-      m.body_treeid,
+      m.fused_world_body_info,
+      m.fused_world_dof_info,
+      m.fused_world_act_info,
       m.body_pos,
       m.body_quat,
       m.body_ipos,
@@ -3372,39 +3416,25 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.body_subtreemass,
       m.body_inertia,
       m.body_gravcomp,
-      m.jnt_type,
-      m.jnt_qposadr,
-      m.jnt_dofadr,
       m.jnt_pos,
       m.jnt_axis,
       m.jnt_stiffness,
       m.jnt_stiffnesspoly,
-      m.jnt_actgravcomp,
-      m.jnt_actfrclimited,
       m.jnt_actfrcrange,
-      m.dof_bodyid,
-      m.dof_jntid,
       m.dof_armature,
       m.dof_damping,
       m.dof_dampingpoly,
       m.tree_sleep_policy,
-      m.M_rownnz,
-      m.M_rowadr,
       m.geom_bodyid,
       m.geom_pos,
       m.geom_quat,
       m.site_bodyid,
       m.site_pos,
       m.site_quat,
-      m.actuator_trnid,
       m.actuator_gear,
-      m.actuator_gaintype,
-      m.actuator_biastype,
       m.actuator_gainprm,
       m.actuator_biasprm,
-      m.actuator_ctrllimited,
       m.actuator_ctrlrange,
-      m.actuator_forcelimited,
       m.actuator_forcerange,
       d.qpos,
       d.qvel,

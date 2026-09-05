@@ -1452,6 +1452,9 @@ class Model:
     sensor_rne_postconstraint: evaluate rne_postconstraint
     fused_world_static: structural part of the fused per-world forward predicate (host, put_model)
     fused_world_nvtree_max: largest tree dof count (host, put_model); bounds the fused factor loops
+    fused_world_body_info: packed per-body topology, fused_world.static_tables      (nbody, 3)
+    fused_world_dof_info: packed per-dof topology, fused_world.static_tables         (nv, 2)
+    fused_world_act_info: packed per-actuator transmission, fused_world.static_tables (nu,)
     sensor_rangefinder_bodyid: bodyid for rangefinder        (nrangefinder,)
     taxel_vertadr: tactile sensor vertex address             (nsensortaxel,)
     taxel_sensorid: address for tactile sensors
@@ -1940,6 +1943,9 @@ class Model:
   sensor_rne_postconstraint: bool
   fused_world_static: bool
   fused_world_nvtree_max: int
+  fused_world_body_info: array("nbody", 3, wp.vec4i)
+  fused_world_dof_info: array("nv", 2, wp.vec4i)
+  fused_world_act_info: array("nu", wp.vec4i)
   sensor_rangefinder_bodyid: array("nrangefinder", int)
   taxel_vertadr: array("nsensortaxel", int)
   taxel_sensorid: array("nsensortaxel", int)

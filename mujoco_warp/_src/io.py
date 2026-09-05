@@ -1286,6 +1286,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   # structural eligibility for the fused per-world forward, from host data (graph-capture safe)
   m.fused_world_static = fused_world.static_eligible(mjm, m)
   m.fused_world_nvtree_max = int(np.max(mjm.tree_dofnum)) if mjm.ntree else 0
+  m.fused_world_body_info, m.fused_world_dof_info, m.fused_world_act_info = fused_world.static_tables(mjm, m)
   for f in dataclasses.fields(types.Model):
     if warp_util.is_array_spec(f.type):
       batch_size = batch_sizes.get(f.name, 1)
