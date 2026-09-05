@@ -68,6 +68,7 @@ class BlockDim:
     cholesky_solve: Cholesky solve block dimension (smooth)
     small_cholesky: scalar small-block Cholesky block dimension (smooth)
     solve_LD_sparse_fused: solve LD sparse fused block dimension (smooth)
+    tree_accumulate: fused tree accumulation block dimension, 0 selects per-level launches (smooth)
     update_gradient_cholesky: update gradient Cholesky block dimension (solver)
     update_gradient_cholesky_blocked: update gradient Cholesky blocked block dimension (solver)
     update_gradient_JTDAJ_sparse: update gradient JTDAJ sparse block dimension (solver)
@@ -99,6 +100,7 @@ class BlockDim:
   cholesky_solve: int = 64
   small_cholesky: int = 64
   solve_LD_sparse_fused: int = 128
+  tree_accumulate: int = 128
   # solver
   update_gradient_cholesky: int = 64
   update_gradient_cholesky_blocked: int = 64
@@ -1375,6 +1377,8 @@ class Model:
     max_flex_dim: maximum flex dimension in the model
     block_dim: block dim options
     body_tree: list of body ids by tree level
+    body_tree_all: body ids of all tree levels concatenated, root level first (nbody,)
+    body_tree_offsets: start index in body_tree_all for each tree level   (ntreelevel + 1,)
     body_branches: flattened body ids for all branches
     body_branch_start: start index in body_branches for each branch   (nbranch + 1,)
     mocap_bodyid: id of body for mocap                       (nmocap,)
@@ -1866,6 +1870,8 @@ class Model:
   max_flex_dim: int
   block_dim: BlockDim
   body_tree: tuple[array("nbody", int), ...]
+  body_tree_all: array("nbody", int)
+  body_tree_offsets: array("nbody_tree_offsets", int)
   body_branches: array("nbody_branches", int)
   body_branch_start: array("nbranch_start", int)
   mocap_bodyid: array("nmocap", int)
