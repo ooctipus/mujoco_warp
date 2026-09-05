@@ -991,6 +991,123 @@ class FusedWorldTest(absltest.TestCase):
     self.assertLess(awake_counts[-1].max(), awake_counts[0].min())
     self.assertGreater(d_ref.nefc.numpy().min(), 0)
 
+  # Data fields forward_a rebuilds from qpos/qvel (compared with stock fwd_position + fwd_velocity)
+  _FORWARD_WORLDS_FLOAT_FIELDS = (
+    "xpos",
+    "xquat",
+    "xmat",
+    "xipos",
+    "ximat",
+    "xanchor",
+    "xaxis",
+    "geom_xpos",
+    "geom_xmat",
+    "subtree_com",
+    "cinert",
+    "cdof",
+    "crb",
+    "M",
+    "actuator_length",
+    "actuator_velocity",
+    "cvel",
+    "cdof_dot",
+    "qfrc_spring",
+    "qfrc_damper",
+    "qfrc_gravcomp",
+    "qfrc_passive",
+    "cacc",
+    "cfrc_int",
+    "qfrc_bias",
+  )
+
+  @staticmethod
+  def _data_arrays(d, prefix=""):
+    """Every Warp array of Data (including the nested contact/efc dataclasses) by field path."""
+    out = {}
+    for f in dataclasses.fields(d):
+      value = getattr(d, f.name)
+      if isinstance(value, wp.array):
+        if value.size:
+          out[prefix + f.name] = value
+      elif dataclasses.is_dataclass(value):
+        out.update(FusedWorldTest._data_arrays(value, prefix + f.name + "."))
+    return out
+
+  def test_forward_worlds_matches_stock(self):
+    """forward_worlds matches the stock stages in the selected worlds, the rest stays untouched."""
+    mjm, m, datas = self._make(seed=5)
+    self._induce_sleep(m, datas)
+    d_ref, d_sub = datas
+    # both data hold the same forward state; then only the selected worlds get new coordinates
+    self._run_forward(m, d_ref, fused=True)
+    self._run_forward(m, d_sub, fused=True)
+    selected = np.array([1, 3, 6], dtype=np.int32)
+    others = np.setdiff1d(np.arange(self.NWORLD), selected)
+    rng = np.random.default_rng(11)
+    qpos, qvel, _ = _random_state(mjm, self.NWORLD, rng, qvel_scale=0.5)
+    for d in datas:
+      new_qpos = d.qpos.numpy()
+      new_qvel = d.qvel.numpy()
+      new_qpos[selected] = qpos[selected]
+      new_qvel[selected] = qvel[selected]
+      d.qpos.assign(new_qpos)
+      d.qvel.assign(new_qvel)
+    before = {name: arr.numpy().copy() for name, arr in self._data_arrays(d_sub).items()}
+
+    # reference: the stock position/velocity stages over every world
+    mjw.fwd_position(m, d_ref, factorize=False)
+    mjw.fwd_velocity(m, d_ref)
+    # device count with spare capacity: the trailing slots must exit without touching any world
+    world_ids = wp.array(np.concatenate([selected, np.full(2, 7, dtype=np.int32)]), dtype=int)
+    count = wp.array([len(selected)], dtype=int)
+    self.assertTrue(fused_world.fused_world(m, d_sub))
+    mjw.forward_worlds(m, d_sub, world_ids, count)
+    wp.synchronize()
+
+    for name, arr in self._data_arrays(d_sub).items():
+      values = arr.numpy()
+      if values.ndim >= 1 and values.shape[0] == self.NWORLD:
+        np.testing.assert_array_equal(values[others], before[name][others], err_msg=f"{name} changed in an unselected world")
+      else:
+        np.testing.assert_array_equal(values, before[name], err_msg=f"{name} (not per world) changed")
+    for name in self._FORWARD_WORLDS_FLOAT_FIELDS:
+      atol = 1e-5 if name == "crb" else _ATOL
+      self._assert_close(name, getattr(d_sub, name).numpy()[selected], getattr(d_ref, name).numpy()[selected], atol=atol)
+    for name in ("tree_asleep", "tree_awake"):
+      np.testing.assert_array_equal(
+        getattr(d_sub, name).numpy()[selected], getattr(d_ref, name).numpy()[selected], err_msg=f"mismatch: {name}"
+      )
+    # the new poses differ from the pre-edit ones, so the comparison above is meaningful
+    self.assertGreater(np.abs(d_sub.xpos.numpy()[selected] - before["xpos"][selected]).max(), 1e-3)
+
+    # host count form: the same result from an exact-size launch
+    d_sub.xpos.assign(before["xpos"])
+    mjw.forward_worlds(m, d_sub, wp.array(selected, dtype=int), len(selected))
+    wp.synchronize()
+    self._assert_close("xpos (host count)", d_sub.xpos.numpy()[selected], d_ref.xpos.numpy()[selected])
+    np.testing.assert_array_equal(d_sub.xpos.numpy()[others], before["xpos"][others])
+
+    # zero count: nothing changes
+    d_sub.xpos.assign(before["xpos"])
+    mjw.forward_worlds(m, d_sub, wp.array(selected, dtype=int), wp.zeros(1, dtype=int))
+    wp.synchronize()
+    np.testing.assert_array_equal(d_sub.xpos.numpy(), before["xpos"])
+
+    # ineligible model: the stock all-worlds stages run instead
+    m.opt.fused_world = False
+    try:
+      self.assertFalse(fused_world.fused_world(m, d_sub))
+      mjw.forward_worlds(m, d_sub, wp.array(selected, dtype=int), count)
+      wp.synchronize()
+    finally:
+      m.opt.fused_world = True
+    self._assert_close("xpos (stock fallback)", d_sub.xpos.numpy(), d_ref.xpos.numpy())
+
+    with self.assertRaises(ValueError):
+      mjw.forward_worlds(m, d_sub, wp.array(selected, dtype=int), len(selected) + 1)
+    with self.assertRaises(TypeError):
+      mjw.forward_worlds(m, d_sub, wp.array(selected.astype(np.int64)))
+
 
 if __name__ == "__main__":
   wp.init()

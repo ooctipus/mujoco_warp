@@ -47,6 +47,11 @@ without atomics, and forward passes are level-synchronous with all bodies of a d
 parallel. Bodies (with their single joint), dofs, actuators and trees are owned by one thread each;
 the block dimension equals the dof capacity.
 
+``forward_a`` also runs over a subset of worlds (``world_ids``): CTA ``slot`` serves world
+``world_ids[slot]``, and an optional device count lets the caller size the launch without a host
+sync (CTAs at or beyond the count exit before touching any state). ``forward.forward_worlds`` uses
+this to rebuild the derived data of reset worlds only.
+
 Warp pitfalls handled here: tile element assignment embeds a block barrier, so shared stores in
 thread-divergent code use single-line native snippets; multi-line native snippets live at module
 scope.
@@ -642,7 +647,9 @@ def _pow2_at_least(n: int) -> int:
 
 
 @cache_kernel
-def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
+def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, SUBSET: bool):
+  # SUBSET: CTA slot serves world world_ids[slot] (optionally bounded by a device count) instead of
+  # world slot; the branch is resolved at code generation, so the full-grid kernel is unchanged
   BLOCK = NV
 
   # tile element stores through native snippets: the builtin element assignment embeds a block
@@ -761,6 +768,9 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     mocap_pos_in: wp.array2d[wp.vec3],
     mocap_quat_in: wp.array2d[wp.quat],
     ctrl_in: wp.array2d[float],
+    # In:
+    world_ids: wp.array[int],
+    world_count: wp.array[int],
     # Data out:
     tree_asleep_out: wp.array2d[int],
     tree_awake_out: wp.array2d[int],
@@ -801,6 +811,12 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     qfrc_actuator_out: wp.array2d[float],
   ):
     worldid, tid = wp.tid()
+    if wp.static(SUBSET):
+      # uniform per CTA: no thread of an exiting CTA reaches a barrier below
+      if world_count:
+        if worldid >= world_count[0]:
+          return
+      worldid = world_ids[worldid]
 
     # shared arenas (per body / per dof / per actuator / per tree); several are reused by a later
     # phase once their first contents are dead, see the phase comments
@@ -3282,8 +3298,45 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
   return kernel
 
 
+def subset_launch_dim(d: Data, world_ids: wp.array | None, count: int | wp.array | None) -> tuple[int, wp.array | None]:
+  """Validate a world subset and return ``(grid worlds, device count or None)`` for its launch.
+
+  ``count`` may be a host int (the grid spans exactly ``count`` slots), a one-element int32 device
+  array (the grid spans ``world_ids.shape[0]`` slots and the kernel exits the slots at or beyond the
+  count: graph-safe, no host sync) or None (``world_ids.shape[0]`` slots, all valid).
+  """
+  if world_ids is None:
+    return d.nworld, None
+  if not isinstance(world_ids, wp.array) or world_ids.dtype != wp.int32 or world_ids.ndim != 1:
+    raise TypeError("world_ids must be a one-dimensional wp.array of int32 world indices.")
+  if world_ids.device != d.qpos.device:
+    raise ValueError(f"world_ids must be on {d.qpos.device}, got {world_ids.device}.")
+  capacity = world_ids.shape[0]
+  if capacity > d.nworld:
+    raise ValueError(f"world_ids holds {capacity} entries, more than the {d.nworld} worlds of Data.")
+  if count is None:
+    return capacity, None
+  if isinstance(count, wp.array):
+    if count.dtype != wp.int32 or count.shape != (1,):
+      raise TypeError("a device count must be a wp.array of shape (1,) and dtype int32.")
+    if count.device != world_ids.device:
+      raise ValueError(f"count must be on {world_ids.device}, got {count.device}.")
+    return capacity, count
+  count = int(count)
+  if count < 0 or count > capacity:
+    raise ValueError(f"count {count} is outside [0, {capacity}] (the world_ids capacity).")
+  return count, None
+
+
 @event_scope
-def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
+def forward_a(
+  m: Model,
+  d: Data,
+  groups: ContactGroups | None = None,
+  world_ids: wp.array | None = None,
+  count: int | wp.array | None = None,
+  run_wake: bool | None = None,
+):
   """Fused sleep wake/update, position, velocity and actuation stages (one CTA per world).
 
   Replaces ``sleep.wake`` + ``sleep.update_sleep_trees``, ``smooth.kinematics``, ``smooth.com_pos``,
@@ -3291,13 +3344,21 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
   forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`. The body/dof
   awake arrays are published once, by ``forward_m`` after ``wake_equality``. ``groups`` are the
   contact buckets shared with ``forward_m`` (their per-world counts are zeroed here). The wake pass
-  is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``).
+  is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``);
+  ``run_wake`` overrides that option (``tree_awake`` is republished from ``tree_asleep`` regardless).
+
+  With ``world_ids`` (int32 world indices) only those worlds run, CTA ``slot`` serving world
+  ``world_ids[slot]``; ``count`` bounds the valid entries as a host int or a one-element int32
+  device array (see :func:`subset_launch_dim`). Every other world is left untouched.
   """
   if groups is None:
     groups = contact_groups(d)
+  if run_wake is None:
+    run_wake = getattr(m.opt, "run_sleep_wake", True)
+  grid_worlds, world_count = subset_launch_dim(d, world_ids, count)
   wp.launch(
-    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP),
-    dim=(d.nworld, NV_CAP),
+    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, world_ids is not None),
+    dim=(grid_worlds, NV_CAP),
     inputs=[
       m.nbody,
       m.nv,
@@ -3306,7 +3367,7 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.ngeom,
       m.nsite,
       int(m.ngravcomp > 0),
-      int(getattr(m.opt, "run_sleep_wake", True)),
+      int(run_wake),
       m.opt.disableflags,
       m.opt.gravity,
       m.qpos0,
@@ -3370,6 +3431,8 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       d.mocap_pos,
       d.mocap_quat,
       d.ctrl,
+      world_ids,
+      world_count,
     ],
     outputs=[
       d.tree_asleep,

@@ -41,6 +41,7 @@ from mujoco_warp._src.constraint import make_constraint as make_constraint
 from mujoco_warp._src.derivative import deriv_smooth_vel as deriv_smooth_vel
 from mujoco_warp._src.forward import euler as euler
 from mujoco_warp._src.forward import forward as forward
+from mujoco_warp._src.forward import forward_worlds as forward_worlds
 from mujoco_warp._src.forward import fwd_acceleration as fwd_acceleration
 from mujoco_warp._src.forward import fwd_actuation as fwd_actuation
 from mujoco_warp._src.forward import fwd_kinematics as fwd_kinematics
