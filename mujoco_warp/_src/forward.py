@@ -1378,11 +1378,8 @@ def _forward_fused(m: Model, d: Data, finalize: bool):
   if m.ncam or m.nlight:
     smooth.camlight(m, d)
 
-  constraint.make_constraint(m, d)
-  if m.neq > 0:
-    sleep.wake_equality(m, d)
-  sleep.update_sleep(m, d)
-  island.island(m, d)
+  # make_constraint, wake_equality, update_sleep and island discovery
+  fused_world.forward_m(m, d)
 
   # position and velocity sensors only read data published by forward_a
   d.sensordata.zero_()
@@ -1433,6 +1430,11 @@ def _step(m: Model, d: Data, finalize: bool):
   # RK4 performs three additional forward passes below. Its public mapping must
   # reflect the final forward state, not the initial state.
   forward(m, d, _finalize=finalize and m.opt.integrator != IntegratorType.RK4)
+
+  if fused_world.fused_world(m, d):
+    # implicitfast integration, sleep and the post-sleep refresh (finalize) as one CTA per world
+    fused_world.forward_c(m, d, finalize=finalize)
+    return
 
   if m.opt.integrator == IntegratorType.EULER:
     if finalize:
