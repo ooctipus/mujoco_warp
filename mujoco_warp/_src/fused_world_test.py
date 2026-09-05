@@ -546,8 +546,15 @@ class FusedWorldTest(absltest.TestCase):
           self.assertTrue((d_ref.overflow.numpy() & OverflowType.NVMAX).any())
         else:
           self.assertEqual(int(d_ref.overflow.numpy().max()), 0)
+          # the finalizing step refreshes the velocity-dependent fields on the post-sleep qvel
+          # (forward_c), so the refresh outputs of every variant (the 12-level chain included) are
+          # compared as well
           for field in ("qpos", "qvel", "qacc_warmstart", "xpos", "cvel", "qfrc_bias", "qfrc_passive", "qfrc_actuator"):
             self._assert_close_scaled(field, getattr(d_fused, field).numpy(), getattr(d_ref, field).numpy(), rel=1e-4)
+          for field in fused_world.DERIVED_FIELDS_REFRESHED:
+            ref = getattr(d_ref, field).numpy()
+            if ref.size:
+              self._assert_close_scaled(field, getattr(d_fused, field).numpy(), ref, rel=1e-4)
         if name == "mocap":
           self.assertGreater(m.nmocap, 0)
           self.assertTrue((d_ref.body_awake.numpy()[:, -1] == SleepState.AWAKE).all())

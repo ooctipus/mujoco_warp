@@ -2854,8 +2854,15 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
   return kernel
 
 
+# resident CTAs per SM requested from the compiler for the integration kernel: 7 CTAs/SM hold 1024
+# worlds in one wave on 170 SMs (<= 72 registers; the finalize variant's shared arenas stay under
+# the ~13 KB that seven CTAs can share on a 100 KB SM)
+_FORWARD_C_MIN_BLOCKS = 7
+
+
 @cache_kernel
 def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG: int, REFRESH: bool):
+  """forward_c kernel factory; ``NU`` is the actuator capacity (a power of two >= nu)."""
   BLOCK = NV
   SMALL_SLOT = NSMALL * NSMALL + NSMALL
   BIG_SLOT = NBIGDOF * NBIGDOF + NBIGDOF
@@ -2868,9 +2875,6 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
   def _st_dof_f(values: wp.tile[float, NV], index: int, value: float): ...
 
   @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
-  def _st_dof_sv(values: wp.tile[wp.spatial_vector, NV], index: int, value: wp.spatial_vector): ...
-
-  @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
   def _st_act_f(values: wp.tile[float, NU], index: int, value: float): ...
 
   @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
@@ -2879,10 +2883,7 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
   @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
   def _st_body_sv(values: wp.tile[wp.spatial_vector, NB], index: int, value: wp.spatial_vector): ...
 
-  @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
-  def _st_body_v10(values: wp.tile[vec10, NB], index: int, value: vec10): ...
-
-  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK,))
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK, _FORWARD_C_MIN_BLOCKS))
   def kernel(
     # Model:
     nbody: int,
@@ -2905,7 +2906,6 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
     body_jntnum: wp.array[int],
     body_jntadr: wp.array[int],
     body_dofadr: wp.array[int],
-    body_tree_offsets: wp.array[int],
     jnt_type: wp.array[int],
     jnt_qposadr: wp.array[int],
     jnt_dofadr: wp.array[int],
@@ -2984,7 +2984,6 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
 
     fac_sh = wp.tile_empty(shape=(FAC_SIZE,), dtype=float, storage="shared")
     qvel_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
-    qacc_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
     act_vel_sh = wp.tile_empty(shape=(NU,), dtype=float, storage="shared")
     act_dof_sh = wp.tile_empty(shape=(NU,), dtype=int, storage="shared")
     tree_asleep_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
@@ -3084,7 +3083,8 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
     # ------------------------------------------------------------ C1: implicitfast factor and solve
     # qDeriv = M - h * (actuator + damping velocity derivatives) touches the diagonal only for joint
     # transmissions; factor/solve as smooth.factor_solve_i with rhs Ma (support.mul_m from the
-    # solver)
+    # solver). The integrated acceleration of a dof stays with its own thread.
+    qacc_int = d_qacc
     if implicit_factor != 0:
       if is_dof:
         rowadr = M_rowadr[tid]
@@ -3104,7 +3104,7 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
         rhs = efc_Ma_in[worldid, tid]
         if qLD_block_adr[tid] == Q_LD_BLOCK_COMPACT:
           inverse = 1.0 / diag
-          _st_dof_f(qacc_sh, tid, inverse * rhs)
+          qacc_int = inverse * rhs
         else:
           # this dof's row of the dense block (zeroed first: branching trees leave structural zeros)
           for c in range(d_n):
@@ -3118,15 +3118,11 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
       # one column per dof thread (smooth._small_cholesky_factorize_solve_block order)
       _dense_factor_solve(fac_sh, d_dense, d_base, d_n, d_i, nvtree_max)
       if d_dense:
-        _st_dof_f(qacc_sh, tid, fac_sh[d_base + d_n * d_n + d_i])
-    else:
-      if is_dof:
-        _st_dof_f(qacc_sh, tid, d_qacc)
-    _sync()
+        qacc_int = fac_sh[d_base + d_n * d_n + d_i]
 
     # --------------------------------------------------------- C2: advance velocity, position, time
     if is_dof:
-      d_qvel = d_qvel + qacc_sh[tid] * timestep
+      d_qvel = d_qvel + qacc_int * timestep
       _st_dof_f(qvel_sh, tid, d_qvel)
       qacc_warmstart_out[worldid, tid] = d_qacc
     _sync()
@@ -3272,13 +3268,14 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
 
     # --------------------------------------------------- C4: post-sleep velocity refresh (finalize)
     if wp.static(REFRESH):
-      # fwd_velocity on the post-sleep qvel: cdof/cinert/subtree_com are the pre-integration values
-      cdof_sh = wp.tile_empty(shape=(NV,), dtype=wp.spatial_vector, storage="shared")
+      # fwd_velocity on the post-sleep qvel: cdof/cinert/subtree_com are the pre-integration values.
+      # Same ancestor-walk structure as forward_a's P6/P8: every body stores its own joint term,
+      # then sums the terms of its chain from shared memory (one barrier per pass instead of one per
+      # tree level). Bodies read their own joint's cdof and their own cinert from global memory, so
+      # the per-dof and per-body arenas of forward_a are not needed here (one wave at W1024).
       cvel_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")
       cacc_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")
-      cinert_sh = wp.tile_empty(shape=(NB,), dtype=vec10, storage="shared")
       parent_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
-      nlevel = body_tree_offsets.shape[0] - 1
       gravity_enabled = (opt_disableflags & DisableBit.GRAVITY) == 0
       dsbl_spring = (opt_disableflags & DisableBit.SPRING) != 0
       gravity = opt_gravity[worldid % opt_gravity.shape[0]]
@@ -3294,11 +3291,9 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
         if b_jntnum == 1:
           j_type = jnt_type[body_jntadr[tid]]
         _st_body64_i(parent_sh, tid, b_parent)
-        _st_body_v10(cinert_sh, tid, cinert_in[worldid, tid])
       cdof = wp.spatial_vector()
       if is_dof:
         cdof = cdof_in[worldid, tid]
-        _st_dof_sv(cdof_sh, tid, cdof)
       for actid in range(tid, nu, BLOCK):
         gear0 = actuator_gear[worldid % actuator_gear.shape[0], actid][0]
         actuator_velocity_out[worldid, actid] = gear0 * qvel_sh[act_dof_sh[actid]]
@@ -3308,49 +3303,73 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
         if gravity_enabled:
           cacc0 = wp.spatial_vector(wp.vec3(0.0), -gravity)
         _st_body_sv(cacc_sh, 0, cacc0)
+      # each body's own velocity term v = sum_k cdof_k qvel_k over its joint; free bodies (children
+      # of the world, whose cvel is zero) also finish their cdof_dot and acceleration term here
+      v_own = wp.spatial_vector()
+      a_own = wp.spatial_vector()
+      cdof_own = wp.spatial_vector()
+      if is_body and tid > 0 and b_jntnum == 1:
+        if j_type == JointType.FREE:
+          for k in range(3):
+            v_own += cdof_in[worldid, b_dofadr + k] * qvel_sh[b_dofadr + k]
+            cdof_dot_out[worldid, b_dofadr + k] = wp.spatial_vector()
+          for k in range(3, 6):
+            cdof_k = cdof_in[worldid, b_dofadr + k]
+            cdof_dot = math.motion_cross(v_own, cdof_k)
+            cdof_dot_out[worldid, b_dofadr + k] = cdof_dot
+            a_own += cdof_dot * qvel_sh[b_dofadr + k]
+          for k in range(3, 6):
+            v_own += cdof_in[worldid, b_dofadr + k] * qvel_sh[b_dofadr + k]
+        else:
+          cdof_own = cdof_in[worldid, b_dofadr]
+          v_own = cdof_own * qvel_sh[b_dofadr]
+      if is_body and tid > 0:
+        _st_body_sv(cvel_sh, tid, v_own)
       _sync()
 
-      # body depth and subtree end from the depth-first numbering
-      b_level = int(0)
+      # subtree end from the depth-first numbering (the rne gather below); cvel_parent = sum of the
+      # ancestors' terms (cvel_sh[0] is zero) read along the chain; cdof_dot of a hinge/slide dof
+      # uses the parent velocity
       subtree_end = int(0)
+      cvel = wp.spatial_vector()
       if is_body:
-        p = int(tid)
-        while p != 0:
-          p = parent_sh[p]
-          b_level += 1
         subtree_end = tid + 1
         while subtree_end < nbody:
           if parent_sh[subtree_end] < tid:
             break
           subtree_end += 1
-
-      # com_vel and the velocity part of rne (level-synchronous)
-      for level in range(1, nlevel):
-        if is_body and b_level == level:
-          cvel = cvel_sh[b_parent]
-          cacc = cacc_sh[b_parent]
-          if b_jntnum == 1:
-            if j_type == JointType.FREE:
-              for k in range(3):
-                cvel += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
-                cdof_dot_out[worldid, b_dofadr + k] = wp.spatial_vector()
-              for k in range(3, 6):
-                cdof_dot = math.motion_cross(cvel, cdof_sh[b_dofadr + k])
-                cdof_dot_out[worldid, b_dofadr + k] = cdof_dot
-                cacc += cdof_dot * qvel_sh[b_dofadr + k]
-              for k in range(3, 6):
-                cvel += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
-            else:
-              cdof_dot = math.motion_cross(cvel, cdof_sh[b_dofadr])
-              cdof_dot_out[worldid, b_dofadr] = cdof_dot
-              cacc += cdof_dot * qvel_sh[b_dofadr]
-              cvel += cdof_sh[b_dofadr] * qvel_sh[b_dofadr]
-          _st_body_sv(cvel_sh, tid, cvel)
-          _st_body_sv(cacc_sh, tid, cacc)
-        _sync()
+        if tid > 0:
+          p = int(b_parent)
+          while p != 0:
+            cvel += cvel_sh[p]
+            p = parent_sh[p]
+          if b_jntnum == 1 and j_type != JointType.FREE:
+            cdof_dot = math.motion_cross(cvel, cdof_own)
+            cdof_dot_out[worldid, b_dofadr] = cdof_dot
+            a_own = cdof_dot * qvel_sh[b_dofadr]
+          cvel += v_own
+      _sync()
+      if is_body and tid > 0:
+        _st_body_sv(cacc_sh, tid, a_own)
+      _sync()
+      # cacc = gravity root + the ancestors' terms + own term, same chain read
+      cacc = wp.spatial_vector()
       if is_body:
-        cvel_out[worldid, tid] = cvel_sh[tid]
-        cacc_out[worldid, tid] = cacc_sh[tid]
+        cacc = cacc_sh[0]
+        if tid > 0:
+          p = int(b_parent)
+          while p != 0:
+            cacc += cacc_sh[p]
+            p = parent_sh[p]
+          cacc += a_own
+      _sync()
+      if is_body:
+        cvel_out[worldid, tid] = cvel
+        cacc_out[worldid, tid] = cacc
+      # own composite inertia for the rne body force below; the passive phase hides the load
+      cinert_own = vec10()
+      if is_body and tid > 0:
+        cinert_own = cinert_in[worldid, tid]
 
       # passive: springs on the advanced qpos, dampers on the post-sleep qvel, gravcomp unchanged
       if is_dof:
@@ -3413,14 +3432,12 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
         qfrc_damper_out[worldid, tid] = qfrc_damper
         qfrc_passive_out[worldid, tid] = qfrc_passive
 
-      # rne: body forces, backward gather, qfrc_bias
+      # rne: body forces (the cacc arena is free since the chain read), backward gather, qfrc_bias
       if is_body:
         frc = wp.spatial_vector()
         if tid > 0:
-          cinert = cinert_sh[tid]
-          cvel = cvel_sh[tid]
-          frc = math.inert_vec(cinert, cacc_sh[tid])
-          frc += math.motion_cross_force(cvel, math.inert_vec(cinert, cvel))
+          frc = math.inert_vec(cinert_own, cacc)
+          frc += math.motion_cross_force(cvel, math.inert_vec(cinert_own, cvel))
         _st_body_sv(cacc_sh, tid, frc)
       _sync()
       cfrc = wp.spatial_vector()
@@ -3821,7 +3838,7 @@ def forward_c(m: Model, d: Data, *, finalize: bool):
   ``sleep.update_sleep``.
   """
   wp.launch(
-    _forward_c_kernel(NBODY_CAP, NV_CAP, NU_CAP, NTREE_CAP, NVTREE_SMALL, NVTREE_CAP, NBIG_CAP, bool(finalize)),
+    _forward_c_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, NVTREE_SMALL, NVTREE_CAP, NBIG_CAP, bool(finalize)),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nbody,
@@ -3844,7 +3861,6 @@ def forward_c(m: Model, d: Data, *, finalize: bool):
       m.body_jntnum,
       m.body_jntadr,
       m.body_dofadr,
-      m.body_tree_offsets,
       m.jnt_type,
       m.jnt_qposadr,
       m.jnt_dofadr,
