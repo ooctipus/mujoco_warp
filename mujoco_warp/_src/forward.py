@@ -791,6 +791,45 @@ def fwd_velocity(m: Model, d: Data):
   smooth.tendon_bias(m, d, d.qfrc_bias)
 
 
+@event_scope
+def forward_worlds(m: Model, d: Data, world_ids: wp.array, count: int | wp.array | None = None):
+  """Position- and velocity-dependent computations for a subset of worlds.
+
+  Rebuilds the smooth data that depends on ``qpos`` and ``qvel`` (kinematics, ``com_pos``, ``crb``
+  and the inertia matrix, transmission, ``com_vel``, passive forces, RNE bias forces and the
+  actuator forces) for the worlds listed in ``world_ids``, leaving every other world untouched.
+  Callers use it to reconcile derived state after editing the coordinates of a few worlds, e.g. an
+  episode reset of some environments in a batch, where sleeping trees would otherwise keep stale
+  poses.
+
+  For models accepted by :func:`fused_world.fused_world` this is one CTA per selected world
+  (:func:`fused_world.forward_a` without its ``sleep.wake`` pass) plus ``camlight`` when the model
+  has cameras or lights. Like ``fwd_position``, it republishes ``tree_awake`` from ``tree_asleep``
+  but wakes no tree; constraint rows, the body/dof sleep bookkeeping and island partitions are not
+  rebuilt here, the next :func:`forward` recomputes them before they are consumed. For every other
+  model the stock all-worlds :func:`fwd_position` (without factorization) and :func:`fwd_velocity`
+  run instead.
+
+  Args:
+    m: The model.
+    d: The data object.
+    world_ids: int32 device array of world indices, shape ``(capacity,)``, ``capacity <= nworld``.
+    count: number of valid leading entries of ``world_ids``: a host int (the launch spans exactly
+      that many worlds), a one-element int32 device array (graph-safe, no host sync; the launch
+      spans the capacity and unused slots exit immediately) or None for the whole array.
+  """
+  if fused_world.fused_world(m, d):
+    # only the per-world contact counts are touched (zeroed); the id buckets belong to forward_m
+    groups = fused_world.ContactGroups(0, wp.empty((d.nworld,), dtype=int), wp.empty((0,), dtype=int))
+    fused_world.forward_a(m, d, groups, world_ids=world_ids, count=count, run_wake=False)
+    if m.ncam or m.nlight:
+      smooth.camlight(m, d)
+    return
+  fused_world.subset_launch_dim(d, world_ids, count)
+  fwd_position(m, d, factorize=False)
+  fwd_velocity(m, d)
+
+
 @wp.kernel
 def _actuator_force(
   # Model:
