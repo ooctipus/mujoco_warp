@@ -187,6 +187,46 @@ return value;
 def _warp_sum(value: float) -> float: ...
 
 
+@wp.func_native(
+  snippet="""
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+return __reduce_max_sync(0xffffffffu, value);
+#elif defined(__CUDA_ARCH__)
+for (int offset = 16; offset > 0; offset >>= 1) value = max(value, __shfl_xor_sync(0xffffffffu, value, offset));
+return value;
+#else
+return value;
+#endif
+"""
+)
+def _warp_max(value: int) -> int: ...
+
+
+# Segmented sum of up to ten lane values towards the first lane of each segment (lanes with equal
+# ``seg``; segments are contiguous and never straddle a warp). ``ndim`` must be warp-uniform: it
+# bounds the components reduced. All 32 lanes must participate (idle lanes pass seg = -1).
+@wp.func_native(
+  snippet="""
+#if defined(__CUDA_ARCH__)
+const int lane = threadIdx.x & 31;
+for (int offset = 1; offset < 32; offset <<= 1) {
+  const int other_seg = __shfl_down_sync(0xffffffffu, seg, offset);
+  const bool take = (lane + offset < 32) && (other_seg == seg);
+#pragma unroll
+  for (int dim = 0; dim < 10; ++dim) {
+    if (dim < ndim) {
+      const float other = __shfl_down_sync(0xffffffffu, values.c[dim], offset);
+      if (take) values.c[dim] += other;
+    }
+  }
+}
+#endif
+return values;
+"""
+)
+def _segment_sum_head10(values: vec10, seg: int, ndim: int) -> vec10: ...
+
+
 # Vectorized publishes of the array-of-structures Data fields. Warp stores a struct element as
 # scalar 4-byte stores, so a warp writing 24/36/40-byte elements touches 6-10x more 32-byte sectors
 # than the data needs; these snippets write 8- or 16-byte words when the element address is aligned
@@ -1923,16 +1963,50 @@ def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG
   return kernel
 
 
+@wp.func
+def _contact_row(
+  worldid: int,
+  efcid: int,
+  cid: int,
+  efc_type: int,
+  kbid: wp.vec4,
+  pos: float,
+  margin: float,
+  Jqvel: float,
+  efc_type_out: wp.array2d[int],
+  efc_id_out: wp.array2d[int],
+  efc_pos_out: wp.array2d[float],
+  efc_margin_out: wp.array2d[float],
+  efc_D_out: wp.array2d[float],
+  efc_vel_out: wp.array2d[float],
+  efc_aref_out: wp.array2d[float],
+  efc_frictionloss_out: wp.array2d[float],
+  efc_Jqvel_out: wp.array2d[float],
+):
+  """Row parameters of one contact row from its contact's (k, b, imp, D) (constraint._efc_row)."""
+  efc_Jqvel_out[worldid, efcid] = Jqvel
+  efc_D_out[worldid, efcid] = kbid[3]
+  efc_vel_out[worldid, efcid] = Jqvel
+  efc_aref_out[worldid, efcid] = -kbid[0] * kbid[2] * pos - kbid[1] * Jqvel
+  efc_pos_out[worldid, efcid] = pos + margin
+  efc_margin_out[worldid, efcid] = margin
+  efc_frictionloss_out[worldid, efcid] = 0.0
+  efc_type_out[worldid, efcid] = efc_type
+  efc_id_out[worldid, efcid] = cid
+
+
 # ------------------------------------------------------------------------------------------------
 # Per-world contact buckets: Newton assigns contact ids with a global atomic counter, so the
 # contacts of one world are scattered over [0, nacon). One pass over the live contacts appends every
-# id to its world's bucket. The bucket capacity is naconmax (exact: any distribution of the global
-# pool fits) while nworld * capacity stays within _GROUP_BUDGET_BYTES, otherwise the budget divided
-# by nworld (at least the nconmax share); a world with more contacts keeps the first ``capacity``
-# and raises OverflowType.NARROWPHASE, which is stricter than the stock global pool. Contacts may be
-# appended every substep (wake injection), so the pass runs per substep; forward_a zeroes the
-# per-world counts first. The slot order within a bucket follows the atomics, i.e. the contact row
-# order is unspecified exactly as with the stock atomic row allocation.
+# constraint-eligible penetrating id (the predicate of constraint._efc_contact_init: the other
+# contacts build no rows) to its world's bucket. The bucket capacity is naconmax (exact: any
+# distribution of the global pool fits) while nworld * capacity stays within _GROUP_BUDGET_BYTES,
+# otherwise the budget divided by nworld (at least the nconmax share); a world with more active
+# contacts keeps the first ``capacity`` and raises OverflowType.NARROWPHASE, which is stricter than
+# the stock global pool. Contacts may be appended every substep (wake injection), so the pass runs
+# per substep; forward_a zeroes the per-world counts first. The slot order within a bucket follows
+# the atomics, i.e. the contact row order is unspecified exactly as with the stock atomic row
+# allocation.
 # ------------------------------------------------------------------------------------------------
 
 # fixed grid for the bucket pass (it grid-strides over nacon, which is a device scalar)
@@ -1946,6 +2020,9 @@ def _world_contact_bucket(
   # Data in:
   nacon_in: wp.array[int],
   contact_worldid_in: wp.array[int],
+  contact_type_in: wp.array[int],
+  contact_dist_in: wp.array[float],
+  contact_includemargin_in: wp.array[float],
   # In:
   capacity: int,
   total_threads: int,
@@ -1957,6 +2034,11 @@ def _world_contact_bucket(
   tid = wp.tid()
   n = wp.min(nacon_in[0], contact_worldid_in.shape[0])
   for cid in range(tid, n, total_threads):
+    if (contact_type_in[cid] & ContactType.CONSTRAINT) == 0:
+      continue
+    # inactive (non-penetrating) contacts own no rows; written as in constraint._efc_contact_init
+    if not (contact_dist_in[cid] - contact_includemargin_in[cid] < 0.0):
+      continue
     worldid = contact_worldid_in[cid]
     slot = wp.atomic_add(count_out, worldid, 1)
     if slot < capacity:
@@ -1994,14 +2076,14 @@ def contact_groups(d: Data) -> ContactGroups:
 
 
 def _bucket_contacts(m: Model, d: Data, groups: ContactGroups):
-  """Append every live contact id to its world's bucket (``groups.count`` must be zero)."""
+  """Append every active (row-building) contact id to its world's bucket (counts start at zero)."""
   if m.opt.disableflags & DisableBit.CONTACT:
     return
   threads = min(_GROUP_THREADS, max(d.naconmax, 1))
   wp.launch(
     _world_contact_bucket,
     dim=threads,
-    inputs=[d.nacon, d.contact.worldid, groups.capacity, threads],
+    inputs=[d.nacon, d.contact.worldid, d.contact.type, d.contact.dist, d.contact.includemargin, groups.capacity, threads],
     outputs=[groups.count, groups.ids, d.overflow],
   )
 
@@ -2069,7 +2151,6 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
     contact_dim_in: wp.array[int],
     contact_includemargin_in: wp.array[float],
     contact_geom_in: wp.array[wp.vec2i],
-    contact_type_in: wp.array[int],
     contact_pos_in: wp.array[wp.vec3],
     contact_frame_in: wp.array2d[wp.vec3],
     contact_friction_in: wp.array[vec5],
@@ -2235,13 +2316,13 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
       l_pos = wp.min(l_dist_min, l_dist_max) - l_margin
       if l_pos < 0.0:
         l_rows = 1
-    # first contact of this thread; the geom bodies follow after the scan
+    # first contact of this thread (the bucket holds active contacts only); the geom bodies follow
+    # after the scan
     ncon = int(0)
     cstart = worldid * world_con_capacity_in
     if con_on:
       ncon = wp.min(world_con_count_in[worldid], world_con_capacity_in)
     p_cid = int(-1)
-    p_ctype = int(0)
     p_dist = float(0.0)
     p_includemargin = float(0.0)
     p_condim = int(0)
@@ -2250,7 +2331,6 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
     p_gb2 = int(0)
     if tid < ncon:
       p_cid = world_con_list_in[cstart + tid]
-      p_ctype = contact_type_in[p_cid]
       p_dist = contact_dist_in[p_cid]
       p_includemargin = contact_includemargin_in[p_cid]
       p_condim = contact_dim_in[p_cid]
@@ -2457,12 +2537,14 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
     row_base = ne + nf + nl
 
     # ------------------------------------------------------------------- M3b: contact rows
-    # pyramidal contacts of this world: ndim rows per active contact, one jtdaj block per contact.
-    # Per chunk of BLOCK contacts: one thread per contact allocates rows/nonzeros/blocks, writes the
-    # bookkeeping and evaluates the impedance once (it depends on the contact, not on the row); the
-    # Jacobian entries are then computed one (contact, ancestor dof) column per thread for all of
-    # the contact's rows, and finally one thread per row sums Jqvel in dof order and writes the row
-    # parameters. The next chunk's contact records are loaded while the current chunk is processed.
+    # pyramidal contacts of this world: ndim rows per contact (the bucket pass keeps the
+    # constraint-eligible penetrating contacts only), one jtdaj block per contact. Per chunk of
+    # BLOCK contacts: one thread per contact allocates rows/nonzeros/blocks, writes the bookkeeping
+    # and evaluates the impedance once (it depends on the contact, not on the row); the Jacobian
+    # entries are then computed one (contact, ancestor dof) column per thread for all of the
+    # contact's rows, and the row parameters follow from a segmented warp reduction of J * qvel over
+    # the contact's columns, so the written entries are never re-read. The next chunk's contact
+    # records are loaded while the current chunk is processed.
     nblock = wp.min(row_base, njmax_in)
     for i0 in range(0, ncon, BLOCK):
       i = i0 + tid
@@ -2480,42 +2562,38 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
       pos = p_dist - p_includemargin
       includemargin = p_includemargin
       if i < ncon:
-        if p_ctype & ContactType.CONSTRAINT:
-          if pos < 0.0:
-            active = 1
-            ndim = 1
-            if p_condim > 1:
-              ndim = 2 * (p_condim - 1)
-            rows = ndim
-            body1 = bweld_sh[gb1]
-            body2 = bweld_sh[gb2]
-            # count the merged ancestor chain excluding common dofs (constraint._efc_contact_init)
-            info1 = binfo_sh[body1]
-            info2 = binfo_sh[body2]
-            da1 = ((info1 & 0xFF) - 1) + ((info1 >> 8) & 0xFF) - 1
-            da2 = ((info2 & 0xFF) - 1) + ((info2 >> 8) & 0xFF) - 1
-            while da1 >= 0 or da2 >= 0:
-              da = wp.max(da1, da2)
-              if da1 == da and da2 == da:
-                break
-              if da1 == da:
-                da1 = dof_parent_sh[da1]
-              if da2 == da:
-                da2 = dof_parent_sh[da2]
-              rownnz += 1
-            nnz = rownnz * ndim
-      # rows, blocks and columns in one scan; the chunk sums bound the fields: rows <= 10 * BLOCK
-      # (11 bits), blocks <= BLOCK (8 bits), columns <= 16 * BLOCK (12 bits). Blocks assume every
-      # row of the chunk fits below njmax, which the rare overflow path below corrects
-      excl = _block_scan(scan_sh, rows | (active << 11) | (rownnz << 19), lane, warp)
+        active = 1
+        ndim = 1
+        if p_condim > 1:
+          ndim = 2 * (p_condim - 1)
+        rows = ndim
+        body1 = bweld_sh[gb1]
+        body2 = bweld_sh[gb2]
+        # count the merged ancestor chain excluding common dofs (constraint._efc_contact_init)
+        info1 = binfo_sh[body1]
+        info2 = binfo_sh[body2]
+        da1 = ((info1 & 0xFF) - 1) + ((info1 >> 8) & 0xFF) - 1
+        da2 = ((info2 & 0xFF) - 1) + ((info2 >> 8) & 0xFF) - 1
+        while da1 >= 0 or da2 >= 0:
+          da = wp.max(da1, da2)
+          if da1 == da and da2 == da:
+            break
+          if da1 == da:
+            da1 = dof_parent_sh[da1]
+          if da2 == da:
+            da2 = dof_parent_sh[da2]
+          rownnz += 1
+        nnz = rownnz * ndim
+      # rows and blocks in one scan; the chunk sums bound the fields: rows <= 10 * BLOCK (11 bits),
+      # blocks <= BLOCK (8 bits). Blocks assume every row of the chunk fits below njmax, which the
+      # rare overflow path below corrects
+      excl = _block_scan(scan_sh, rows | (active << 11), lane, warp)
       row_excl = excl & 0x7FF
       base = row_base + row_excl
       rows_total = scan_sh[4] & 0x7FF
       blocks = active
-      block_excl = (excl >> 11) & 0xFF
-      blocks_total = (scan_sh[4] >> 11) & 0xFF
-      col_excl = excl >> 19
-      cols_total = scan_sh[4] >> 19
+      block_excl = excl >> 11
+      blocks_total = scan_sh[4] >> 11
       if row_base + rows_total > njmax_in:
         blocks = 0
         if active == 1 and base < njmax_in:
@@ -2538,7 +2616,6 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
             contact_efc_address_out[cid, dim] = -1
           else:
             contact_efc_address_out[cid, dim] = efcid
-            efc_id_out[worldid, efcid] = cid
             if nnz_ok == 1:
               efc_J_rowadr_out[worldid, efcid] = rowadr + dim * rownnz
               efc_J_rownnz_out[worldid, efcid] = rownnz
@@ -2561,13 +2638,37 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
           invweight = invweight * 2.0 * fri0 * fri0 * impratio_invsqrt * impratio_invsqrt
           efc_type = int(ConstraintType.CONTACT_PYRAMIDAL)
         kbid = constraint._efc_kbid(opt_disableflags, timestep, pos, invweight, contact_solref_in[cid], contact_solimp_in[cid])
+        # contacts without Jacobian entries (both bodies static, or entries beyond njmax_nnz) have
+        # no column thread: their rows carry Jqvel = 0
+        if rownnz * nnz_ok == 0:
+          for dim in range(ndim):
+            efcid = base + dim
+            if efcid < njmax_in:
+              _contact_row(
+                worldid,
+                efcid,
+                cid,
+                efc_type,
+                kbid,
+                pos,
+                includemargin,
+                0.0,
+                efc_type_out,
+                efc_id_out,
+                efc_pos_out,
+                efc_margin_out,
+                efc_D_out,
+                efc_vel_out,
+                efc_aref_out,
+                efc_frictionloss_out,
+                efc_Jqvel_out,
+              )
       else:
         cid = -1
-      # stash the chunk's contacts for the column and row phases; contacts whose nonzeros do not
-      # fit keep their column slots but own no entries (rownnz stashed as 0)
+      # stash the chunk's contacts for the column phase; contacts whose nonzeros do not fit own no
+      # entries (rownnz stashed as 0)
       _st_chunk_i(c_cid_sh, tid, cid)
       _st_chunk_i(c_row_sh, tid, row_excl)
-      _st_chunk_i(c_col_sh, tid, col_excl)
       _st_chunk_i(c_rowadr_sh, tid, rowadr)
       _st_chunk_i(c_rownnz_sh, tid, rownnz * nnz_ok)
       _st_chunk_i(c_body1_sh, tid, body1)
@@ -2580,151 +2681,172 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
       _st_chunk_f(c_pos_sh, tid, pos)
       _st_chunk_f(c_margin_sh, tid, includemargin)
       _sync()
-      # next chunk, first round (the later rounds follow the column and row phases)
+      # next chunk, first round (the later rounds follow the packing and column phases)
       i_next = i0 + BLOCK + tid
       p_cid = -1
       if i_next < ncon:
         p_cid = world_con_list_in[cstart + i_next]
-
-      # Jacobian entries, one (contact, ancestor dof) column per thread for all ndim rows
-      # (constraint._efc_contact_jac_sparse; the per-row values only differ in the friction term)
-      for col in range(tid, cols_total, BLOCK):
-        # owning contact: the last chunk entry whose column prefix is <= col (contacts without
-        # columns share the prefix of their successor, so the search never lands on one)
-        lo = int(0)
-        hi = chunk_n - 1
-        while lo < hi:
-          mid = (lo + hi + 1) // 2
-          if c_col_sh[mid] <= col:
-            lo = mid
-          else:
-            hi = mid - 1
-        rownnz = c_rownnz_sh[lo]
-        if rownnz == 0:
-          continue
-        k = col - c_col_sh[lo]
-        cid = c_cid_sh[lo]
-        body1 = c_body1_sh[lo]
-        body2 = c_body2_sh[lo]
-        type_ndim = c_type_sh[lo]
-        pyramidal = (type_ndim & 0xFF) == ConstraintType.CONTACT_PYRAMIDAL
-        ndim = type_ndim >> 8
-        efcid0 = row_base + c_row_sh[lo]
-        # k-th dof of the merged ancestor chain; common ancestors are excluded from rownnz, so one
-        # body owns it
-        info1 = binfo_sh[body1]
-        info2 = binfo_sh[body2]
-        da1 = ((info1 & 0xFF) - 1) + ((info1 >> 8) & 0xFF) - 1
-        da2 = ((info2 & 0xFF) - 1) + ((info2 >> 8) & 0xFF) - 1
-        da = wp.max(da1, da2)
-        for _step in range(k):
-          if da1 == da:
-            da1 = dof_parent_sh[da1]
-          if da2 == da:
-            da2 = dof_parent_sh[da2]
-          da = wp.max(da1, da2)
-        root = info2 >> 16
-        sign = float(1.0)
-        if da1 == da:
-          root = info1 >> 16
-          sign = -1.0
-        con_pos = contact_pos_in[cid]
-        frame_0 = contact_frame_in[cid, 0]
-        frame_1 = wp.vec3(0.0)
-        frame_2 = wp.vec3(0.0)
-        friction = vec5()
-        if pyramidal:
-          frame_1 = contact_frame_in[cid, 1]
-          frame_2 = contact_frame_in[cid, 2]
-          friction = contact_friction_in[cid]
-        cdof = cdof_in[worldid, da]
-        cdof_ang = wp.spatial_top(cdof)
-        offset = con_pos - subtree_com_in[worldid, root]
-        jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
-        jacr_dif = cdof_ang * sign
-        adr0 = c_rowadr_sh[lo] + k
-        for dim in range(ndim):
-          efcid = efcid0 + dim
-          if efcid >= njmax_in:
-            continue
-          frame_i = wp.vec3(0.0)
-          dimid2 = int(0)
-          frii = float(0.0)
-          if pyramidal:
-            dimid2 = dim / 2 + 1
-            frii = friction[dimid2 - 1]
-            if dimid2 == 1:
-              frame_i = frame_1
-            elif dimid2 == 2:
-              frame_i = frame_2
-            elif dimid2 == 3:
-              frame_i = frame_0
-            elif dimid2 == 4:
-              frame_i = frame_1
-            else:
-              frame_i = frame_2
-          J = float(0.0)
-          Ji = float(0.0)
-          for xyz in range(3):
-            J += frame_0[xyz] * jacp_dif[xyz]
-            if pyramidal:
-              if dimid2 < 3:
-                Ji += frame_i[xyz] * jacp_dif[xyz]
-              else:
-                Ji += frame_i[xyz] * jacr_dif[xyz]
-          if pyramidal:
-            if dim % 2 == 0:
-              J += Ji * frii
-            else:
-              J -= Ji * frii
-          adr = adr0 + dim * rownnz
-          efc_J_colind_out[worldid, 0, adr] = da
-          efc_J_out[worldid, 0, adr] = J
+      # column slots: contact c owns [c_col[c], c_col[c] + rownnz) packed so that no contact
+      # straddles a warp (rownnz <= 2 * NVTREE_CAP = 32), which lets the segmented warp reduction
+      # below sum a contact's columns without cross-warp carries; the total lands in scan_sh[5]
+      if tid == 0:
+        col = int(0)
+        for c in range(chunk_n):
+          n = c_rownnz_sh[c]
+          if (col & 31) + n > 32:
+            col = (col | 31) + 1
+          _st_chunk_i(c_col_sh, c, col)
+          col += n
+        _st_scan_i(scan_sh, 5, col)
       _sync()
+      cols_total = scan_sh[5]
       # next chunk, second round
       if i_next < ncon:
-        p_ctype = contact_type_in[p_cid]
         p_dist = contact_dist_in[p_cid]
         p_includemargin = contact_includemargin_in[p_cid]
         p_condim = contact_dim_in[p_cid]
         p_geom = contact_geom_in[p_cid]
 
-      # rows: Jqvel from the written entries in dof order (velocities from shared), then the row
-      # parameters (_efc_row)
-      for r in range(tid, rows_total, BLOCK):
-        efcid = row_base + r
-        if efcid >= njmax_in:
-          continue
+      # Jacobian entries, one (contact, ancestor dof) column per thread for all ndim rows
+      # (constraint._efc_contact_jac_sparse; the per-row values only differ in the friction term),
+      # then the contact's Jqvel per row by a segmented sum towards its first column, whose thread
+      # writes the row parameters (_efc_row)
+      for c0 in range(0, cols_total, BLOCK):
+        col = c0 + tid
+        seg = int(-1)
         lo = int(0)
-        hi = chunk_n - 1
-        while lo < hi:
-          mid = (lo + hi + 1) // 2
-          if c_row_sh[mid] <= r:
-            lo = mid
-          else:
-            hi = mid - 1
-        cid = c_cid_sh[lo]
-        dim = r - c_row_sh[lo]
-        rownnz = c_rownnz_sh[lo]
-        rowadr_dim = c_rowadr_sh[lo] + dim * rownnz
-        Jqvel = float(0.0)
-        for k in range(rownnz):
-          adr = rowadr_dim + k
-          Jqvel += efc_J_out[worldid, 0, adr] * qvel_sh[efc_J_colind_out[worldid, 0, adr]]
-        kk = c_k_sh[lo]
-        b = c_b_sh[lo]
-        imp = c_imp_sh[lo]
-        pos = c_pos_sh[lo]
-        margin = c_margin_sh[lo]
-        efc_Jqvel_out[worldid, efcid] = Jqvel
-        efc_D_out[worldid, efcid] = c_D_sh[lo]
-        efc_vel_out[worldid, efcid] = Jqvel
-        efc_aref_out[worldid, efcid] = -kk * imp * pos - b * Jqvel
-        efc_pos_out[worldid, efcid] = pos + margin
-        efc_margin_out[worldid, efcid] = margin
-        efc_frictionloss_out[worldid, efcid] = 0.0
-        efc_type_out[worldid, efcid] = c_type_sh[lo] & 0xFF
-        efc_id_out[worldid, efcid] = cid
+        k = int(0)
+        ndim = int(0)
+        efcid0 = int(0)
+        Jq = vec10()
+        if col < cols_total:
+          # owning contact: the last chunk entry whose column slot is <= col (contacts without
+          # columns share the slot of their successor, so the search never lands on one); columns
+          # in the padding after a contact's entries stay idle
+          hi = chunk_n - 1
+          while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if c_col_sh[mid] <= col:
+              lo = mid
+            else:
+              hi = mid - 1
+          k = col - c_col_sh[lo]
+          if k < c_rownnz_sh[lo]:
+            seg = lo
+        if seg >= 0:
+          rownnz = c_rownnz_sh[lo]
+          cid = c_cid_sh[lo]
+          body1 = c_body1_sh[lo]
+          body2 = c_body2_sh[lo]
+          type_ndim = c_type_sh[lo]
+          pyramidal = (type_ndim & 0xFF) == ConstraintType.CONTACT_PYRAMIDAL
+          ndim = type_ndim >> 8
+          efcid0 = row_base + c_row_sh[lo]
+          # the contact records and both root coms are issued before the ancestor walk so that
+          # their latency overlaps it
+          con_pos = contact_pos_in[cid]
+          frame_0 = contact_frame_in[cid, 0]
+          frame_1 = wp.vec3(0.0)
+          frame_2 = wp.vec3(0.0)
+          friction = vec5()
+          if pyramidal:
+            frame_1 = contact_frame_in[cid, 1]
+            frame_2 = contact_frame_in[cid, 2]
+            friction = contact_friction_in[cid]
+          info1 = binfo_sh[body1]
+          info2 = binfo_sh[body2]
+          com1 = subtree_com_in[worldid, info1 >> 16]
+          com2 = subtree_com_in[worldid, info2 >> 16]
+          # k-th dof of the merged ancestor chain; common ancestors are excluded from rownnz, so
+          # one body owns it
+          da1 = ((info1 & 0xFF) - 1) + ((info1 >> 8) & 0xFF) - 1
+          da2 = ((info2 & 0xFF) - 1) + ((info2 >> 8) & 0xFF) - 1
+          da = wp.max(da1, da2)
+          for _step in range(k):
+            if da1 == da:
+              da1 = dof_parent_sh[da1]
+            if da2 == da:
+              da2 = dof_parent_sh[da2]
+            da = wp.max(da1, da2)
+          offset = con_pos - com2
+          sign = float(1.0)
+          if da1 == da:
+            offset = con_pos - com1
+            sign = -1.0
+          cdof = cdof_in[worldid, da]
+          cdof_ang = wp.spatial_top(cdof)
+          jacp_dif = (wp.spatial_bottom(cdof) + wp.cross(cdof_ang, offset)) * sign
+          jacr_dif = cdof_ang * sign
+          qvel_da = qvel_sh[da]
+          adr0 = c_rowadr_sh[lo] + k
+          for dim in range(10):
+            if dim < ndim:
+              frame_i = wp.vec3(0.0)
+              dimid2 = int(0)
+              frii = float(0.0)
+              if pyramidal:
+                dimid2 = dim / 2 + 1
+                frii = friction[dimid2 - 1]
+                if dimid2 == 1:
+                  frame_i = frame_1
+                elif dimid2 == 2:
+                  frame_i = frame_2
+                elif dimid2 == 3:
+                  frame_i = frame_0
+                elif dimid2 == 4:
+                  frame_i = frame_1
+                else:
+                  frame_i = frame_2
+              J = float(0.0)
+              Ji = float(0.0)
+              for xyz in range(3):
+                J += frame_0[xyz] * jacp_dif[xyz]
+                if pyramidal:
+                  if dimid2 < 3:
+                    Ji += frame_i[xyz] * jacp_dif[xyz]
+                  else:
+                    Ji += frame_i[xyz] * jacr_dif[xyz]
+              if pyramidal:
+                if dim % 2 == 0:
+                  J += Ji * frii
+                else:
+                  J -= Ji * frii
+              Jq[dim] = J * qvel_da
+              if efcid0 + dim < njmax_in:
+                adr = adr0 + dim * rownnz
+                efc_J_colind_out[worldid, 0, adr] = da
+                efc_J_out[worldid, 0, adr] = J
+        # every lane of the block takes part in the warp reduction (warp-uniform row count)
+        ndim_warp = _warp_max(ndim)
+        Jq = _segment_sum_head10(Jq, seg, ndim_warp)
+        if seg >= 0 and k == 0:
+          kbid = wp.vec4(c_k_sh[lo], c_b_sh[lo], c_imp_sh[lo], c_D_sh[lo])
+          pos = c_pos_sh[lo]
+          margin = c_margin_sh[lo]
+          efc_type = c_type_sh[lo] & 0xFF
+          for dim in range(10):
+            if dim < ndim:
+              efcid = efcid0 + dim
+              if efcid < njmax_in:
+                _contact_row(
+                  worldid,
+                  efcid,
+                  cid,
+                  efc_type,
+                  kbid,
+                  pos,
+                  margin,
+                  Jq[dim],
+                  efc_type_out,
+                  efc_id_out,
+                  efc_pos_out,
+                  efc_margin_out,
+                  efc_D_out,
+                  efc_vel_out,
+                  efc_aref_out,
+                  efc_frictionloss_out,
+                  efc_Jqvel_out,
+                )
       _sync()
       # next chunk, third round
       if i_next < ncon:
@@ -3773,7 +3895,6 @@ def _launch_forward_m(m: Model, d: Data, groups: ContactGroups):
       d.contact.dim,
       d.contact.includemargin,
       d.contact.geom,
-      d.contact.type,
       d.contact.pos,
       contact_frame_2d,
       d.contact.friction,
