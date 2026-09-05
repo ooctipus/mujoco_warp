@@ -15,6 +15,7 @@
 
 import dataclasses
 import os
+import warnings
 from math import ceil
 from typing import Any
 
@@ -4979,7 +4980,7 @@ def _world_solver_applicable(m: types.Model, d: types.Data) -> bool:
   reason = world_solver.world_solver_unsupported_reason(m, d)
   if reason is not None and reason not in _WORLD_SOLVER_WARNED:
     _WORLD_SOLVER_WARNED.add(reason)
-    wp.utils.warn(f"world solver disabled for this model: {reason}")
+    warnings.warn(f"world solver disabled for this model: {reason}", stacklevel=2)
   return reason is None
 
 
