@@ -29,7 +29,9 @@ from mujoco_warp._src import fused_world
 from mujoco_warp._src import sleep
 from mujoco_warp._src import smooth
 from mujoco_warp._src.types import ConstraintType
+from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import OverflowType
+from mujoco_warp._src.types import SleepState
 
 # fused and stock paths differ only in floating point summation / factorization order
 _RTOL = 1e-5
@@ -301,25 +303,25 @@ class FusedWorldTest(absltest.TestCase):
       d.tree_awake.assign(tree_awake)
 
   def _run_forward(self, m, d, fused: bool):
-    fused_world.enabled = fused
+    m.opt.fused_world = fused
     try:
-      if fused:
-        self.assertTrue(fused_world.fused_world(m, d))
+      self.assertEqual(fused_world.fused_world(m, d), fused)
       mjw.forward(m, d)
       wp.synchronize()
     finally:
-      fused_world.enabled = True
+      m.opt.fused_world = True
 
   def _run_step(self, m, d, fused: bool, finalize: bool = True):
-    fused_world.enabled = fused
+    m.opt.fused_world = fused
     try:
+      self.assertEqual(fused_world.fused_world(m, d), fused)
       if finalize:
         mjw.step(m, d)
       else:
         mjw._step_intermediate(m, d)
       wp.synchronize()
     finally:
-      fused_world.enabled = True
+      m.opt.fused_world = True
 
   def _assert_close(self, name, fused, ref, rtol=_RTOL, atol=_ATOL):
     fused = np.asarray(fused)
@@ -398,7 +400,9 @@ class FusedWorldTest(absltest.TestCase):
     err_ref = np.abs(x_ref - x64).max() / scale
     err_fused = np.abs(x_fused - x64).max() / scale
     print(f"{name}: max rel error vs float64: stock {err_ref:.3e} fused {err_fused:.3e}")
-    self.assertLessEqual(err_fused, max(2.0 * err_ref, 1e-6), f"{name}: fused solve less accurate than stock")
+    # the scalar Cholesky of the 9-dof block measures 7.4e-7 (tile Cholesky: 8e-8); bound at 2e-6
+    self.assertLessEqual(err_fused, 2e-6, f"{name}: fused solve less accurate than expected")
+    self.assertLessEqual(err_ref, 2e-6, f"{name}: stock solve less accurate than expected")
     self._assert_close(name, x_fused, x_ref, rtol=1e-3, atol=1e-4 * scale)
 
   def _qld_upper_mask(self, m):
@@ -427,11 +431,11 @@ class FusedWorldTest(absltest.TestCase):
     m.opt.run_collision_detection = True
     self.assertFalse(fused_world.fused_world(m, d))
     m.opt.run_collision_detection = False
-    fused_world.enabled = False
-    try:
-      self.assertFalse(fused_world.fused_world(m, d))
-    finally:
-      fused_world.enabled = True
+    # host switch
+    m.opt.fused_world = False
+    self.assertFalse(fused_world.fused_world(m, d))
+    m.opt.fused_world = True
+    self.assertTrue(fused_world.fused_world(m, d))
 
     # structural rejections: ball joint, tendon
     for extra in (
@@ -443,6 +447,95 @@ class FusedWorldTest(absltest.TestCase):
       mjm2, mjd2, m2, d2 = test_data.fixture(xml=xml, nworld=1)
       m2.opt.run_collision_detection = False
       self.assertFalse(fused_world.fused_world(m2, d2))
+
+  def test_variants_match_stock(self):
+    """Model variants the predicate admits behave like stock.
+
+    Mocap body, actuator gravcomp and force range, a second wide tree, no actuators, disabled
+    spring/damper/gravity/actuation and an nvmax overflow.
+    """
+    mocap = '<body name="mocap0" mocap="true" pos="1 1 0.5"><geom type="sphere" size="0.02"/></body>'
+    second_chain = (
+      "".join(
+        f'<body pos="0 0 0.1"><joint type="hinge" axis="{"0 1 0" if i % 2 else "1 0 0"}" range="-1 1" damping="0.2"/>'
+        f'<geom type="capsule" size="0.02" fromto="0 0 0 0 0 0.1" mass="0.5"/>'
+        for i in range(7)
+      )
+      + "</body>" * 7
+    )
+    second_tree = f'<body name="chain2" pos="-1 -1 0"><geom type="box" size="0.03 0.03 0.03" mass="1"/>{second_chain}</body>'
+    variants = {
+      "mocap": (factory_like_xml().replace("</worldbody>", mocap + "</worldbody>", 1), 0, None),
+      "actgravcomp": (
+        factory_like_xml()
+        .replace(
+          '<joint name="j1" type="hinge"', '<joint name="j1" type="hinge" actuatorgravcomp="true" actuatorfrcrange="-30 30"', 1
+        )
+        .replace("<actuator>", '<option><flag actuation="enable"/></option><actuator>', 1)
+        .replace('<option><flag actuation="enable"/></option>', "", 1),
+        0,
+        None,
+      ),
+      "second_wide_tree": (factory_like_xml(n_free=10).replace("</worldbody>", second_tree + "</worldbody>", 1), 0, None),
+      "no_actuators": (factory_like_xml().split("<actuator>")[0] + "</mujoco>", 0, None),
+      "disable_flags": (
+        factory_like_xml(),
+        DisableBit.SPRING | DisableBit.DAMPER | DisableBit.GRAVITY | DisableBit.ACTUATION,
+        None,
+      ),
+      # only trees with constraint rows count towards nvmax (the arm when one of its limits is active)
+      "nvmax_overflow": (factory_like_xml(), 0, 4),
+    }
+    exact_int = (
+      "tree_asleep",
+      "tree_awake",
+      "body_awake",
+      "ntree_awake",
+      "nbody_awake",
+      "nv_awake",
+      "ncdof",
+      "nsingleton6",
+      "overflow",
+      "nefc",
+      "nisland",
+      "tree_island",
+    )
+    for name, (xml, disableflags, nvmax) in variants.items():
+      with self.subTest(variant=name):
+        mjm, mjd, m, _ = test_data.fixture(xml=xml, nworld=1)
+        m.opt.run_collision_detection = False
+        m.opt.disableflags = m.opt.disableflags | disableflags
+        rng = np.random.default_rng(11)
+        qpos, qvel, ctrl = _random_state(mjm, 4, rng, qvel_scale=0.5)
+        datas = []
+        for _ in range(2):
+          kwargs = {"nvmax": nvmax} if nvmax is not None else {}
+          d = mjw.put_data(mjm, mjd, nworld=4, **kwargs)
+          d.qpos.assign(qpos)
+          d.qvel.assign(qvel)
+          d.ctrl.assign(ctrl)
+          if m.nmocap:
+            d.mocap_pos.assign(np.tile(np.array([[1.1, 0.9, 0.6]], dtype=np.float32), (4, m.nmocap, 1)))
+          datas.append(d)
+        d_ref, d_fused = datas
+        self.assertTrue(fused_world.fused_world(m, d_fused), name)
+        if name == "second_wide_tree":
+          self.assertEqual((m.tree_dofnum.numpy() > fused_world.NVTREE_SMALL).sum(), 2)
+        if name == "no_actuators":
+          self.assertEqual(m.nu, 0)
+        for _ in range(3):
+          self._run_step(m, d_ref, fused=False)
+          self._run_step(m, d_fused, fused=True)
+        self._assert_int_equal(d_fused, d_ref, exact_int)
+        if name == "nvmax_overflow":
+          self.assertTrue((d_ref.overflow.numpy() & OverflowType.NVMAX).any())
+        else:
+          self.assertEqual(int(d_ref.overflow.numpy().max()), 0)
+          for field in ("qpos", "qvel", "qacc_warmstart", "xpos", "cvel", "qfrc_bias", "qfrc_passive", "qfrc_actuator"):
+            self._assert_close_scaled(field, getattr(d_fused, field).numpy(), getattr(d_ref, field).numpy(), rel=1e-4)
+        if name == "mocap":
+          self.assertGreater(m.nmocap, 0)
+          self.assertTrue((d_ref.body_awake.numpy()[:, -1] == SleepState.AWAKE).all())
 
   def test_forward_matches_stock(self):
     """One forward pass: fused kernels reproduce every replaced Data field of the stock launches."""

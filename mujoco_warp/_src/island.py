@@ -1096,6 +1096,8 @@ def _reset_compact_maps(
     cdof_dof_out[worldid, idx] = -1
 
 
+# The active-DOF compaction below is mirrored by fused_world._forward_b_kernel (phases Q3/Q3b); keep
+# the layout rules (nvmax overflow, tile alignment, singleton fold-back, prefix order) in sync.
 @wp.kernel
 def _compact_dof_layout(
   # Model:
@@ -1153,6 +1155,7 @@ def _compact_dof_layout(
     nsingleton6_out[worldid] = singleton_count
 
 
+# Mirrored by fused_world._forward_b_kernel (Q3b); keep in sync with _compact_dof_layout above.
 @wp.kernel
 def _map_compact_dofs(
   # Model:

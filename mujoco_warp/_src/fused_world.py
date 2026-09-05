@@ -53,8 +53,6 @@ thread-divergent code use single-line native snippets; multi-line native snippet
 scope.
 """
 
-import os
-
 import numpy as np
 import warp as wp
 
@@ -103,9 +101,6 @@ NBIG_CAP = 2
 
 # tree_asleep value for a fully awake tree (see sleep.py)
 _K_AWAKE_VAL = -(1 + types.MJ_MINAWAKE)
-
-# Host switch (e.g. for A/B comparisons); MJWARP_FUSED_WORLD=0 disables the fused path.
-enabled = os.environ.get("MJWARP_FUSED_WORLD", "1") != "0"
 
 
 @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -421,6 +416,10 @@ def _dfs_contiguous(body_parentid: np.ndarray) -> bool:
 def static_eligible(mjm, m: Model) -> bool:
   """Structural (model-only) part of the fused-world predicate, evaluated on host data in put_model.
 
+  The result freezes facts that live in mutable device arrays of the built model (``jnt_type``,
+  ``body_parentid``, ``eq_type``, the actuator transmission/dynamics/gain/bias types and the tree
+  layout): mutating those after ``put_model`` is unsupported on the fused path.
+
   Args:
     mjm: The MuJoCo model (host arrays).
     m: The partially built MJWarp model; its derived scalars and the host ``qLD_block_adr`` layout
@@ -458,7 +457,10 @@ def static_eligible(mjm, m: Model) -> bool:
       return False
 
   tree_dofnum = np.asarray(mjm.tree_dofnum)
-  if tree_dofnum.max() > NVTREE_CAP or (tree_dofnum > NVTREE_SMALL).sum() > NBIG_CAP:
+  if tree_dofnum.min() <= 0 or tree_dofnum.max() > NVTREE_CAP or (tree_dofnum > NVTREE_SMALL).sum() > NBIG_CAP:
+    return False
+  # every dof belongs to a tree: the kernels index tree state with dof_treeid unguarded
+  if (np.asarray(mjm.body_treeid)[np.asarray(mjm.dof_bodyid)] < 0).any():
     return False
   if (np.asarray(m.qLD_block_adr) == Q_LD_BLOCK_SPARSE).any():
     return False
@@ -469,13 +471,16 @@ def static_eligible(mjm, m: Model) -> bool:
 def fused_world(m: Model, d: Data) -> bool:
   """Return whether the fused per-world forward kernels apply to ``(m, d)``.
 
-  The structural part comes from ``m.fused_world_static`` (host data in put_model); option flags and
-  runtime toggles (such as ``sensor_rne_postconstraint``, which Newton flips at runtime) are
-  re-evaluated on every call. Only host state is read, so the predicate is safe under graph capture.
+  The structural part comes from ``m.fused_world_static`` (host data in put_model); option flags
+  (including the ``Option.fused_world`` host switch) and runtime toggles (such as
+  ``sensor_rne_postconstraint``, which Newton flips at runtime) are re-evaluated on every call. Only
+  host state is read, so the predicate is safe under graph capture.
   """
-  if not enabled or not getattr(m, "fused_world_static", False):
+  if not getattr(m, "fused_world_static", False):
     return False
   opt = m.opt
+  if not getattr(opt, "fused_world", True):
+    return False
   if opt.solver != SolverType.NEWTON or opt.cone != ConeType.PYRAMIDAL or opt.integrator != IntegratorType.IMPLICITFAST:
     return False
   if opt.run_collision_detection:
@@ -614,12 +619,6 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     # Data out:
     tree_asleep_out: wp.array2d[int],
     tree_awake_out: wp.array2d[int],
-    ntree_awake_out: wp.array[int],
-    body_awake_out: wp.array2d[int],
-    body_awake_ind_out: wp.array2d[int],
-    nbody_awake_out: wp.array[int],
-    dof_awake_ind_out: wp.array2d[int],
-    nv_awake_out: wp.array[int],
     xpos_out: wp.array2d[wp.vec3],
     xquat_out: wp.array2d[wp.quat],
     xmat_out: wp.array2d[wp.mat33],
@@ -669,7 +668,6 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     cacc_sh = wp.tile_empty(shape=(NB,), dtype=wp.spatial_vector, storage="shared")
     parent_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
     send_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
-    body_awake_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
     gc_body_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
     cdof_sh = wp.tile_empty(shape=(NV,), dtype=wp.spatial_vector, storage="shared")
     qvel_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
@@ -682,7 +680,6 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
 
     lane = tid & 31
     warp = tid >> 5
-    lanemask = (wp.uint32(1) << wp.uint32(lane)) - wp.uint32(1)
 
     is_body = tid < nbody
     is_dof = tid < nv
@@ -834,65 +831,14 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     _sync()
 
     # ---------------------------------------------------------------- P1b: update_sleep (trees)
-    awake_flag = int(0)
+    # tree_awake feeds wake_equality in forward_m, which then publishes the body/dof awake arrays
     if is_tree:
       asleep = tree_asleep_sh[tid]
       tree_asleep_out[worldid, tid] = asleep
+      awake_flag = int(0)
       if asleep < 0:
         awake_flag = 1
-      _st_tree_i(tree_awake_sh, tid, awake_flag)
       tree_awake_out[worldid, tid] = awake_flag
-    awake_mask = _ballot(awake_flag)
-    if tid == 0:
-      # trees fit in the first warp (ntree <= 32)
-      ntree_awake_out[worldid] = _popc(awake_mask)
-    _sync()
-
-    # ---------------------------------------------------------------- P1c: update_sleep (bodies)
-    body_flag = int(0)
-    if is_body:
-      state = int(SleepState.STATIC)
-      if b_tree < 0:
-        if body_mocapid[b_root] >= 0:
-          state = int(SleepState.AWAKE)
-      elif tree_awake_sh[b_tree] == 1:
-        state = int(SleepState.AWAKE)
-      else:
-        state = int(SleepState.ASLEEP)
-      _st_body_i(body_awake_sh, tid, state)
-      body_awake_out[worldid, tid] = state
-      if state != SleepState.ASLEEP:
-        body_flag = 1
-    body_mask = _ballot(body_flag)
-    if lane == 0:
-      _st_misc_i(misc_sh, warp, _popc(body_mask))
-    _sync()
-
-    # deterministic compaction in body order
-    if body_flag != 0:
-      scan_offset = int(0)
-      for w in range(warp):
-        scan_offset += misc_sh[w]
-      body_awake_ind_out[worldid, scan_offset + _popc(body_mask & lanemask)] = tid
-    if tid == 0:
-      nbody_awake_out[worldid] = misc_sh[0] + misc_sh[1] + misc_sh[2] + misc_sh[3]
-
-    # ---------------------------------------------------------------- P1d: update_sleep (dofs)
-    dof_flag = int(0)
-    if is_dof:
-      if d_tree >= 0 and body_awake_sh[d_body] == SleepState.AWAKE:
-        dof_flag = 1
-    dof_mask = _ballot(dof_flag)
-    if lane == 0:
-      _st_misc_i(misc_sh, 4 + warp, _popc(dof_mask))
-    _sync()
-    if dof_flag != 0:
-      scan_offset = int(0)
-      for w in range(warp):
-        scan_offset += misc_sh[4 + w]
-      dof_awake_ind_out[worldid, scan_offset + _popc(dof_mask & lanemask)] = tid
-    if tid == 0:
-      nv_awake_out[worldid] = misc_sh[4] + misc_sh[5] + misc_sh[6] + misc_sh[7]
 
     # ----------------------------------------------------------- P2: kinematics (level-synchronous)
     xanchor = wp.vec3(0.0)
@@ -1384,7 +1330,8 @@ def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG
     # ------------------------------------------------------------ Q1: qfrc_smooth + xfrc_accumulate
     qfrc = float(0.0)
     if is_dof:
-      if d_tree < 0 or tree_awake_sh[d_tree] != 0:
+      # every dof belongs to a tree (static_eligible), so tree state is indexed unguarded
+      if tree_awake_sh[d_tree] != 0:
         qfrc = (
           qfrc_passive_in[worldid, tid]
           - qfrc_bias_in[worldid, tid]
@@ -2961,9 +2908,10 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
 def forward_a(m: Model, d: Data):
   """Fused sleep wake/update, position, velocity and actuation stages (one CTA per world).
 
-  Replaces ``sleep.wake`` + ``sleep.update_sleep``, ``smooth.kinematics``, ``smooth.com_pos``,
+  Replaces ``sleep.wake`` + ``sleep.update_sleep_trees``, ``smooth.kinematics``, ``smooth.com_pos``,
   ``smooth.crb``, ``smooth.transmission``, ``fwd_velocity`` (actuator velocity, ``com_vel``, passive
-  forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`.
+  forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`. The body/dof
+  awake arrays are published once, by ``forward_m`` after ``wake_equality``.
   """
   wp.launch(
     _forward_a_kernel(NBODY_CAP, NV_CAP, NU_CAP, NTREE_CAP),
@@ -3045,12 +2993,6 @@ def forward_a(m: Model, d: Data):
     outputs=[
       d.tree_asleep,
       d.tree_awake,
-      d.ntree_awake,
-      d.body_awake,
-      d.body_awake_ind,
-      d.nbody_awake,
-      d.dof_awake_ind,
-      d.nv_awake,
       d.xpos,
       d.xquat,
       d.xmat,
