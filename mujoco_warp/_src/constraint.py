@@ -84,33 +84,21 @@ def _zero_constraint_counts(
 
 
 @wp.func
-def _efc_row(
+def _efc_kbid(
   # Model:
   opt_disableflags: int,
   # In:
-  worldid: int,
   timestep: float,
-  efcid: int,
-  pos_aref: float,
   pos_imp: float,
   invweight: float,
   solref: wp.vec2,
   solimp: vec5,
-  margin: float,
-  vel: float,
-  frictionloss: float,
-  type: int,
-  id: int,
-  # Out:
-  type_out: wp.array2d[int],
-  id_out: wp.array2d[int],
-  pos_out: wp.array2d[float],
-  margin_out: wp.array2d[float],
-  D_out: wp.array2d[float],
-  vel_out: wp.array2d[float],
-  aref_out: wp.array2d[float],
-  frictionloss_out: wp.array2d[float],
-):
+) -> wp.vec4:
+  """Constraint stiffness k, damping b, impedance and diagonal D of one row as (k, b, imp, D).
+
+  Shared by the stock row kernels (``_efc_row``) and the fused per-world constraint assembly
+  (fused_world.py), which evaluates it once per contact instead of once per row.
+  """
   # calculate kbi
   timeconst = solref[0]
   dampratio = solref[1]
@@ -144,8 +132,45 @@ def _efc_row(
   imp = wp.clamp(imp, dmin, dmax)
   imp = wp.where(imp_x > 1.0, dmax, imp)
 
+  D = 1.0 / wp.max(invweight * (1.0 - imp) / imp, types.MJ_MINVAL)
+  return wp.vec4(k, b, imp, D)
+
+
+@wp.func
+def _efc_row(
+  # Model:
+  opt_disableflags: int,
+  # In:
+  worldid: int,
+  timestep: float,
+  efcid: int,
+  pos_aref: float,
+  pos_imp: float,
+  invweight: float,
+  solref: wp.vec2,
+  solimp: vec5,
+  margin: float,
+  vel: float,
+  frictionloss: float,
+  type: int,
+  id: int,
+  # Out:
+  type_out: wp.array2d[int],
+  id_out: wp.array2d[int],
+  pos_out: wp.array2d[float],
+  margin_out: wp.array2d[float],
+  D_out: wp.array2d[float],
+  vel_out: wp.array2d[float],
+  aref_out: wp.array2d[float],
+  frictionloss_out: wp.array2d[float],
+):
+  kbid = _efc_kbid(opt_disableflags, timestep, pos_imp, invweight, solref, solimp)
+  k = kbid[0]
+  b = kbid[1]
+  imp = kbid[2]
+
   # set outputs
-  D_out[worldid, efcid] = 1.0 / wp.max(invweight * (1.0 - imp) / imp, types.MJ_MINVAL)
+  D_out[worldid, efcid] = kbid[3]
   vel_out[worldid, efcid] = vel
   aref_out[worldid, efcid] = -k * imp * pos_aref - b * vel
   pos_out[worldid, efcid] = pos_aref + margin

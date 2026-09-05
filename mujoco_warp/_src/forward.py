@@ -1374,12 +1374,13 @@ def _forward_fused(m: Model, d: Data, finalize: bool):
   """Forward dynamics with the per-world fused smooth stages (see fused_world.fused_world)."""
   # sleep.wake/update_sleep, fwd_position (kinematics, com_pos, crb, transmission), fwd_velocity
   # and fwd_actuation: none of them depend on the constraint set, so they precede make_constraint
-  fused_world.forward_a(m, d)
+  groups = fused_world.contact_groups(d)
+  fused_world.forward_a(m, d, groups)
   if m.ncam or m.nlight:
     smooth.camlight(m, d)
 
   # make_constraint, wake_equality, update_sleep and island discovery
-  fused_world.forward_m(m, d)
+  fused_world.forward_m(m, d, groups)
 
   # position and velocity sensors only read data published by forward_a
   d.sensordata.zero_()
