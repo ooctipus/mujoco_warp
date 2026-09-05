@@ -24,24 +24,29 @@ pyramidal piecewise-quadratic problem per component with semismooth Newton steps
 on the active set (``q -= H^-1 grad`` with ``H = M + J^T D_active J``), which is the
 active-set fixed point written as a residual correction.
 
-Components are solved warp-synchronously (no block-wide barriers between rounds):
-warps pull components from a work-ordered list. Rows of components with up to 16 DOFs
-are written once (phase 0) as dense records to a per-world scratch and then read with
-one coalesced load level per round. Components with up to 6 DOFs (free bodies) keep
-their rows in registers, reduce the packed 6x6 Hessian with xor-butterfly shuffles and
-every lane factors and solves it redundantly in registers. Components with 7..16 DOFs
-stage 32-row tiles in per-warp shared memory (resident when the component fits one
-tile), accumulate packed Hessian entries per lane and factor with a lane-per-row packed
-Cholesky in registers; 17..32 DOFs stage 17-row tiles from a second (wide) record
-scratch and accumulate lane-owned Hessian rows.
+Components with up to 16 DOFs are solved warp-synchronously (no block-wide barriers
+between rounds): warps pull them from a work-ordered list. Their rows are written once
+(phase 0) as dense records to a per-world scratch and then read with one coalesced load
+level per round. Components with up to 6 DOFs (free bodies) keep their rows in
+registers, reduce the packed 6x6 Hessian with xor-butterfly shuffles and every lane
+factors and solves it redundantly in registers. Components with 7..16 DOFs stage 32-row
+tiles in per-warp shared memory (resident when the component fits one tile) and
+accumulate packed Hessian entries per lane; up to 9 DOFs every lane then gathers the
+whole packed Hessian and factors and solves it redundantly in registers (no dependent
+shuffle chains), 10..16 DOFs factor with a lane-per-row packed Cholesky in registers.
+Components with 17..32 DOFs run on a two-warp group (named barrier) while the other warps
+pull the warp-local components: their rows (from a second, wide record scratch) are
+staged into the group's pooled arenas (resident when they fit), every group thread
+accumulates its live packed Hessian entries over the staged rows into a packed Hessian in
+shared memory, and warp 0 factors it with a lane-per-row register Cholesky and solves it.
 
 Every iterate is certified with the history-free clauses of ``solver._solve_done``
 (rescaled gradient or half Newton decrement below ``d.ctol`` with
 ``_rescale(nvmax_pad, meaninertia)``), so a certified world stops at a point at which
 the stock solver would also have stopped. Uncertified worlds and worlds that exceed
 the compile-time capacities (component DOFs > 32, active DOFs > 128, rows > 1024, more
-than 256 rows in 17..32 DOF components, ``nf > 0``) are flagged in ``stock_world`` and counted in ``nstock`` for the stock
-fallback.
+than 256 rows in 17..32 DOF components, ``nf > 0``) are flagged in ``stock_world`` and
+counted in ``nstock`` for the stock fallback.
 
 All reductions run in a fixed order (stable row bucketing, fixed lane-to-row
 assignment, xor-butterfly shuffles), so outputs are replay-stable for identical inputs.
@@ -61,11 +66,13 @@ DENSE_ROW_FLOATS = 20
 WIDE_ROW_CAP = 256
 WIDE_ROW_FLOATS = 36
 LIGHT_DOF_CAP = 6
+REGISTER_FACTOR_DOF_CAP = 9
 COMP_DOF_CAP = 32
 NCDOF_CAP = 128
 NTREE_CAP = 32
 ROUND_CAP = 10
 RESIDENT_ROWS_PER_LANE = 2
+WIDE_GROUP_WARPS = 2
 MIN_BLOCKS_PER_SM = 4
 
 STATUS_CERTIFIED = 0
@@ -84,13 +91,17 @@ _NATIVE_TEMPLATE = r"""
   constexpr int LN = __LN__;                 // light component DOF cap
   constexpr int LP = LN * (LN + 1) / 2;      // packed light Hessian entries
   constexpr int RES = __RES__;               // resident row slots per lane (light path)
-  constexpr int MN = __MN__;                 // mid component DOF cap
+  constexpr int M9 = __M9__;                 // mid components up to M9 DOFs factor redundantly in registers
+  constexpr int MN = __MN__;                 // component DOF cap (wide components: MNS < n <= MN)
   constexpr int MNS = 16;                    // mid components up to MNS DOFs read dense row records
   constexpr int MP = MNS * (MNS + 1) / 2;    // packed per-warp Hessian entries (n <= MNS)
   constexpr int DR4 = __DR4__;               // float4 per dense row record (MNS + D, aref, coef, F)
   constexpr int WIDE_CAP = __WIDE_CAP__;     // rows of 17..32 DOF components per world (compact index)
   constexpr int WR4 = __WR4__;               // float4 per wide row record (MN + D, aref, coef, F)
+  constexpr int WG = __WG__;                 // warps of the wide-component group
+  constexpr int MPW = MN * (MN + 1) / 2;     // packed wide Hessian entries
   constexpr int TILE_FLOATS = 32 * (MNS + 4); // per-warp tile: 32 rows x (MNS + D, aref, coef, F)
+  constexpr int WARP_FLOATS = TILE_FLOATS + 2 * MP + MN;  // per-warp arena: tile, packed M_c, packed H/L, iterate
   constexpr int NCDOF = __NCDOF__;
   constexpr int NTREE = __NTREE__;
   constexpr int NV = __NV__;
@@ -108,11 +119,15 @@ _NATIVE_TEMPLATE = r"""
   static_assert(NTREE <= 32, "island bitsets are 32 wide");
   static_assert(LP <= 32, "light Hessian must fit one entry per lane for the M gather");
   static_assert(LN <= 6, "dense row record holds 6 values + D + aref");
-  static_assert(MN <= 32, "mid components use one lane per DOF");
+  static_assert(LN < M9 && M9 <= MNS, "register-factored mid components read dense row records");
+  static_assert(MN <= 32, "mid and wide components use one lane per DOF");
   static_assert(MNS % 4 == 0 && 4 * DR4 == MNS + 4, "dense record: MNS values + D, aref, coef, F");
   static_assert(MN % 4 == 0 && 4 * WR4 == MN + 4, "wide record: MN values + D, aref, coef, F");
   static_assert(2 * 4 >= LN + 2, "light rows use the first two float4 of the record");
   static_assert(LP + LN <= MP, "light M_c/qfrc scratch fits the per-warp H arena");
+  static_assert(WG >= 1 && WG <= NWARPS, "the wide group is a subset of the CTA's warps");
+  static_assert(TILE_FLOATS % 4 == 0 && MP % 4 == 0 && WARP_FLOATS % 4 == 0, "warp arenas keep float4 alignment");
+  static_assert(WG * WARP_FLOATS >= MPW + MN + 4, "the wide group's pooled arenas hold the packed Hessian and a row");
   const unsigned FULL = 0xffffffffu;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -138,11 +153,12 @@ _NATIVE_TEMPLATE = r"""
   __shared__ float sh_comp_gd[NTREE];
   __shared__ float sh_comp_dec[NTREE];
   __shared__ int sh_flags[8];
-  // ---- shared memory (per warp) ----
-  __shared__ __align__(16) float sh_tile[NWARPS][TILE_FLOATS];
-  __shared__ __align__(16) float sh_Hw[NWARPS][MP];     // mid: packed M_c; light: M_c/qfrc scratch
-  __shared__ __align__(16) float sh_Hacc[NWARPS][MP];   // mid: packed H, then packed L
-  __shared__ float sh_qw[NWARPS][MN];
+  // ---- shared memory (per-warp arenas; the wide group pools those of warps 0..WG-1) ----
+  __shared__ __align__(16) float sh_arena[NWARPS * WARP_FLOATS];
+  float* const wtile = sh_arena + warp * WARP_FLOATS;   // 32 staged rows x (MNS + D, aref, coef, F)
+  float* const wHw = wtile + TILE_FLOATS;               // mid: packed M_c (+ qfrc_smooth); light: M_c/qfrc scratch
+  float* const wHacc = wHw + MP;                        // mid: packed H, then packed L (+ gradient)
+  float* const wqw = wHacc + MP;                        // mid: iterate
   // ---- raw pointers and element strides (all 4-byte element types) ----
   const int* const ne_p = reinterpret_cast<const int*>(ne_in.data);
   const int* const nf_p = reinterpret_cast<const int*>(nf_in.data);
@@ -174,6 +190,7 @@ _NATIVE_TEMPLATE = r"""
   // dense row records (DR4 float4 per row), per world
   float4* const dense4_p = reinterpret_cast<float4*>(dense_rows.data) + (size_t)worldid * ROW_CAP * DR4;
   float4* const wide4_p = reinterpret_cast<float4*>(wide_rows.data) + (size_t)worldid * WIDE_CAP * WR4;
+  float* const wideM_p = reinterpret_cast<float*>(wide_M.data) + (size_t)worldid * MPW;
   float* const qacc_o = reinterpret_cast<float*>(qacc_out.data) + worldid * (qacc_out.strides[0] / 4);
   float* const qfrc_o = reinterpret_cast<float*>(qfrc_constraint_out.data) + worldid * (qfrc_constraint_out.strides[0] / 4);
   float* const force_o = reinterpret_cast<float*>(efc_force_out.data) + worldid * (efc_force_out.strides[0] / 4);
@@ -470,7 +487,7 @@ _NATIVE_TEMPLATE = r"""
     const int sb = sh_comp_begin[c];
     const int nrow = sh_comp_nrow[c];
     const int rb = sh_comp_row_begin[c];
-    float* const Mc = sh_Hw[warp];   // packed M_c (LP entries)
+    float* const Mc = wHw;           // packed M_c (LP entries)
     float* const qs = Mc + LP;       // qfrc_smooth on the component slots
     if (lane < LP) {
       int a = 0;
@@ -723,47 +740,61 @@ _NATIVE_TEMPLATE = r"""
     __syncwarp();
   };
 
-  // ---------------------------------------------------------------- mid path (LN < n <= MNL)
-  // Rows are staged row-major into a shared tile (TS floats per row: j[0..MNL), D, aref,
-  // coef, F). Lane a owns row a of the Hessian / factor in registers: per tile row it reads
-  // the row as float4 broadcasts plus its own column, and accumulates H[a][b] += coef j_a j_b.
-  // The factor is a right-looking packed Cholesky with shuffles; the backward solve reads the
-  // packed L from shared memory. MNL = MNS: dense row records (32-row tiles, per-warp packed
-  // M_c / L); MNL = MN: sparse J (two lanes per row), M from global, L aliased onto the tile.
+  // ---------------------------------------------------------------- mid path (LN < n <= MNS, one warp)
+  // Rows are staged row-major into the warp's shared tile (TS floats per row: j[0..MNS), D,
+  // aref, coef, F); the tile stays staged across rounds when the component fits it. The lane
+  // owns the packed Hessian entries E = lane + 32k (kept as (a << 8) | b) and accumulates
+  // H[a][b] += coef j_a j_b over the tile rows; lane a accumulates the gradient entry a. The
+  // packed M_c lives in the warp's M_c arena, the packed H (then L) in its H arena. Two factor
+  // variants share the staging and the accumulation:
+  //   REG (n <= M9): every lane gathers the whole packed Hessian from the arena and factors and
+  //     solves it redundantly in registers (no dependent shuffle chains);
+  //   lane-per-row (n <= MNS): lane a holds row a of H / L in registers, right-looking packed
+  //     Cholesky with chunked straight-line shuffles, backward solve from the packed L in shared
+  //     memory.
+  // Both apply the same operations in the same order, so the iterate does not depend on the
+  // variant.
   auto mid_component = [&](auto tag, const int c) {
-    constexpr int MNL = (int)sizeof(*tag);
-    constexpr bool DENSE = MNL <= MNS;
-    constexpr int TS = MNL + 4;                       // tile row stride
-    constexpr int TB = (TILE_FLOATS / TS) < 32 ? (TILE_FLOATS / TS) : 32;  // rows per tile
-    constexpr int R4 = TS / 4;                                                // float4 per record / tile row
-    constexpr int MPL = MNL * (MNL + 1) / 2;
-    static_assert(MNL == MNS || MNL == MN, "mid variants: dense records up to MNS, wide records up to MN");
-    static_assert(TS % 4 == 0 && TB >= 1 && TB * TS <= TILE_FLOATS, "tile rows fit the per-warp arena");
-    static_assert(DENSE ? (R4 == DR4) : (R4 == WR4), "tile rows are record copies");
-    static_assert(DENSE ? (MPL <= MP) : (MPL <= TILE_FLOATS), "packed H / L fits its arena");
-    static_assert(TB <= 32, "one lane per tile row");
+    constexpr int MNL = (int)sizeof(*tag);            // Hessian dimension cap of the variant
+    constexpr bool REG = MNL <= M9;
+    constexpr int TS = MNS + 4;                       // tile row stride
+    constexpr int TB = 32;                            // rows per tile
+    constexpr int MPL = MNL * (MNL + 1) / 2;          // packed entries of the variant
+    constexpr int EPLL = (MPL + 31) / 32;             // packed entries per lane
+    constexpr int CH = 4;                             // lane-per-row: straight-line shuffle steps per chunk
+    static_assert(REG || MNL % CH == 0, "the lane-per-row factor chunks tile the row");
+    static_assert(MNL == M9 || MNL == MNS, "mid variants: register factor up to M9, lane-per-row up to MNS");
+    static_assert(TB * TS <= TILE_FLOATS && 4 * DR4 == TS, "tile rows are dense record copies");
+    static_assert(MPL <= MP && (!REG || MPL + MNL <= MP), "packed M_c / H (and the REG vectors) fit the warp arenas");
     const int n = sh_comp_ndof[c];
     const int sb = sh_comp_begin[c];
     const int nrow = sh_comp_nrow[c];
     const int rb = sh_comp_row_begin[c];
     const bool own_row = lane < n;
-    // the single tile stays staged across rounds (the wide variant reuses the tile for L)
-    const bool resident = DENSE && nrow <= TB;
-    float* const tile = sh_tile[warp];
-    float* const Lpk = DENSE ? sh_Hacc[warp] : tile;   // packed L for the backward solve
-    float* const Mpk = sh_Hw[warp];                     // packed M_c (dense variant only)
-    float* const qc = sh_qw[warp];
-    const float4* const rec4 = DENSE ? dense4_p : wide4_p;
-    const int wbeg = DENSE ? 0 : (int)sh_comp_wbegin[c];
-    // packed M_c: lane a gathers its row (b <= a)
-    if (DENSE && own_row) {
-      const int ga = sh_slot_dof[sb + lane];
-      const int rowp = lane * (lane + 1) / 2;
-#pragma unroll 4
-      for (int b = 0; b <= lane; ++b) {
+    const bool resident = nrow <= TB;
+    const int rowp = lane * (lane + 1) / 2;
+    const int np = n * (n + 1) / 2;
+    float* const tile = wtile;
+    float* const Mpk = wHw;                           // packed M_c
+    float* const qsm = Mpk + MPL;                     // REG: qfrc_smooth on the component slots
+    float* const Hpk = wHacc;                         // packed H (lane entries), then packed L (lane-per-row)
+    float* const gsh = Hpk + MPL;                     // REG: gradient J^T f per DOF
+    float* const qc = wqw;                            // iterate (REG: only the initial value)
+    // packed M_c: the lane's entries E = lane + 32k, gathered with one dependent load level
+    int eab[EPLL];
+#pragma unroll
+    for (int k = 0; k < EPLL; ++k) {
+      const int E = lane + 32 * k;
+      int a = (int)((sqrtf(8.0f * (float)E + 1.0f) - 1.0f) * 0.5f);
+      while ((a + 1) * (a + 2) / 2 <= E) ++a;
+      while (a * (a + 1) / 2 > E) --a;
+      const int b = E - a * (a + 1) / 2;
+      eab[k] = (a << 8) | b;
+      if (E < np) {
+        const int ga_ = sh_slot_dof[sb + a];
         const int gb = sh_slot_dof[sb + b];
-        const int elemid = M_elemid_p[max(ga, gb) * s_M_elemid + min(ga, gb)];
-        Mpk[rowp + b] = (elemid >= 0) ? M_p[elemid] : 0.0f;
+        const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
+        Mpk[E] = (elemid >= 0) ? M_p[elemid] : 0.0f;
       }
     }
     float qfs = 0.0f;
@@ -771,84 +802,87 @@ _NATIVE_TEMPLATE = r"""
       const int g = sh_slot_dof[sb + lane];
       qfs = qfrc_smooth_p[g];
       qc[lane] = warmstart ? warm_p[g] : qacc_smooth_p[g];
-    }
-    const int np = n * (n + 1) / 2;
-    // dense variant: this lane owns packed Hessian entries E = lane + 32k, kept as (a << 8) | b
-    // with their M_c values (the sparse variant accumulates lane-owned rows instead and keeps
-    // its register peak low: the whole kernel shares one register budget)
-    constexpr int EPLL = DENSE ? (MPL + 31) / 32 : 1;
-    int eab[EPLL];
-    float mc[EPLL];
-#pragma unroll
-    for (int k = 0; k < EPLL; ++k) {
-      if (!DENSE) break;
-      const int E = lane + 32 * k;
-      int a = (int)((sqrtf(8.0f * (float)E + 1.0f) - 1.0f) * 0.5f);
-      while ((a + 1) * (a + 2) / 2 <= E) ++a;
-      while (a * (a + 1) / 2 > E) --a;
-      const int b = E - a * (a + 1) / 2;
-      eab[k] = (a << 8) | b;
-      float v = 0.0f;
-      if (E < np) {
-        const int ga_ = sh_slot_dof[sb + a];
-        const int gb = sh_slot_dof[sb + b];
-        const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
-        if (elemid >= 0) v = M_p[elemid];
-      }
-      mc[k] = v;
+      if (REG) qsm[lane] = qfs;
     }
     __syncwarp();
-    // stage rows [tb, tb+rows): copy the dense record (j[0..MNL), D, aref) into tile row t;
+    // REG: the iterate is held redundantly in registers (zero beyond n)
+    float q[MNL];
+#pragma unroll
+    for (int i = 0; i < MNL; ++i) q[i] = (REG && i < n) ? qc[i] : 0.0f;
+    // stage rows [tb, tb+rows): copy the dense record (j[0..MNS), D, aref) into tile row t;
     // streamed batches classify straight from the loaded registers (coef, F fill the record)
     auto stage_batch = [&](const int tb, const int rows, const bool classify) {
       const int t = lane;
       if (t < rows) {
         const int r = sh_row_order[rb + tb + t];
-        const int rec = DENSE ? r : (wbeg + tb + t);
-        float4 w[R4];
+        float4 w[DR4];
 #pragma unroll
-        for (int i = 0; i < R4; ++i) w[i] = rec4[R4 * rec + i];
+        for (int i = 0; i < DR4; ++i) w[i] = dense4_p[DR4 * r + i];
         if (classify) {
-          float x = -w[R4 - 1].y;
+          float x = -w[DR4 - 1].y;
 #pragma unroll
           for (int b = 0; b < MNL; ++b) {
             if (b >= n) break;
             const float4 wb = w[b >> 2];
             const float vb = ((b & 3) == 0) ? wb.x : (((b & 3) == 1) ? wb.y : (((b & 3) == 2) ? wb.z : wb.w));
-            x += vb * qc[b];
+            x += vb * (REG ? q[b] : qc[b]);
           }
           const bool quad = (r < ne) || (x < 0.0f);
-          const float Dv = w[R4 - 1].x;
+          const float Dv = w[DR4 - 1].x;
           const float f = quad ? -Dv * x : 0.0f;
-          w[R4 - 1].z = quad ? Dv : 0.0f;
-          w[R4 - 1].w = f;
+          w[DR4 - 1].z = quad ? Dv : 0.0f;
+          w[DR4 - 1].w = f;
           force_o[r] = f;
           state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
         }
         float4* const row4 = reinterpret_cast<float4*>(tile + t * TS);
 #pragma unroll
-        for (int i = 0; i < R4; ++i) row4[i] = w[i];
+        for (int i = 0; i < DR4; ++i) row4[i] = w[i];
       }
       __syncwarp();
     };
-    // classify tile rows at the current q (lane = row): coef = D on QUADRATIC rows, F = -D x;
+    // classify tile rows at the current iterate (lane = row): coef = D on QUADRATIC rows, F = -D x;
     // force/state are published every round (the final round wins)
     auto classify_tile = [&](const int tb, const int rows) {
       if (lane < rows) {
         const int r = sh_row_order[rb + tb + lane];
         float* const row = tile + lane * TS;
-        float x = -row[MNL + 1];
-#pragma unroll 4
-        for (int a = 0; a < n; ++a) x += row[a] * qc[a];
+        float x = -row[MNS + 1];
+#pragma unroll
+        for (int a = 0; a < MNL; ++a) {
+          if (a >= n) break;
+          x += row[a] * (REG ? q[a] : qc[a]);
+        }
         const bool quad = (r < ne) || (x < 0.0f);
-        const float Dv = row[MNL];
+        const float Dv = row[MNS];
         const float f = quad ? -Dv * x : 0.0f;
-        row[MNL + 2] = quad ? Dv : 0.0f;
-        row[MNL + 3] = f;
+        row[MNS + 2] = quad ? Dv : 0.0f;
+        row[MNS + 3] = f;
         force_o[r] = f;
         state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
       }
       __syncwarp();
+    };
+    // xor-butterfly sum over the 32 lanes in the fixed offset order 16, 8, 4, 2, 1 (every lane ends
+    // with the same total); REG replays the same association on a register vector padded with zeros
+    auto butterfly = [&](float v) {
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FULL, v, o);
+      return v;
+    };
+    auto butterfly_reg = [&](const float* v) {
+      float t[32];
+#pragma unroll
+      for (int i = 0; i < 32; ++i) t[i] = (i < MNL) ? v[i] : 0.0f;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        float u[32];
+#pragma unroll
+        for (int i = 0; i < 32; ++i) u[i] = t[i] + t[i ^ o];
+#pragma unroll
+        for (int i = 0; i < 32; ++i) t[i] = u[i];
+      }
+      return t[0];
     };
     stage_batch(0, min(TB, nrow), false);
     float gd = 0.0f;
@@ -857,174 +891,247 @@ _NATIVE_TEMPLATE = r"""
     int rounds = 0;
     float ga = 0.0f;
     for (int round = 0; round < round_cap; ++round) {
-      // mq = M_c q (lane a); packed entries start from M_c
-      float mq = 0.0f;
-      if (own_row) {
-        if (DENSE) {
+      // packed entries start from M_c; lane a accumulates the gradient entry a
+      float hp[EPLL];
+#pragma unroll
+      for (int k = 0; k < EPLL; ++k) {
+        const int E = lane + 32 * k;
+        hp[k] = 0.0f;
+        if (E < np) hp[k] = Mpk[E];
+      }
+      ga = 0.0f;
+      const int trow = own_row ? lane : 0;
+      for (int tb = 0; tb < nrow; tb += TB) {
+        const int rows = min(TB, nrow - tb);
+        if (!resident && !DBG_NO_STAGE) stage_batch(tb, rows, true);
+        if (resident) classify_tile(tb, rows);
+        // H[a][b] += coef j_a j_b over the tile rows (SATISFIED rows carry coef = 0)
+#pragma unroll 4
+        for (int tt = 0; tt < (DBG_NO_ACC ? 0 : rows); ++tt) {
+          const float* const row = tile + tt * TS;
+          const float cf = row[MNS + 2];
+          const float fL = row[MNS + 3];
+#pragma unroll
+          for (int k = 0; k < EPLL; ++k) hp[k] += cf * row[eab[k] >> 8] * row[eab[k] & 255];
+          ga += fL * row[trow];
+        }
+        __syncwarp();
+      }
+      // packed entries -> arena
+#pragma unroll
+      for (int k = 0; k < EPLL; ++k) {
+        const int E = lane + 32 * k;
+        if (E < np) Hpk[E] = hp[k];
+      }
+      if (REG && own_row) gsh[lane] = ga;
+      __syncwarp();
+      bool ok = true;
+      float s_own = 0.0f;
+      float gv = 0.0f;
+      if (REG) {
+        // every lane: the whole packed H (identity padding beyond n) and the gradient
+        // g = M q - qfrc_smooth - J^T f; the diagonal of the factor stores 1/L[p][p]
+        float H[MPL];
+#pragma unroll
+        for (int a = 0; a < MNL; ++a) {
+#pragma unroll
+          for (int b = 0; b <= a; ++b) {
+            const int e = a * (a + 1) / 2 + b;
+            H[e] = (a < n) ? Hpk[e] : ((a == b) ? 1.0f : 0.0f);
+          }
+        }
+        float g[MNL];
+        float s[MNL];
+#pragma unroll
+        for (int a = 0; a < MNL; ++a) {
+          float mq = 0.0f;
+#pragma unroll
+          for (int b = 0; b < MNL; ++b) {
+            if (b >= n) break;
+            const int hi = (a > b) ? a : b;
+            const int lo = (a > b) ? b : a;
+            mq += Mpk[hi * (hi + 1) / 2 + lo] * q[b];
+          }
+          g[a] = (a < n) ? (mq - qsm[a] - gsh[a]) : 0.0f;
+          s[a] = g[a] * g[a];
+        }
+        gd = butterfly_reg(s);
+        // right-looking packed Cholesky in registers (same operation order as the lane-per-row factor)
+#pragma unroll
+        for (int p = 0; p < MNL; ++p) {
+          if (p >= n || DBG_NO_FACTOR) break;
+          const int rp = p * (p + 1) / 2;
+          const float d = H[rp + p];
+          ok = ok && (d > 0.0f) && isfinite(d);
+          const float inv = rsqrtf(d);
+          H[rp + p] = inv;
+#pragma unroll
+          for (int i = p + 1; i < MNL; ++i) {
+            if (i >= n) break;
+            H[i * (i + 1) / 2 + p] *= inv;  // L[i][p]
+          }
+#pragma unroll
+          for (int i = p + 1; i < MNL; ++i) {
+            if (i >= n) break;
+            const int ri = i * (i + 1) / 2;
+#pragma unroll
+            for (int j = p + 1; j <= i; ++j) H[ri + j] -= H[ri + p] * H[j * (j + 1) / 2 + p];
+          }
+        }
+        rounds = round + 1;
+        if (!ok) {
+          status = STATUS_NOT_PD;
+          break;
+        }
+        // forward y = L^-1 g (in place), backward s = L^-T y (in place, descending), sv = s . g
+#pragma unroll
+        for (int i = 0; i < MNL; ++i) {
+          if (i >= n || DBG_NO_FACTOR) break;
+          const int ri = i * (i + 1) / 2;
+          float y = g[i];
+#pragma unroll
+          for (int k = 0; k < i; ++k) y -= H[ri + k] * s[k];
+          s[i] = y * H[ri + i];
+        }
+#pragma unroll
+        for (int i = MNL - 1; i >= 0; --i) {
+          if (i >= n || DBG_NO_FACTOR) continue;
+          const int ri = i * (i + 1) / 2;
+          float y = s[i];
+#pragma unroll
+          for (int j = MNL - 1; j > i; --j) {
+            if (j >= n) continue;
+            y -= H[j * (j + 1) / 2 + i] * s[j];
+          }
+          s[i] = y * H[ri + i];
+        }
+        float sg[MNL];
+#pragma unroll
+        for (int i = 0; i < MNL; ++i) sg[i] = (i < n) ? s[i] * g[i] : 0.0f;
+        sv = butterfly_reg(sg);
+        const bool finite_ok = isfinite(gd) && isfinite(sv);
+        const float grad_r = sqrtf(gd) / scale;
+        const float mi_r = 0.5f * sv / scale;
+        const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
+        const bool last = (round + 1 >= round_cap);
+        if (!finite_ok) {
+          status = STATUS_NONFINITE;
+          break;
+        }
+        if (pass || last) break;
+        // semismooth Newton step on the current active set
+#pragma unroll
+        for (int i = 0; i < MNL; ++i) q[i] -= s[i];
+      } else {
+        // lane a owns row a of H in registers (zero beyond the row and beyond n)
+        float Hrow[MNL];
+#pragma unroll
+        for (int b = 0; b < MNL; ++b) Hrow[b] = (own_row && b <= lane) ? Hpk[rowp + b] : 0.0f;
+        __syncwarp();
+        float mq = 0.0f;
+        if (own_row) {
 #pragma unroll 4
           for (int b = 0; b < n; ++b) {
             const int hi = max(lane, b);
             const int lo = min(lane, b);
             mq += Mpk[hi * (hi + 1) / 2 + lo] * qc[b];
           }
-        } else {
-          const int ga_ = sh_slot_dof[sb + lane];
-#pragma unroll 4
-          for (int b = 0; b < n; ++b) {
-            const int gb = sh_slot_dof[sb + b];
-            const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
-            mq += ((elemid >= 0) ? M_p[elemid] : 0.0f) * qc[b];
-          }
         }
-      }
-      float Hrow[MNL];
-      ga = 0.0f;
-      const int trow = own_row ? lane : 0;
-      if (DENSE) {
-        float hp[EPLL];
+        gv = own_row ? (mq - qfs - ga) : 0.0f;
+        // packed Cholesky, lane = row, right-looking; inv_own = 1/L[lane][lane]. The column
+        // shuffles run in chunks of CH straight-line steps (pipelined, bounded register pressure);
+        // every loop has a constant trip count so Hrow stays in registers
+        float inv_own = 0.0f;
 #pragma unroll
-        for (int k = 0; k < EPLL; ++k) hp[k] = mc[k];
-        for (int tb = 0; tb < nrow; tb += TB) {
-          const int rows = min(TB, nrow - tb);
-          if (!resident && !DBG_NO_STAGE) stage_batch(tb, rows, true);
-          if (resident) classify_tile(tb, rows);
-          // H[a][b] += coef j_a j_b over the tile rows (SATISFIED rows carry coef = 0)
-#pragma unroll 4
-          for (int tt = 0; tt < (DBG_NO_ACC ? 0 : rows); ++tt) {
-            const float* const row = tile + tt * TS;
-            const float cf = row[MNL + 2];
-            const float fL = row[MNL + 3];
+        for (int p = 0; p < MNL; ++p) {
+          if (p >= n || DBG_NO_FACTOR) break;
+          const float d = __shfl_sync(FULL, Hrow[p], p);
+          ok = ok && (d > 0.0f) && isfinite(d);
+          const float inv = rsqrtf(d);
+          if (lane == p) inv_own = inv;
+          if (lane > p) Hrow[p] *= inv;  // L[lane][p]
+          const float lp = Hrow[p];
 #pragma unroll
-            for (int k = 0; k < EPLL; ++k) hp[k] += cf * row[eab[k] >> 8] * row[eab[k] & 255];
-            ga += fL * row[trow];
-          }
-          __syncwarp();
-        }
-        // packed entries -> shared -> lane a owns row a in registers
+          for (int jb = 0; jb < MNL; jb += CH) {
+            if (jb + CH <= p + 1) continue;  // chunk at or before the pivot (folded)
+            if (jb >= n) break;
 #pragma unroll
-        for (int k = 0; k < EPLL; ++k) {
-          const int E = lane + 32 * k;
-          if (E < np) Lpk[E] = hp[k];
-        }
-        __syncwarp();
-        const int rowp = lane * (lane + 1) / 2;
-#pragma unroll
-        for (int b = 0; b < MNL; ++b) {
-          if (b >= n) break;
-          Hrow[b] = (own_row && b <= lane) ? Lpk[rowp + b] : 0.0f;
-        }
-        __syncwarp();
-      } else {
-        // wide variant: lane a accumulates its own Hessian row (M row from global)
-#pragma unroll
-        for (int b = 0; b < MNL; ++b) Hrow[b] = 0.0f;
-        if (own_row) {
-          const int ga_ = sh_slot_dof[sb + lane];
-#pragma unroll
-          for (int b = 0; b < MNL; ++b) {
-            if (b >= n) break;
-            if (b <= lane) {
-              const int gb = sh_slot_dof[sb + b];
-              const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
-              Hrow[b] = (elemid >= 0) ? M_p[elemid] : 0.0f;
+            for (int j = jb; j < jb + CH && j < MNL; ++j) {
+              if (j > p) {
+                const float ljp = __shfl_sync(FULL, lp, j);
+                if (j < n && lane >= j) Hrow[j] -= lp * ljp;
+              }
             }
           }
         }
-        for (int tb = 0; tb < nrow; tb += TB) {
-          const int rows = min(TB, nrow - tb);
-          if (!DBG_NO_STAGE) stage_batch(tb, rows, true);
-#pragma unroll 2
-          for (int tt = 0; tt < (DBG_NO_ACC ? 0 : rows); ++tt) {
-            const float* const row = tile + tt * TS;
-            const float ja = row[trow];
-            const float cja = row[MNL + 2] * ja;
-            ga += row[MNL + 3] * ja;
-#pragma unroll
-            for (int b = 0; b < MNL; ++b) {
-              if (b >= n) break;
-              if (b <= lane) Hrow[b] += cja * row[b];
-            }
-          }
-          __syncwarp();
+        rounds = round + 1;
+        if (!ok) {
+          status = STATUS_NOT_PD;
+          break;
         }
-      }
-      const float gv = own_row ? (mq - qfs - ga) : 0.0f;
-      // packed Cholesky, lane = row, right-looking; inv_own = 1/L[lane][lane]
-      bool ok = true;
-      float inv_own = 0.0f;
+        gd = butterfly(gv * gv);
+        // forward: y = L^-1 grad (lane k publishes y_k at step k)
+        float acc = gv;
+        float y_own = 0.0f;
 #pragma unroll
-      for (int p = 0; p < MNL; ++p) {
-        if (p >= n || DBG_NO_FACTOR) break;
-        const float d = __shfl_sync(FULL, Hrow[p], p);
-        ok = ok && (d > 0.0f) && isfinite(d);
-        const float inv = rsqrtf(d);
-        if (lane == p) inv_own = inv;
-        if (lane > p) Hrow[p] *= inv;  // L[lane][p]
-        const float lp = Hrow[p];
-#pragma unroll
-        for (int j = p + 1; j < MNL; ++j) {
-          if (j >= n) break;
-          const float ljp = __shfl_sync(FULL, lp, j);
-          if (lane >= j) Hrow[j] -= lp * ljp;
+        for (int k = 0; k < MNL; ++k) {
+          if (k >= n || DBG_NO_FACTOR) break;
+          const float yk = __shfl_sync(FULL, acc * inv_own, k);
+          if (lane == k) y_own = yk;
+          if (lane > k) acc -= Hrow[k] * yk;
         }
-      }
-      rounds = round + 1;
-      if (!ok) {
-        status = STATUS_NOT_PD;
-        break;
-      }
-      gd = gv * gv;
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) gd += __shfl_xor_sync(FULL, gd, o);
-      // forward: y = L^-1 grad (lane k publishes y_k at step k)
-      float acc = gv;
-      float y_own = 0.0f;
-#pragma unroll
-      for (int k = 0; k < MNL; ++k) {
-        if (k >= n || DBG_NO_FACTOR) break;
-        const float yk = __shfl_sync(FULL, acc * inv_own, k);
-        if (lane == k) y_own = yk;
-        if (lane > k) acc -= Hrow[k] * yk;
-      }
-      // packed L to shared (own row) for the backward solve
-      {
-        const int rowp = lane * (lane + 1) / 2;
+        // packed L to shared (own row) for the backward solve
 #pragma unroll
         for (int b = 0; b < MNL; ++b) {
-          if (b >= n) break;
-          if (own_row && b <= lane) Lpk[rowp + b] = Hrow[b];
+          if (own_row && b <= lane) Hpk[rowp + b] = Hrow[b];
         }
-      }
-      __syncwarp();
-      // backward: s = L^-T y (L[j][lane] from the shared packed copy)
-      acc = y_own;
-      float s_own = 0.0f;
-      for (int j = (DBG_NO_FACTOR ? -1 : n - 1); j >= 0; --j) {
-        const float sj = __shfl_sync(FULL, acc * inv_own, j);
-        if (lane == j) s_own = sj;
-        if (lane < j) acc -= Lpk[j * (j + 1) / 2 + lane] * sj;
-      }
-      sv = s_own * gv;
+        __syncwarp();
+        // backward: s = L^-T y (L[j][lane] from the shared packed copy, loaded CH steps ahead of
+        // the shuffle chain)
+        acc = y_own;
 #pragma unroll
-      for (int o = 16; o > 0; o >>= 1) sv += __shfl_xor_sync(FULL, sv, o);
-      const bool finite_ok = isfinite(gd) && isfinite(sv);
-      const float grad_r = sqrtf(gd) / scale;
-      const float mi_r = 0.5f * sv / scale;
-      const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
-      const bool last = (round + 1 >= round_cap);
-      if (!finite_ok) {
-        status = STATUS_NONFINITE;
-        break;
+        for (int jb = MNL - CH; jb >= 0; jb -= CH) {
+          if (jb >= n) continue;  // chunk beyond n
+          float lj[CH];
+#pragma unroll
+          for (int i = 0; i < CH; ++i) {
+            const int j = jb + i;
+            lj[i] = (j < n && own_row && lane < j) ? Hpk[j * (j + 1) / 2 + lane] : 0.0f;
+          }
+#pragma unroll
+          for (int i = CH - 1; i >= 0; --i) {
+            const int j = jb + i;
+            const bool live = (j < n) && !DBG_NO_FACTOR;
+            const float sj = __shfl_sync(FULL, acc * inv_own, j);
+            if (live && lane == j) s_own = sj;
+            if (live && lane < j) acc -= lj[i] * sj;
+          }
+        }
+        sv = butterfly(s_own * gv);
+        const bool finite_ok = isfinite(gd) && isfinite(sv);
+        const float grad_r = sqrtf(gd) / scale;
+        const float mi_r = 0.5f * sv / scale;
+        const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
+        const bool last = (round + 1 >= round_cap);
+        if (!finite_ok) {
+          status = STATUS_NONFINITE;
+          break;
+        }
+        if (pass || last) break;
+        // semismooth Newton step on the current active set
+        __syncwarp();
+        if (own_row) qc[lane] -= s_own;
+        __syncwarp();
       }
-      if (pass || last) break;
-      // semismooth Newton step on the current active set
-      __syncwarp();
-      if (own_row) qc[lane] -= s_own;
-      __syncwarp();
     }
     // force/state were stored by the last round's classification (the final iterate)
     if (own_row) {
-      sh_q[sb + lane] = qc[lane];
+      float qv = qc[lane];
+      if (REG) {
+#pragma unroll
+        for (int i = 0; i < MNL; ++i) qv = (lane == i) ? q[i] : qv;
+      }
+      sh_q[sb + lane] = qv;
       sh_qfrc[sb + lane] = ga;
     }
     if (lane == 0) {
@@ -1036,7 +1143,296 @@ _NATIVE_TEMPLATE = r"""
     __syncwarp();
   };
 
-  // ---------------------------------------------------------------- phase 1: warps pull components
+  // ---------------------------------------------------------------- wide path (MNS < n <= MN, WG warps)
+  // Warps 0..WG-1 form a group (named barrier 1) that solves the wide components while the other
+  // warps pull warp-local components. The group's warp arenas are pooled: the packed Hessian (M_c
+  // at the start of a round, then H, then L) at the front, staged rows (WR4 float4 each) behind it;
+  // components whose rows fit stay staged across rounds and are reclassified in place. Group
+  // thread t owns the packed entries E = t + WT k below np (their M_c values in a per-world
+  // scratch, reloaded every round in flight with the row loads) and sweeps every staged row, so
+  // H is complete without a reduction. Warp 0 owns lane = DOF: M_c q from the arena before the sweep, then the
+  // right-looking packed Cholesky with lane = row in registers (straight-line shuffles, as in the
+  // mid path), the shuffle solves, the certificate and the step.
+  auto wide_component = [&](const int c) {
+    constexpr int WT = 32 * WG;                                 // group threads
+    constexpr int TS = MN + 4;                                  // staged row stride
+    constexpr int POOL = WG * WARP_FLOATS - MPW;                // pooled floats behind the packed Hessian
+    constexpr int WCH = (POOL / TS) < WT ? (POOL / TS) : WT;    // rows staged per pass
+    constexpr int EPT = (MPW + WT - 1) / WT;                    // packed entries per thread (cap)
+    constexpr int CH = 4;                                       // straight-line shuffle steps per chunk
+    static_assert(4 * WR4 == TS && MN % CH == 0, "staged rows are wide record copies; chunks tile the row");
+    static_assert(MPW % 4 == 0 && WCH >= 1, "the pool holds at least one float4-aligned staged row");
+    auto group_sync = [&]() { asm volatile("bar.sync 1, %0;" : : "r"(WT) : "memory"); };
+    const int n = sh_comp_ndof[c];
+    const int sb = sh_comp_begin[c];
+    const int nrow = sh_comp_nrow[c];
+    const int rb = sh_comp_row_begin[c];
+    const int wbeg = sh_comp_wbegin[c];
+    const int np = n * (n + 1) / 2;
+    const bool own_row = lane < n;                              // warp 0: lane = DOF
+    const int rowp = lane * (lane + 1) / 2;
+    const bool resident = nrow <= WCH;
+    float* const Hpk = sh_arena;                                // packed M_c / H / L of the component
+    float* const pool = sh_arena + MPW;                         // staged rows
+    float* const qc = sh_q + sb;                                // iterate in the world slots
+    // the thread's packed entries E = tid + WT k, k < kmax (E < np); (a, b) is decoded from E where
+    // needed (no loop-carried table: registers are the wide path's scarce resource) and the M_c
+    // values go to the world's scratch once (the same thread reads them back every round)
+    const int kmax = (np - tid + WT - 1) / WT;
+    auto packed_ab = [&](const int E, int& a, int& b) {
+      a = (int)((sqrtf(8.0f * (float)E + 1.0f) - 1.0f) * 0.5f);
+      while ((a + 1) * (a + 2) / 2 <= E) ++a;
+      while (a * (a + 1) / 2 > E) --a;
+      b = E - a * (a + 1) / 2;
+    };
+#pragma unroll
+    for (int k = 0; k < EPT; ++k) {
+      if (k >= kmax) break;
+      const int E = tid + WT * k;
+      int a, b;
+      packed_ab(E, a, b);
+      const int ga_ = sh_slot_dof[sb + a];
+      const int gb = sh_slot_dof[sb + b];
+      const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
+      wideM_p[E] = (elemid >= 0) ? M_p[elemid] : 0.0f;
+    }
+    float qfs = 0.0f;
+    if (warp == 0 && own_row) {
+      const int g = sh_slot_dof[sb + lane];
+      qfs = qfrc_smooth_p[g];
+      qc[lane] = warmstart ? warm_p[g] : qacc_smooth_p[g];
+    }
+    if (tid == 0) sh_flags[4] = 0;  // warp 0's round decision for the group
+    // classify row r (record w) at the current iterate: coef = D on QUADRATIC rows, F = -D x;
+    // force/state are published every round (the final round wins)
+    auto classify_row = [&](const int r, float4* const w) {
+      float x = -w[WR4 - 1].y;
+#pragma unroll
+      for (int b = 0; b < MN; ++b) {
+        if (b >= n) break;
+        const float4 wb = w[b >> 2];
+        const float vb = ((b & 3) == 0) ? wb.x : (((b & 3) == 1) ? wb.y : (((b & 3) == 2) ? wb.z : wb.w));
+        x += vb * qc[b];
+      }
+      const bool quad = (r < ne) || (x < 0.0f);
+      const float Dv = w[WR4 - 1].x;
+      const float f = quad ? -Dv * x : 0.0f;
+      w[WR4 - 1].z = quad ? Dv : 0.0f;
+      w[WR4 - 1].w = f;
+      force_o[r] = f;
+      state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
+    };
+    group_sync();
+    float gd = 0.0f;
+    float sv = 0.0f;
+    int status = STATUS_CERTIFIED;
+    int rounds = 0;
+    float ga = 0.0f;
+    for (int round = 0; round < round_cap; ++round) {
+      // packed entries start from M_c (scratch loads in flight with the first row loads)
+      float hp[EPT];
+#pragma unroll
+      for (int k = 0; k < EPT; ++k) {
+        hp[k] = 0.0f;
+        if (k < kmax) hp[k] = wideM_p[tid + WT * k];
+      }
+      ga = 0.0f;
+      float mq = 0.0f;
+      const int trow = own_row ? lane : 0;
+      for (int cb = 0; cb < nrow; cb += WCH) {
+        const int cnt = min(WCH, nrow - cb);
+        // thread t stages row cb + t (resident rows after the first round: reclassify in place)
+        if (tid < cnt && !DBG_NO_STAGE) {
+          const int r = sh_row_order[rb + cb + tid];
+          float4* const row4 = reinterpret_cast<float4*>(pool + tid * TS);
+          float4 w[WR4];
+          if (resident && round > 0) {
+#pragma unroll
+            for (int i = 0; i < WR4; ++i) w[i] = row4[i];
+            classify_row(r, w);
+            row4[WR4 - 1] = w[WR4 - 1];
+          } else {
+            const int rec = wbeg + cb + tid;
+#pragma unroll
+            for (int i = 0; i < WR4; ++i) w[i] = wide4_p[WR4 * rec + i];
+            classify_row(r, w);
+#pragma unroll
+            for (int i = 0; i < WR4; ++i) row4[i] = w[i];
+          }
+        }
+        if (cb == 0) {
+          // M_c into the arena for warp 0's M_c q (read before any thread publishes H)
+#pragma unroll
+          for (int k = 0; k < EPT; ++k) {
+            if (k < kmax) Hpk[tid + WT * k] = hp[k];
+          }
+        }
+        group_sync();
+        if (cb == 0 && warp == 0 && own_row) {
+#pragma unroll 4
+          for (int b = 0; b < n; ++b) {
+            const int hi = max(lane, b);
+            const int lo = min(lane, b);
+            mq += Hpk[hi * (hi + 1) / 2 + lo] * qc[b];
+          }
+        }
+        // every group thread sweeps the staged rows for its live packed entries, one entry at a
+        // time (the loads pipeline across rows; SATISFIED rows carry coef = 0); warp 0 lane a
+        // adds F j_a
+#pragma unroll
+        for (int k = 0; k < EPT; ++k) {
+          if (k >= kmax) break;
+          int ea, eb;
+          packed_ab(tid + WT * k, ea, eb);
+          float h = hp[k];
+#pragma unroll 4
+          for (int t = 0; t < (DBG_NO_ACC ? 0 : cnt); ++t) {
+            const float* const row = pool + t * TS;
+            h += row[MN + 2] * row[ea] * row[eb];
+          }
+          hp[k] = h;
+        }
+        if (warp == 0) {
+#pragma unroll 4
+          for (int t = 0; t < (DBG_NO_ACC ? 0 : cnt); ++t) {
+            const float* const row = pool + t * TS;
+            ga += row[MN + 3] * row[trow];
+          }
+        }
+        // the pool is restaged next pass; a single pass orders warp 0's M_c q before the H publish
+        if (cb + WCH < nrow || resident) group_sync();
+      }
+      // H = M_c + J^T D J as packed entries
+#pragma unroll
+      for (int k = 0; k < EPT; ++k) {
+        if (k < kmax) Hpk[tid + WT * k] = hp[k];
+      }
+      group_sync();
+      if (warp == 0) {
+        const float gv = own_row ? (mq - qfs - ga) : 0.0f;
+        // lane a owns row a of H in registers (zero beyond the row and beyond n)
+        float Hrow[MN];
+#pragma unroll
+        for (int b = 0; b < MN; ++b) Hrow[b] = (own_row && b <= lane) ? Hpk[rowp + b] : 0.0f;
+        // packed Cholesky, lane = row, right-looking; inv_own = 1/L[lane][lane]. The column
+        // shuffles run in chunks of CH straight-line steps (pipelined, bounded register pressure);
+        // every loop has a constant trip count so Hrow stays in registers
+        bool ok = true;
+        float inv_own = 0.0f;
+#pragma unroll
+        for (int p = 0; p < MN; ++p) {
+          if (p >= n || DBG_NO_FACTOR) break;
+          const float d = __shfl_sync(FULL, Hrow[p], p);
+          ok = ok && (d > 0.0f) && isfinite(d);
+          const float inv = rsqrtf(d);
+          if (lane == p) inv_own = inv;
+          if (lane > p) Hrow[p] *= inv;  // L[lane][p]
+          const float lp = Hrow[p];
+#pragma unroll
+          for (int jb = 0; jb < MN; jb += CH) {
+            if (jb + CH <= p + 1) continue;  // chunk at or before the pivot (folded)
+            if (jb >= n) break;
+#pragma unroll
+            for (int j = jb; j < jb + CH && j < MN; ++j) {
+              if (j > p) {
+                const float ljp = __shfl_sync(FULL, lp, j);
+                if (j < n && lane >= j) Hrow[j] -= lp * ljp;
+              }
+            }
+          }
+        }
+        rounds = round + 1;
+        int stop = 0;
+        if (!ok) {
+          status = STATUS_NOT_PD;
+          stop = 1;
+        } else {
+          gd = gv * gv;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) gd += __shfl_xor_sync(FULL, gd, o);
+          // forward: y = L^-1 grad (lane k publishes y_k at step k)
+          float acc = gv;
+          float y_own = 0.0f;
+#pragma unroll
+          for (int k = 0; k < MN; ++k) {
+            if (k >= n || DBG_NO_FACTOR) break;
+            const float yk = __shfl_sync(FULL, acc * inv_own, k);
+            if (lane == k) y_own = yk;
+            if (lane > k) acc -= Hrow[k] * yk;
+          }
+          // packed L to the arena (own row) for the backward solve
+#pragma unroll
+          for (int b = 0; b < MN; ++b) {
+            if (own_row && b <= lane) Hpk[rowp + b] = Hrow[b];
+          }
+          __syncwarp();
+          // backward: s = L^-T y (L[j][lane] from the arena, loaded CH steps ahead of the chain)
+          acc = y_own;
+          float s_own = 0.0f;
+#pragma unroll
+          for (int jb = MN - CH; jb >= 0; jb -= CH) {
+            if (jb >= n) continue;  // chunk beyond n
+            float lj[CH];
+#pragma unroll
+            for (int i = 0; i < CH; ++i) {
+              const int j = jb + i;
+              lj[i] = (j < n && own_row && lane < j) ? Hpk[j * (j + 1) / 2 + lane] : 0.0f;
+            }
+#pragma unroll
+            for (int i = CH - 1; i >= 0; --i) {
+              const int j = jb + i;
+              const bool live = (j < n) && !DBG_NO_FACTOR;
+              const float sj = __shfl_sync(FULL, acc * inv_own, j);
+              if (live && lane == j) s_own = sj;
+              if (live && lane < j) acc -= lj[i] * sj;
+            }
+          }
+          sv = s_own * gv;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) sv += __shfl_xor_sync(FULL, sv, o);
+          const bool finite_ok = isfinite(gd) && isfinite(sv);
+          const float grad_r = sqrtf(gd) / scale;
+          const float mi_r = 0.5f * sv / scale;
+          const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
+          const bool last = (round + 1 >= round_cap);
+          if (!finite_ok) {
+            status = STATUS_NONFINITE;
+            stop = 1;
+          } else if (pass || last) {
+            stop = 1;
+          } else {
+            // semismooth Newton step on the current active set
+            __syncwarp();
+            if (own_row) qc[lane] -= s_own;
+          }
+        }
+        if (lane == 0) sh_flags[4] = stop;
+      }
+      group_sync();
+      if (sh_flags[4]) break;
+    }
+    // force/state were stored by the last round's classification; the iterate is already in sh_q
+    if (warp == 0) {
+      if (own_row) sh_qfrc[sb + lane] = ga;
+      if (lane == 0) {
+        sh_comp_status[c] = (unsigned char)status;
+        sh_comp_rounds[c] = (unsigned char)rounds;
+        sh_comp_gd[c] = gd;
+        sh_comp_dec[c] = sv;
+      }
+    }
+    group_sync();
+  };
+
+  // ---------------------------------------------------------------- phase 1a: wide components (group)
+  // warps 0..WG-1 solve the wide components in work order; the other warps start pulling below
+  if (warp < WG) {
+    for (int i = 0; i < ncomp_active; ++i) {
+      const int c = sh_comp_order[i];
+      if ((int)sh_comp_ndof[c] > MNS) wide_component(c);
+    }
+  }
+  // ---------------------------------------------------------------- phase 1b: warps pull the rest
   for (;;) {
     int next = 0;
     if (lane == 0) next = atomicAdd(&sh_flags[3], 1);
@@ -1044,9 +1440,10 @@ _NATIVE_TEMPLATE = r"""
     if (next >= ncomp_active) break;
     const int c = sh_comp_order[next];
     const int nd = sh_comp_ndof[c];
+    if (nd > MNS) continue;
     if (nd <= LN) light_component(c);
-    else if (nd <= MNS) mid_component((char(*)[16])nullptr, c);
-    else mid_component((char(*)[32])nullptr, c);
+    else if (nd <= M9) mid_component((char(*)[M9])nullptr, c);
+    else mid_component((char(*)[MNS])nullptr, c);
   }
   __syncthreads();
 
@@ -1138,6 +1535,8 @@ def _render(nv: int, njmax: int, debug_exit: int = 0) -> str:
     "__DR4__": str(DENSE_ROW_FLOATS // 4),
     "__WIDE_CAP__": str(WIDE_ROW_CAP),
     "__WR4__": str(WIDE_ROW_FLOATS // 4),
+    "__M9__": str(REGISTER_FACTOR_DOF_CAP),
+    "__WG__": str(WIDE_GROUP_WARPS),
     "__MN__": str(COMP_DOF_CAP),
     "__NCDOF__": str(NCDOF_CAP),
     "__NTREE__": str(NTREE_CAP),
@@ -1197,6 +1596,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     qacc_warmstart_in: wp.array2d(dtype=float),
     dense_rows: wp.array3d(dtype=float),
     wide_rows: wp.array3d(dtype=float),
+    wide_M: wp.array2d(dtype=float),
     qacc_out: wp.array2d(dtype=float),
     qfrc_constraint_out: wp.array2d(dtype=float),
     efc_force_out: wp.array2d(dtype=float),
@@ -1244,6 +1644,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     qacc_warmstart_in: wp.array2d(dtype=float),
     dense_rows: wp.array3d(dtype=float),
     wide_rows: wp.array3d(dtype=float),
+    wide_M: wp.array2d(dtype=float),
     qacc_out: wp.array2d(dtype=float),
     qfrc_constraint_out: wp.array2d(dtype=float),
     efc_force_out: wp.array2d(dtype=float),
@@ -1294,6 +1695,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
       qacc_warmstart_in,
       dense_rows,
       wide_rows,
+      wide_M,
       qacc_out,
       qfrc_constraint_out,
       efc_force_out,
@@ -1339,6 +1741,7 @@ class WorldSolverContext:
     world_order: CTA -> world permutation (heavy worlds first)        (nworld,)
     dense_rows: dense row records (j[0..16), D, aref)                  (nworld, ROW_CAP, 20)
     wide_rows: dense records of rows of 17..32 DOF components           (nworld, WIDE_ROW_CAP, 36)
+    wide_M: packed M_c of the 17..32 DOF component being solved         (nworld, 528)
   """
 
   stock_world: wp.array
@@ -1350,6 +1753,7 @@ class WorldSolverContext:
   world_order: wp.array
   dense_rows: wp.array
   wide_rows: wp.array
+  wide_M: wp.array
 
 
 def create_world_solver_context(nworld: int, device=None) -> WorldSolverContext:
@@ -1363,6 +1767,7 @@ def create_world_solver_context(nworld: int, device=None) -> WorldSolverContext:
     world_order=wp.zeros(nworld, dtype=int, device=device),
     dense_rows=wp.empty((nworld, ROW_CAP, DENSE_ROW_FLOATS), dtype=float, device=device),
     wide_rows=wp.empty((nworld, WIDE_ROW_CAP, WIDE_ROW_FLOATS), dtype=float, device=device),
+    wide_M=wp.empty((nworld, COMP_DOF_CAP * (COMP_DOF_CAP + 1) // 2), dtype=float, device=device),
   )
 
 
@@ -1482,6 +1887,7 @@ def launch_world_solver(
       qacc_warmstart,
       ctx.dense_rows,
       ctx.wide_rows,
+      ctx.wide_M,
     ],
     outputs=[
       qacc,

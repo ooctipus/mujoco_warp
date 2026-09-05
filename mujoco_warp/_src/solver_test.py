@@ -15,6 +15,8 @@
 
 """Tests for solver functions."""
 
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -28,6 +30,7 @@ from mujoco_warp import test_data
 from mujoco_warp._src import island
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
+from mujoco_warp._src import world_solver
 
 # tolerance for difference between MuJoCo and MJWarp solver calculations - mostly
 # due to float precision
@@ -1644,6 +1647,29 @@ _COMPACT_SINGLETON_XML = """
 """
 
 
+def _connected_bodies_xml(nbodies: int, contact: bool) -> str:
+  """``nbodies`` free three-sphere bodies joined by connect equalities: one island of 6 * nbodies DOFs.
+
+  With ``contact`` the bodies rest (penetrating) on the plane so the island carries contact rows;
+  otherwise the chain hangs in the air and only the equality rows constrain it. A lone free sphere
+  keeps a second tree outside the chain.
+  """
+  z = 0.08 if contact else 0.5
+  bodies = "".join(
+    f'<body name="b{i}" pos="{0.3 * i} 0 {z}"><freejoint/><geom type="sphere" size=".1"/>'
+    '<geom type="sphere" size=".1" pos="0 .25 0"/><geom type="sphere" size=".1" pos="0 -.25 0"/></body>'
+    for i in range(nbodies)
+  )
+  equalities = "".join(
+    f'<connect body1="b{i}" body2="b{i + 1}" anchor="{0.3 * i + 0.15} 0 {z}"/>' for i in range(nbodies - 1)
+  )
+  return (
+    '<mujoco><option jacobian="sparse" solver="Newton" iterations="50"/><worldbody><geom type="plane" size="5 5 .1"/>'
+    f'{bodies}<body pos="5 0 {z}"><freejoint/><geom type="sphere" size=".1"/></body></worldbody>'
+    f"<equality>{equalities}</equality></mujoco>"
+  )
+
+
 def _put_compact(xml: str, nvmax: int | None = None, sparse: bool = False):
   """Build (mjm, mjd, m, d) with the compact workspace allocated via nvmax.
 
@@ -1768,6 +1794,37 @@ class CompactSolverTest(absltest.TestCase):
     self.assertEqual(d.nsingleton6.numpy()[0], 2)
     for field in ("qpos", "qvel", "qacc"):
       np.testing.assert_allclose(getattr(d, field).numpy(), getattr(baseline_d, field).numpy(), rtol=1e-3, atol=1e-4)
+
+  def test_world_solver_lane_per_row_and_wide_components(self):
+    """Connected free bodies (12, 18 and 30 DOF islands) certify on the world solver and match stock.
+
+    12 DOFs take the lane-per-row mid path, 18 and 30 DOFs the wide (two-warp) path with resident
+    rows (no contacts) and multi-pass staging (contacts).
+    """
+    for nbodies, contact in ((2, True), (3, True), (3, False), (5, True)):
+      with self.subTest(nbodies=nbodies, contact=contact):
+        mjm = mujoco.MjModel.from_xml_string(_connected_bodies_xml(nbodies, contact))
+        mjd = mujoco.MjData(mjm)
+        mjd.qvel[:] = 0.2 * np.sin(np.arange(mjm.nv))
+        mujoco.mj_forward(mjm, mjd)
+        baseline_m, m = mjw.put_model(mjm), mjw.put_model(mjm)
+        baseline_d, d = mjw.put_data(mjm, mjd, nvmax=mjm.nv), mjw.put_data(mjm, mjd, nvmax=mjm.nv)
+        for model in (baseline_m, m):
+          model.opt.enableflags |= types.EnableBit.SLEEP
+
+        mjw.step(baseline_m, baseline_d)
+        with mock.patch.object(solver, "WORLD_SOLVER_ENABLED", True):
+          mjw.step(m, d)
+
+        # the chain is one island of 6 * nbodies DOFs; the world was certified (no stock fallback)
+        tree_island = d.tree_island.numpy()[0]
+        self.assertGreaterEqual(tree_island[0], 0)
+        np.testing.assert_array_equal(tree_island[:nbodies], tree_island[0])
+        ctx = solver._WORLD_SOLVER_CTX[id(d)]
+        self.assertEqual(ctx.status.numpy()[0], world_solver.STATUS_CERTIFIED)
+        self.assertEqual(ctx.nstock.numpy()[0], 0)
+        for field in ("qpos", "qvel", "qacc"):
+          np.testing.assert_allclose(getattr(d, field).numpy(), getattr(baseline_d, field).numpy(), rtol=1e-3, atol=1e-4)
 
   def test_constrained_solve_promoted_singleton_equivalence(self):
     """A singleton folded into the general prefix preserves the Newton solve."""
