@@ -152,61 +152,62 @@ def _dfs_contiguous(body_parentid: np.ndarray) -> bool:
   return True
 
 
-def _static_eligible(m: Model) -> bool:
-  """Structural (model-only) part of the eligibility predicate; evaluated once per model."""
-  if m.nv == 0 or m.ntree == 0 or m.nbody < 2:
+def static_eligible(mjm, m: Model) -> bool:
+  """Structural (model-only) part of the fused-world predicate, evaluated on host data in put_model.
+
+  Args:
+    mjm: The MuJoCo model (host arrays).
+    m: The partially built MJWarp model; its derived scalars and the host ``qLD_block_adr`` layout
+      are read before they are converted to device arrays.
+  """
+  if mjm.nv == 0 or mjm.ntree == 0 or mjm.nbody < 2:
     return False
-  if m.nv > NV_CAP or m.nbody > NBODY_CAP or m.nu > NU_CAP or m.ntree > NTREE_CAP:
+  if mjm.nv > NV_CAP or mjm.nbody > NBODY_CAP or mjm.nu > NU_CAP or mjm.ntree > NTREE_CAP:
     return False
-  if m.ntendon or m.nflex or m.na or m.nhistory or m.nacttrnbody:
+  if mjm.ntendon or mjm.nflex or mjm.na or m.nhistory or m.nacttrnbody:
     return False
-  if m.has_fluid or m.flg_adhesion:
-    return False
-  if not m.is_sparse:
+  if m.has_fluid or m.flg_adhesion or not m.is_sparse:
     return False
 
-  jnt_type = m.jnt_type.numpy()
+  jnt_type = np.asarray(mjm.jnt_type)
   if not np.isin(jnt_type, (JointType.FREE, JointType.HINGE, JointType.SLIDE)).all():
     return False
-  if m.body_jntnum.numpy().max() > 1:
+  if mjm.nbody > 1 and np.asarray(mjm.body_jntnum).max() > 1:
     return False
-  if m.neq and not (m.eq_type.numpy() == EqType.JOINT).all():
+  if mjm.neq and not (np.asarray(mjm.eq_type) == EqType.JOINT).all():
     return False
 
-  if m.nu:
-    trntype = m.actuator_trntype.numpy()
-    if not np.isin(trntype, (TrnType.JOINT, TrnType.JOINTINPARENT)).all():
+  if mjm.nu:
+    if not np.isin(mjm.actuator_trntype, (TrnType.JOINT, TrnType.JOINTINPARENT)).all():
       return False
-    trn_jnt = m.actuator_trnid.numpy()[:, 0]
-    if not np.isin(jnt_type[trn_jnt], (JointType.HINGE, JointType.SLIDE)).all():
+    if not np.isin(jnt_type[np.asarray(mjm.actuator_trnid)[:, 0]], (JointType.HINGE, JointType.SLIDE)).all():
       return False
-    if not (m.actuator_dyntype.numpy() == DynType.NONE).all():
+    if not (np.asarray(mjm.actuator_dyntype) == DynType.NONE).all():
       return False
-    if not np.isin(m.actuator_gaintype.numpy(), (GainType.FIXED, GainType.AFFINE)).all():
+    if not np.isin(mjm.actuator_gaintype, (GainType.FIXED, GainType.AFFINE)).all():
       return False
-    if not np.isin(m.actuator_biastype.numpy(), (BiasType.NONE, BiasType.AFFINE)).all():
+    if not np.isin(mjm.actuator_biastype, (BiasType.NONE, BiasType.AFFINE)).all():
       return False
-    if m.actuator_actearly.numpy().any():
-      return False
-    if m.nJmom < m.nu:
+    if np.asarray(mjm.actuator_actearly).any() or mjm.nJmom < mjm.nu:
       return False
 
-  tree_dofnum = m.tree_dofnum.numpy()
+  tree_dofnum = np.asarray(mjm.tree_dofnum)
   if tree_dofnum.max() > NVTREE_CAP or (tree_dofnum > NVTREE_SMALL).sum() > NBIG_CAP:
     return False
-  if (m.qLD_block_adr.numpy() == Q_LD_BLOCK_SPARSE).any():
+  if (np.asarray(m.qLD_block_adr) == Q_LD_BLOCK_SPARSE).any():
     return False
 
-  return _dfs_contiguous(m.body_parentid.numpy())
+  return _dfs_contiguous(np.asarray(mjm.body_parentid))
 
 
 def fused_world(m: Model, d: Data) -> bool:
   """Return whether the fused per-world forward kernels apply to ``(m, d)``.
 
-  The structural part is cached on the model; option flags and runtime toggles (such as
-  ``sensor_rne_postconstraint``, which Newton flips at runtime) are re-evaluated on every call.
+  The structural part comes from ``m.fused_world_static`` (host data in put_model); option flags and
+  runtime toggles (such as ``sensor_rne_postconstraint``, which Newton flips at runtime) are
+  re-evaluated on every call. Only host state is read, so the predicate is safe under graph capture.
   """
-  if not enabled:
+  if not enabled or not getattr(m, "fused_world_static", False):
     return False
   opt = m.opt
   if opt.solver != SolverType.NEWTON or opt.cone != ConeType.PYRAMIDAL or opt.integrator != IntegratorType.IMPLICITFAST:
@@ -223,12 +224,7 @@ def fused_world(m: Model, d: Data) -> bool:
     return False
   if d.qLD.shape[1] != m.qLD_block_total:
     return False
-
-  cached = m.__dict__.get("_fused_world_static")
-  if cached is None:
-    cached = _static_eligible(m)
-    m.__dict__["_fused_world_static"] = cached
-  return cached
+  return True
 
 
 @cache_kernel

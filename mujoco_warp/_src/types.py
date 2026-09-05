@@ -1444,6 +1444,7 @@ class Model:
     sensor_contact_adr: addresses for contact sensors        (nsensorcontact,)
     sensor_adr_to_contact_adr: map sensor adr to contact adr (nsensor,)
     sensor_rne_postconstraint: evaluate rne_postconstraint
+    fused_world_static: structural part of the fused per-world forward predicate (host, put_model)
     sensor_rangefinder_bodyid: bodyid for rangefinder        (nrangefinder,)
     taxel_vertadr: tactile sensor vertex address             (nsensortaxel,)
     taxel_sensorid: address for tactile sensors
@@ -1930,6 +1931,7 @@ class Model:
   sensor_contact_adr: array("nsensorcontact", int)
   sensor_adr_to_contact_adr: array("nsensor", int)
   sensor_rne_postconstraint: bool
+  fused_world_static: bool
   sensor_rangefinder_bodyid: array("nrangefinder", int)
   taxel_vertadr: array("nsensortaxel", int)
   taxel_sensorid: array("nsensortaxel", int)

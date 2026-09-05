@@ -21,6 +21,7 @@ import mujoco
 import numpy as np
 import warp as wp
 
+from mujoco_warp._src import fused_world
 from mujoco_warp._src import sleep
 from mujoco_warp._src import support
 from mujoco_warp._src import types
@@ -1278,6 +1279,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nflexvert_geom_pair_filtered": len(m.flexvert_geom_pair_filtered),
     }
   )
+  # structural eligibility for the fused per-world forward, from host data (graph-capture safe)
+  m.fused_world_static = fused_world.static_eligible(mjm, m)
   for f in dataclasses.fields(types.Model):
     if warp_util.is_array_spec(f.type):
       batch_size = batch_sizes.get(f.name, 1)
