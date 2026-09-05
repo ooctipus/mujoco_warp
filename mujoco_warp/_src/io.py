@@ -269,7 +269,9 @@ def refresh_gravcomp_bodies(m: types.Model, body_gravcomp: np.ndarray | None = N
   nonzero = nonzero[nonzero > 0]  # world body never carries gravcomp
   m.has_gravcomp = bool(nonzero.size)
   m.ngravcomp = int(nonzero.size)
-  m.gravcomp_bodyid = wp.array(nonzero.astype(np.int32), dtype=int, device=m.body_gravcomp.device if hasattr(m.body_gravcomp, "device") else None)
+  m.gravcomp_bodyid = wp.array(
+    nonzero.astype(np.int32), dtype=int, device=m.body_gravcomp.device if hasattr(m.body_gravcomp, "device") else None
+  )
 
 
 def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) -> types.Model:
@@ -1283,6 +1285,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   )
   # structural eligibility for the fused per-world forward, from host data (graph-capture safe)
   m.fused_world_static = fused_world.static_eligible(mjm, m)
+  m.fused_world_nvtree_max = int(np.max(mjm.tree_dofnum)) if mjm.ntree else 0
   for f in dataclasses.fields(types.Model):
     if warp_util.is_array_spec(f.type):
       batch_size = batch_sizes.get(f.name, 1)
