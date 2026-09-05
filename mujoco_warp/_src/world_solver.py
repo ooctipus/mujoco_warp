@@ -1330,7 +1330,9 @@ class WorldSolverContext:
   Attributes:
     stock_world: 1 if the world must take the stock solve, else 0    (nworld,)
     nstock: number of worlds routed to the stock solve                (1,)
-    nstock_total: cumulative stock-routed worlds over all launches     (1,)
+    nstock_total: stock-routed worlds accumulated over launches (when the
+      context is created under graph capture its zero-init is replayed too, so
+      it counts per replay)                                            (1,)
     status: STATUS_* code per world                                   (nworld,)
     gradient: rescaled gradient norm of the world certificate         (nworld,)
     decrement: rescaled half Newton decrement of the certificate      (nworld,)
