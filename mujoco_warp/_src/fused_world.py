@@ -709,7 +709,12 @@ def _pow2_at_least(n: int) -> int:
 
 
 @cache_kernel
-def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
+def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool):
+  """forward_a kernel factory.
+
+  ``PUBLISH`` compiles the derived publishes in (see ``Option.fused_world_publish_derived``), so the
+  default variant carries no runtime gates.
+  """
   BLOCK = NV
 
   # tile element stores through native snippets: the builtin element assignment embeds a block
@@ -764,7 +769,6 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     nsite: int,
     has_gravcomp: int,
     run_wake: int,
-    publish_derived: int,
     opt_disableflags: int,
     opt_gravity: wp.array[wp.vec3],
     qpos0: wp.array2d[float],
@@ -1161,15 +1165,18 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       _st_q(xquat_out, worldid, tid, xquat)
       xipos_out[worldid, tid] = xipos
       _st_body_v3(mcom_sh, tid, xipos * b_mass)
-      if publish_derived != 0:
+      if PUBLISH:
         _st_m33(xmat_out, worldid, tid, math.quat_to_mat(xquat))
         _st_m33(ximat_out, worldid, tid, math.quat_to_mat(math.mul_quat(xquat, b_iquat)))
         if b_jntnum == 1:
           xanchor_out[worldid, b_jntadr] = xanchor
           xaxis_out[worldid, b_jntadr] = xaxis
     # geom and site frames are derived publishes too
-    ngeom_pub = wp.where(publish_derived != 0, ngeom, 0)
-    nsite_pub = wp.where(publish_derived != 0, nsite, 0)
+    ngeom_pub = int(0)
+    nsite_pub = int(0)
+    if PUBLISH:
+      ngeom_pub = ngeom
+      nsite_pub = nsite
     for geomid in range(tid, ngeom_pub, BLOCK):
       bodyid = g_body
       if geomid != tid:
@@ -1263,7 +1270,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     _sync()
 
     # ---------------------------------------------------------------- P4: crb and M
-    if is_body and publish_derived != 0:
+    if is_body and PUBLISH:
       crb = cinert_sh[tid]
       # the world body never accumulates its children
       if tid > 0:
@@ -1309,7 +1316,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     a_velocity = float(0.0)
     if is_act:
       a_velocity = a_gear * qvel_sh[a_vadr]
-      if publish_derived != 0:
+      if PUBLISH:
         actuator_length_out[worldid, tid] = a_length
         moment_rownnz_out[worldid, tid] = 1
         moment_rowadr_out[worldid, tid] = tid
@@ -1343,11 +1350,11 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       if j_type == JointType.FREE:
         for k in range(3):
           v_own += cdof_sh[b_dofadr + k] * qvel_sh[b_dofadr + k]
-          if publish_derived != 0:
+          if PUBLISH:
             _st_sv(cdof_dot_out, worldid, b_dofadr + k, wp.spatial_vector())
         for k in range(3, 6):
           cdof_dot = math.motion_cross(v_own, cdof_sh[b_dofadr + k])
-          if publish_derived != 0:
+          if PUBLISH:
             _st_sv(cdof_dot_out, worldid, b_dofadr + k, cdof_dot)
           a_own += cdof_dot * qvel_sh[b_dofadr + k]
         for k in range(3, 6):
@@ -1368,7 +1375,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
         p = binfo_sh[p] & 0xFF
       if b_jntnum == 1 and j_type != JointType.FREE:
         cdof_dot = math.motion_cross(cvel, cdof_sh[b_dofadr])
-        if publish_derived != 0:
+        if PUBLISH:
           _st_sv(cdof_dot_out, worldid, b_dofadr, cdof_dot)
         a_own = cdof_dot * qvel_sh[b_dofadr]
       cvel += v_own
@@ -1392,7 +1399,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
       if tid > 0:
         _st_body_sv(cacc_sh, tid, cacc)
       _st_sv(cvel_out, worldid, tid, cvel)
-      if publish_derived != 0:
+      if PUBLISH:
         _st_sv(cacc_out, worldid, tid, cacc)
     _sync()
 
@@ -1461,7 +1468,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
 
       qfrc_gravcomp_out[worldid, tid] = qfrc_gravcomp
       qfrc_passive_out[worldid, tid] = qfrc_passive
-      if publish_derived != 0:
+      if PUBLISH:
         qfrc_spring_out[worldid, tid] = qfrc_spring
         qfrc_damper_out[worldid, tid] = qfrc_damper
         qfrc_adhesion_out[worldid, tid] = 0.0
@@ -1522,7 +1529,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int):
     if is_body:
       # the cvel slot (dead since the traversal) now holds the interaction force
       _st_body_sv(cvel_sh, tid, cfrc)
-      if publish_derived != 0:
+      if PUBLISH:
         _st_sv(cfrc_int_out, worldid, tid, cfrc)
     _sync()
     if is_dof:
@@ -3404,8 +3411,10 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
   """
   if groups is None:
     groups = contact_groups(d)
+  # sensors read the derived fields, so they force the full publish
+  publish = bool(getattr(m.opt, "fused_world_publish_derived", True) or m.nsensor > 0)
   wp.launch(
-    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP),
+    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, publish),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nbody,
@@ -3416,8 +3425,6 @@ def forward_a(m: Model, d: Data, groups: ContactGroups | None = None):
       m.nsite,
       int(m.ngravcomp > 0),
       int(getattr(m.opt, "run_sleep_wake", True)),
-      # sensors read the derived fields, so they force the full publish
-      int(getattr(m.opt, "fused_world_publish_derived", True) or m.nsensor > 0),
       m.opt.disableflags,
       m.opt.gravity,
       m.qpos0,
