@@ -24,15 +24,27 @@ pyramidal piecewise-quadratic problem per component with semismooth Newton steps
 on the active set (``q -= H^-1 grad`` with ``H = M + J^T D_active J``), which is the
 active-set fixed point written as a residual correction.
 
+Components are solved warp-synchronously (no block-wide barriers between rounds):
+warps pull components from a work-ordered list. Rows of components with up to 16 DOFs
+are written once (phase 0) as dense records to a per-world scratch and then read with
+one coalesced load level per round. Components with up to 6 DOFs (free bodies) keep
+their rows in registers, reduce the packed 6x6 Hessian with xor-butterfly shuffles and
+every lane factors and solves it redundantly in registers. Components with 7..16 DOFs
+stage 32-row tiles in per-warp shared memory (resident when the component fits one
+tile), accumulate packed Hessian entries per lane and factor with a lane-per-row packed
+Cholesky in registers; 17..32 DOFs use the same scheme from the sparse Jacobian on a
+block-level scratch (warp 0).
+
 Every iterate is certified with the history-free clauses of ``solver._solve_done``
 (rescaled gradient or half Newton decrement below ``d.ctol`` with
 ``_rescale(nvmax_pad, meaninertia)``), so a certified world stops at a point at which
 the stock solver would also have stopped. Uncertified worlds and worlds that exceed
-the compile-time capacities (component DOFs > 32, active DOFs > 128, ``nf > 0``) are
-flagged in ``stock_world`` and counted in ``nstock`` for the stock fallback.
+the compile-time capacities (component DOFs > 32, active DOFs > 128, rows > 1024,
+``nf > 0``) are flagged in ``stock_world`` and counted in ``nstock`` for the stock
+fallback.
 
-All reductions run in a fixed order (stable row bucketing, thread-per-entry Hessian
-accumulation, warp-0 shuffles), so outputs are replay-stable for identical inputs.
+All reductions run in a fixed order (stable row bucketing, fixed lane-to-row
+assignment, xor-butterfly shuffles), so outputs are replay-stable for identical inputs.
 """
 
 from __future__ import annotations
@@ -43,86 +55,88 @@ import warp as wp
 
 from mujoco_warp._src import types
 
-BLOCK_DIM = 256
-TILE_ROWS = 128
+BLOCK_DIM = 128
+ROW_CAP = 1024
+DENSE_ROW_FLOATS = 20
+LIGHT_DOF_CAP = 6
 COMP_DOF_CAP = 32
 NCDOF_CAP = 128
 NTREE_CAP = 32
 ROUND_CAP = 10
-PACKED_TOTAL_CAP = 640
+RESIDENT_ROWS_PER_LANE = 2
+MIN_BLOCKS_PER_SM = 4
 
 STATUS_CERTIFIED = 0
 STATUS_UNCERTIFIED = 1
 STATUS_NOT_PD = 3
 STATUS_NONFINITE = 4
 # capacity routing sub-codes (>= 20): nisland, friction rows, component DOFs, active DOFs,
-# packed Hessian total, row spanning islands
+# rows, row spanning islands, row nnz
 STATUS_CAPACITY = 20
 
 _NATIVE_TEMPLATE = r"""
 {
   constexpr int BLOCK = __BLOCK__;
-  constexpr int TILE = __TILE__;
-  constexpr int CDOF = __CDOF__;
+  constexpr int NWARPS = BLOCK / 32;
+  constexpr int ROW_CAP = __ROW_CAP__;
+  constexpr int LN = __LN__;                 // light component DOF cap
+  constexpr int LP = LN * (LN + 1) / 2;      // packed light Hessian entries
+  constexpr int RES = __RES__;               // resident row slots per lane (light path)
+  constexpr int MN = __MN__;                 // mid component DOF cap
+  constexpr int MNS = 16;                    // mid components up to MNS DOFs read dense row records
+  constexpr int MP = MNS * (MNS + 1) / 2;    // packed per-warp Hessian entries (n <= MNS)
+  constexpr int DR4 = __DR4__;               // float4 per dense row record (MNS + 2 floats, padded)
+  constexpr int TILE_FLOATS = 32 * (MNS + 4); // per-warp tile: 32 rows x (MNS + D, aref, coef, F)
   constexpr int NCDOF = __NCDOF__;
   constexpr int NTREE = __NTREE__;
-  constexpr int NJMAX = __NJMAX__;
   constexpr int NV = __NV__;
   constexpr int ROUND_CAP = __ROUND_CAP__;
-  constexpr int PACKED_TOTAL = __PACKED_TOTAL__;
   constexpr int DEBUG_EXIT = __DEBUG_EXIT__;
-  constexpr int NNZ_HALF = 8;  // per-thread prefetch depth (two threads per staged row)
-  constexpr int NNZ_PREFETCH = 2 * NNZ_HALF;
+  constexpr int NNZ_CAP = 16;
+  constexpr int NNZ_HALF = NNZ_CAP / 2;
   constexpr int STATE_SATISFIED = __STATE_SATISFIED__;
   constexpr int STATE_QUADRATIC = __STATE_QUADRATIC__;
   constexpr int ROW_NONE = 255;
   constexpr int STATUS_CERTIFIED = 0, STATUS_UNCERTIFIED = 1, STATUS_NOT_PD = 3, STATUS_NONFINITE = 4;
   constexpr int STATUS_CAP_NISLAND = 20, STATUS_CAP_FRICTION = 21, STATUS_CAP_COMP_DOF = 22, STATUS_CAP_NCDOF = 23,
-                STATUS_CAP_PACKED = 24, STATUS_CAP_ROW_ISLANDS = 25, STATUS_CAP_ROW_NNZ = 26;
-  constexpr int NWARPS = BLOCK / 32;
+                STATUS_CAP_ROWS = 24, STATUS_CAP_ROW_ISLANDS = 25, STATUS_CAP_ROW_NNZ = 26;
   static_assert(BLOCK % 32 == 0, "block must be whole warps");
   static_assert(NTREE <= 32, "island bitsets are 32 wide");
-  static_assert(NJMAX + NWARPS * NTREE * 4 + 16 <= TILE * CDOF * 4, "bucketing scratch must fit in the tile arena");
+  static_assert(LP <= 32, "light Hessian must fit one entry per lane for the M gather");
+  static_assert(LN <= 6, "dense row record holds 6 values + D + aref");
+  static_assert(MN <= 32, "mid components use one lane per DOF");
+  static_assert(MNS % 4 == 0 && 4 * DR4 >= MNS + 2, "dense record holds MNS values + D + aref");
+  static_assert(2 * 4 >= LN + 2, "light rows use the first two float4 of the record");
+  static_assert(LP + LN <= MP, "light M_c/qfrc scratch fits the per-warp H arena");
   const unsigned FULL = 0xffffffffu;
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const unsigned lanemask_lt = (1u << lane) - 1u;
 
-  __shared__ __align__(16) float sh_tile_J[TILE * CDOF];
-  __shared__ float sh_tile_F[TILE];
-  __shared__ float sh_H[PACKED_TOTAL];
-  __shared__ unsigned short sh_Melem[PACKED_TOTAL];  // M CSR address per packed entry (0xffff: zero)
-  __shared__ unsigned short sh_entry_ab[PACKED_TOTAL];  // (a << 8) | b
-  __shared__ unsigned char sh_entry_comp[PACKED_TOTAL];
+  // ---- shared memory (block level) ----
+  __shared__ unsigned char sh_row_comp[ROW_CAP];
+  __shared__ unsigned short sh_row_order[ROW_CAP];
+  __shared__ short sh_dof_slot[NV];
+  __shared__ unsigned short sh_slot_dof[NCDOF];
+  __shared__ unsigned char sh_slot_comp[NCDOF];
   __shared__ float sh_q[NCDOF];
   __shared__ float sh_qfrc[NCDOF];
-  __shared__ unsigned char sh_slot_comp[NCDOF];
-  __shared__ unsigned short sh_slot_dof[NCDOF];
-  __shared__ unsigned short sh_row_order[NJMAX];
-  __shared__ short sh_dof_slot[NV];
-  __shared__ signed char sh_tree_comp[NTREE];
   __shared__ unsigned char sh_comp_ndof[NTREE];
   __shared__ unsigned char sh_comp_begin[NTREE];
-  __shared__ short sh_comp_pbegin[NTREE + 1];
-  __shared__ int sh_comp_row_begin[NTREE + 1];
-  __shared__ unsigned short sh_comp_nrow[NTREE];
-  __shared__ int sh_bucket_count[NTREE];
-  __shared__ int sh_bucket_fill[NTREE];
-  __shared__ unsigned char sh_comp_done[NTREE];
   __shared__ unsigned char sh_comp_status[NTREE];
   __shared__ unsigned char sh_comp_rounds[NTREE];
+  __shared__ unsigned char sh_comp_order[NTREE];
+  __shared__ unsigned short sh_comp_nrow[NTREE];
+  __shared__ unsigned short sh_comp_row_begin[NTREE];
+  __shared__ int sh_comp_cnt[NTREE];
   __shared__ float sh_comp_gd[NTREE];
   __shared__ float sh_comp_dec[NTREE];
   __shared__ int sh_flags[8];
-  // per-slot gradient / Newton step alias the tile arena: they are live only between the last
-  // tile of a round and the next round's staging
-  float* const sh_grad = sh_tile_J;
-  float* const sh_s = sh_tile_J + NCDOF;
-  static_assert(2 * NCDOF <= TILE * CDOF, "grad/s alias must fit in the tile arena");
-  // bucketing scratch aliases the tile arena (dead before any tile is staged)
-  unsigned char* const sh_row_comp = reinterpret_cast<unsigned char*>(sh_tile_J);
-  int* const sh_warp_cnt = reinterpret_cast<int*>(sh_tile_J + ((NJMAX + 15) / 16) * 4);
-
+  // ---- shared memory (per warp) ----
+  __shared__ __align__(16) float sh_tile[NWARPS][TILE_FLOATS];
+  __shared__ __align__(16) float sh_Hw[NWARPS][MP];     // mid: packed M_c; light: M_c/qfrc scratch
+  __shared__ __align__(16) float sh_Hacc[NWARPS][MP];   // mid: packed H, then packed L
+  __shared__ float sh_qw[NWARPS][MN];
   // ---- raw pointers and element strides (all 4-byte element types) ----
   const int* const ne_p = reinterpret_cast<const int*>(ne_in.data);
   const int* const nf_p = reinterpret_cast<const int*>(nf_in.data);
@@ -132,7 +146,6 @@ _NATIVE_TEMPLATE = r"""
   const int s_tree_awake = tree_awake_in.strides[0] / 4;
   const int* const tree_island_p = reinterpret_cast<const int*>(tree_island_in.data);
   const int s_tree_island = tree_island_in.strides[0] / 4;
-  const int* const dof_treeid_p = reinterpret_cast<const int*>(dof_treeid.data);
   const int* const tree_dofadr_p = reinterpret_cast<const int*>(tree_dofadr.data);
   const int* const tree_dofnum_p = reinterpret_cast<const int*>(tree_dofnum.data);
   const int* const M_elemid_p = reinterpret_cast<const int*>(M_elemid.data);
@@ -152,6 +165,8 @@ _NATIVE_TEMPLATE = r"""
   const float* const warm_p = reinterpret_cast<const float*>(qacc_warmstart_in.data) + worldid * (qacc_warmstart_in.strides[0] / 4);
   const float* const meaninertia_p = reinterpret_cast<const float*>(stat_meaninertia.data);
   const float* const ctol_p = reinterpret_cast<const float*>(ctol_in.data);
+  // dense row records (DR4 float4 per row), per world
+  float4* const dense4_p = reinterpret_cast<float4*>(dense_rows.data) + (size_t)worldid * ROW_CAP * DR4;
   float* const qacc_o = reinterpret_cast<float*>(qacc_out.data) + worldid * (qacc_out.strides[0] / 4);
   float* const qfrc_o = reinterpret_cast<float*>(qfrc_constraint_out.data) + worldid * (qfrc_constraint_out.strides[0] / 4);
   float* const force_o = reinterpret_cast<float*>(efc_force_out.data) + worldid * (efc_force_out.strides[0] / 4);
@@ -164,6 +179,10 @@ _NATIVE_TEMPLATE = r"""
   float* const gradient_o = reinterpret_cast<float*>(world_gradient_out.data);
   float* const decrement_o = reinterpret_cast<float*>(world_decrement_out.data);
 
+  if (DEBUG_EXIT == 9) {
+    if (tid == 0) status_o[worldid] = 0;
+    return;
+  }
   // stock clamps every row loop to njmax (solver.py: wp.min(nefc, njmax))
   const int nefc = min(nefc_p[worldid], njmax);
   const int ne = ne_p[worldid];
@@ -173,587 +192,846 @@ _NATIVE_TEMPLATE = r"""
   const float ctol = ctol_p[0];
   const float scale = meaninertia * (float)nv_scale;
 
-  // ---------------------------------------------------------------- phase 0: components
-  if (tid < 8) sh_flags[tid] = 0;
-  for (int g = tid; g < NV; g += BLOCK) sh_dof_slot[g] = -1;
-  if (tid < NTREE) {
-    sh_comp_ndof[tid] = 0;
-    sh_comp_begin[tid] = 0;
-    sh_comp_pbegin[tid] = 0;
-    sh_bucket_count[tid] = 0;
-    sh_bucket_fill[tid] = 0;
-    sh_comp_done[tid] = 1;
-    sh_comp_status[tid] = STATUS_CERTIFIED;
-    sh_comp_rounds[tid] = 0;
-    sh_comp_gd[tid] = 0.0f;
-    sh_comp_dec[tid] = 0.0f;
-    signed char comp = -1;
-    if (tid < ntree) {
-      const int awake = tree_awake_p[worldid * s_tree_awake + tid];
-      const int isl = tree_island_p[worldid * s_tree_island + tid];
+  auto route_to_stock = [&](const int status) {
+    if (tid == 0) {
+      stock_o[worldid] = 1;
+      atomicAdd(nstock_o, 1);
+      status_o[worldid] = status;
+      gradient_o[worldid] = 0.0f;
+      decrement_o[worldid] = 0.0f;
+    }
+  };
+
+  // ---------------------------------------------------------------- phase 0a: components (warp 0)
+  if (warp == 0) {
+    if (lane < 8) sh_flags[lane] = 0;
+    sh_comp_cnt[lane] = 0;
+    sh_comp_status[lane] = STATUS_CERTIFIED;
+    sh_comp_rounds[lane] = 0;
+    sh_comp_gd[lane] = 0.0f;
+    sh_comp_dec[lane] = 0.0f;
+    sh_comp_nrow[lane] = 0;
+    sh_comp_row_begin[lane] = 0;
+    int comp = -1;
+    int dnum = 0;
+    int dadr = 0;
+    if (lane < ntree) {
+      const int awake = tree_awake_p[worldid * s_tree_awake + lane];
+      const int isl = tree_island_p[worldid * s_tree_island + lane];
+      dnum = tree_dofnum_p[lane];
+      dadr = tree_dofadr_p[lane];
       // ACTIVE predicate of island._compact_dof_layout / _map_compact_dofs
-      if (awake == 1 && isl >= 0) comp = (signed char)isl;
+      if (awake == 1 && isl >= 0 && isl < NTREE) comp = isl;
     }
-    sh_tree_comp[tid] = comp;
-  }
-  __syncthreads();
-  // per island: active DOF count (thread per island)
-  if (tid < NTREE) {
+    // island DOF count (lane = island) and the tree's DOF offset inside its island
     int nd = 0;
-    if (tid < nisland) {
-      for (int t2 = 0; t2 < ntree; ++t2) {
-        if (sh_tree_comp[t2] == tid) nd += tree_dofnum_p[t2];
-      }
+    int off = 0;
+    for (int t2 = 0; t2 < ntree; ++t2) {
+      const int c2 = __shfl_sync(FULL, comp, t2);
+      const int n2 = __shfl_sync(FULL, dnum, t2);
+      if (c2 == lane) nd += n2;
+      if (t2 < lane && c2 == comp && comp >= 0) off += n2;
     }
-    sh_bucket_count[tid] = nd;  // scratch: island DOF count
-  }
-  __syncthreads();
-  if (tid == 0) {
+    // exclusive prefix of island DOF counts -> component slot begin
+    int incl = nd;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int v = __shfl_up_sync(FULL, incl, o);
+      if (lane >= o) incl += v;
+    }
+    const int begin = incl - nd;
+    const int ncdof = __shfl_sync(FULL, incl, 31);
     int status = STATUS_CERTIFIED;
     if (nisland > NTREE) status = STATUS_CAP_NISLAND;
     if (nf > 0) status = STATUS_CAP_FRICTION;
-    int ncdof = 0;
-    int npacked = 0;
-    int ncomp_active = 0;
-    const int nisl = min(nisland, NTREE);
-    for (int isl = 0; isl < nisl; ++isl) {
-      const int nd = sh_bucket_count[isl];
-      sh_comp_begin[isl] = (unsigned char)min(ncdof, 255);
-      sh_comp_ndof[isl] = (unsigned char)min(nd, 255);
-      sh_comp_pbegin[isl] = (short)min(npacked, 32767);
-      if (nd > CDOF) status = STATUS_CAP_COMP_DOF;
-      if (nd > 0) {
-        ++ncomp_active;
-        sh_comp_done[isl] = 0;
-      }
-      ncdof += nd;
-      npacked += nd * (nd + 1) / 2;
-    }
-    sh_comp_pbegin[nisl] = (short)min(npacked, 32767);
+    if (nefc > ROW_CAP) status = STATUS_CAP_ROWS;
+    if (__any_sync(FULL, nd > MN)) status = STATUS_CAP_COMP_DOF;
     if (ncdof > NCDOF) status = STATUS_CAP_NCDOF;
-    if (npacked > PACKED_TOTAL) status = STATUS_CAP_PACKED;
-    sh_flags[0] = status;
-    sh_flags[1] = ncdof;
-    sh_flags[2] = ncomp_active;
-    sh_flags[3] = npacked;
-  }
-  __syncthreads();
-  // per tree: slot assignment (trees of an island in increasing tree order)
-  if (tid < ntree && sh_flags[0] == STATUS_CERTIFIED) {
-    const int isl = sh_tree_comp[tid];
-    if (isl >= 0) {
-      int offset = 0;
-      for (int t2 = 0; t2 < tid; ++t2) {
-        if (sh_tree_comp[t2] == isl) offset += tree_dofnum_p[t2];
-      }
-      const int base = (int)sh_comp_begin[isl] + offset;
-      const int adr = tree_dofadr_p[tid];
-      const int num = tree_dofnum_p[tid];
-      for (int j = 0; j < num; ++j) {
-        const int slot = base + j;
-        if (slot < NCDOF) {
-          sh_dof_slot[adr + j] = (short)slot;
-          sh_slot_dof[slot] = (unsigned short)adr + (unsigned short)j;
-          sh_slot_comp[slot] = (unsigned char)isl;
+    sh_comp_ndof[lane] = (unsigned char)min(nd, 255);
+    sh_comp_begin[lane] = (unsigned char)min(begin, 255);
+    const int base = __shfl_sync(FULL, begin, (comp >= 0) ? comp : 0) + off;
+    if (status == STATUS_CERTIFIED && lane < ntree) {
+      if (comp >= 0) {
+        for (int j = 0; j < dnum; ++j) {
+          const int slot = base + j;
+          sh_dof_slot[dadr + j] = (short)slot;
+          sh_slot_dof[slot] = (unsigned short)(dadr + j);
+          sh_slot_comp[slot] = (unsigned char)comp;
         }
+      } else {
+        for (int j = 0; j < dnum; ++j) sh_dof_slot[dadr + j] = -1;
       }
     }
-  }
-  if (tid < NTREE) sh_bucket_count[tid] = 0;
-  __syncthreads();
-
-  // row -> component (island of its first active column); all active columns must agree
-  if (sh_flags[0] == STATUS_CERTIFIED) {
-    for (int r = tid; r < nefc; r += BLOCK) {
-      const int nnz = rownnz_p[r];
-      const int adr = rowadr_p[r];
-      if (nnz > NNZ_PREFETCH) sh_flags[0] = STATUS_CAP_ROW_NNZ;
-      int cols[NNZ_PREFETCH];
-#pragma unroll
-      for (int k = 0; k < NNZ_PREFETCH; ++k) cols[k] = (k < nnz) ? colind_p[adr + k] : 0;
-      int comp = ROW_NONE;
-      bool bad = false;
-#pragma unroll
-      for (int k = 0; k < NNZ_PREFETCH; ++k) {
-        if (k < nnz && sh_dof_slot[cols[k]] >= 0) {
-          const int isl = (int)sh_tree_comp[dof_treeid_p[cols[k]]];
-          if (comp == ROW_NONE) comp = isl;
-          else if (isl != comp) bad = true;
-        }
-      }
-      sh_row_comp[r] = (unsigned char)comp;
-      if (comp != ROW_NONE) atomicAdd(&sh_bucket_count[comp], 1);
-      if (bad) sh_flags[0] = STATUS_CAP_ROW_ISLANDS;
+    if (lane == 0) {
+      sh_flags[0] = status;
+      sh_flags[1] = ncdof;
     }
   }
   __syncthreads();
   if (sh_flags[0] != STATUS_CERTIFIED) {
-    if (tid == 0) {
-      stock_o[worldid] = 1;
-      atomicAdd(nstock_o, 1);
-      status_o[worldid] = sh_flags[0];
-      gradient_o[worldid] = 0.0f;
-      decrement_o[worldid] = 0.0f;
-    }
+    route_to_stock(sh_flags[0]);
     return;
   }
   const int ncdof = sh_flags[1];
-  const int ncomp_active = sh_flags[2];
-  const int npacked = sh_flags[3];
-  if (tid == 0) {
-    int acc = 0;
-    for (int isl = 0; isl < nisland; ++isl) {
-      sh_comp_row_begin[isl] = acc;
-      acc += sh_bucket_count[isl];
-    }
-    sh_comp_row_begin[nisland] = acc;
-  }
-  // packed-entry -> component table, M_c blocks, q0
-  for (int E = tid; E < npacked; E += BLOCK) {
-    int c = 0;
-    while (c + 1 < nisland && (int)sh_comp_pbegin[c + 1] <= E) ++c;
-    const int e = E - sh_comp_pbegin[c];
-    int a = (int)((sqrtf(8.0f * (float)e + 1.0f) - 1.0f) * 0.5f);
-    while ((a + 1) * (a + 2) / 2 <= e) ++a;
-    while (a * (a + 1) / 2 > e) --a;
-    const int b = e - a * (a + 1) / 2;
-    sh_entry_comp[E] = (unsigned char)c;
-    sh_entry_ab[E] = (unsigned short)((a << 8) | b);
-    const int sb = sh_comp_begin[c];
-    const int ga = sh_slot_dof[sb + a];
-    const int gb = sh_slot_dof[sb + b];
-    const int elemid = M_elemid_p[max(ga, gb) * s_M_elemid + min(ga, gb)];
-    sh_Melem[E] = elemid >= 0 ? (unsigned short)elemid : (unsigned short)0xffff;
-  }
-  for (int s = tid; s < ncdof; s += BLOCK) {
-    const int g = sh_slot_dof[s];
-    sh_q[s] = warmstart ? warm_p[g] : qacc_smooth_p[g];
+
+  // ---------------------------------------------------------------- phase 0b: row -> component, dense rows
+  // component of a row = island of its first active column; all active columns must agree.
+  // Rows of components with <= MNS DOFs are also written as dense records (DR4 float4 per row:
+  // j[0..n), then D, aref) so the solve rounds read them with one coalesced load level.
+  {
+    auto classify = [&](const int r) {
+      const int nnz = rownnz_p[r];
+      const int adr = rowadr_p[r];
+      if (nnz > NNZ_CAP) sh_flags[0] = STATUS_CAP_ROW_NNZ;
+      const float Dv = D_p[r];
+      const float av = aref_p[r];
+      int cols[NNZ_CAP];
+      float vals[NNZ_CAP];
+#pragma unroll
+      for (int k = 0; k < NNZ_CAP; ++k) {
+        cols[k] = (k < nnz) ? colind_p[adr + k] : 0;
+        vals[k] = (k < nnz) ? J_p[adr + k] : 0.0f;
+      }
+      int slots[NNZ_CAP];
+      int comp = ROW_NONE;
+      bool bad = false;
+#pragma unroll
+      for (int k = 0; k < NNZ_CAP; ++k) {
+        const int s = (k < nnz) ? (int)sh_dof_slot[cols[k]] : -1;
+        slots[k] = s;
+        if (s >= 0) {
+          const int c = sh_slot_comp[s];
+          if (comp == ROW_NONE) comp = c;
+          else if (c != comp) bad = true;
+        }
+      }
+      sh_row_comp[r] = (unsigned char)comp;
+      if (comp != ROW_NONE) {
+        atomicAdd(&sh_comp_cnt[comp], 1);
+        const int nd = sh_comp_ndof[comp];
+        if (nd <= MNS) {
+          const int sb = sh_comp_begin[comp];
+          float jd[MNS];
+#pragma unroll
+          for (int i = 0; i < MNS; ++i) jd[i] = 0.0f;
+          if (nd <= LN) {
+#pragma unroll
+            for (int k = 0; k < NNZ_CAP; ++k) {
+              const int a = slots[k] - sb;
+#pragma unroll
+              for (int i = 0; i < LN; ++i) jd[i] = (slots[k] >= 0 && a == i) ? vals[k] : jd[i];
+            }
+            dense4_p[DR4 * r] = make_float4(jd[0], jd[1], jd[2], jd[3]);
+            dense4_p[DR4 * r + 1] = make_float4(jd[4], jd[5], Dv, av);
+          } else {
+#pragma unroll
+            for (int k = 0; k < NNZ_CAP; ++k) {
+              const int a = slots[k] - sb;
+#pragma unroll
+              for (int i = 0; i < MNS; ++i) jd[i] = (slots[k] >= 0 && a == i) ? vals[k] : jd[i];
+            }
+#pragma unroll
+            for (int i = 0; i < MNS / 4; ++i) dense4_p[DR4 * r + i] = make_float4(jd[4 * i], jd[4 * i + 1], jd[4 * i + 2], jd[4 * i + 3]);
+            dense4_p[DR4 * r + MNS / 4] = make_float4(Dv, av, 0.0f, 0.0f);
+          }
+        }
+      }
+      if (bad) sh_flags[0] = STATUS_CAP_ROW_ISLANDS;
+    };
+    for (int r = tid; r < nefc; r += BLOCK) classify(r);
   }
   __syncthreads();
-  // stable bucketing: rows keep their efc order inside each component
-  for (int base = 0; base < nefc; base += BLOCK) {
-    for (int i = tid; i < NWARPS * NTREE; i += BLOCK) sh_warp_cnt[i] = 0;
-    __syncthreads();
-    const int r = base + tid;
-    const int comp = (r < nefc) ? (int)sh_row_comp[r] : ROW_NONE;
-    const unsigned peers = __match_any_sync(FULL, comp);
-    const int rank = __popc(peers & lanemask_lt);
-    if (comp != ROW_NONE && rank == 0) sh_warp_cnt[warp * NTREE + comp] = __popc(peers);
-    __syncthreads();
-    if (comp != ROW_NONE) {
-      int off = sh_comp_row_begin[comp] + sh_bucket_fill[comp] + rank;
-      for (int w2 = 0; w2 < warp; ++w2) off += sh_warp_cnt[w2 * NTREE + comp];
-      sh_row_order[off] = (unsigned short)r;
-    }
-    __syncthreads();
-    if (tid < NTREE) {
-      int tot = 0;
-      for (int w2 = 0; w2 < NWARPS; ++w2) tot += sh_warp_cnt[w2 * NTREE + tid];
-      sh_bucket_fill[tid] += tot;
-    }
-    __syncthreads();
+  if (sh_flags[0] != STATUS_CERTIFIED) {
+    route_to_stock(sh_flags[0]);
+    return;
   }
 
-  if (DEBUG_EXIT == 1) { if (tid == 0) status_o[worldid] = 0; return; }
-  // ---------------------------------------------------------------- phase 1: all components per round
-  const float comp_tol = ctol / (float)max(ncomp_active, 1);
-  if (tid < NTREE) {
-    sh_comp_nrow[tid] = (tid < nisland) ? (unsigned short)(sh_comp_row_begin[tid + 1] - sh_comp_row_begin[tid]) : 0;
-  }
-  if (tid == 0) {
-    sh_flags[4] = sh_comp_row_begin[nisland];
-    sh_flags[5] = 0;
+  // ---------------------------------------------------------------- phase 0c: component order (warp 0)
+  if (warp == 0) {
+    const int c = lane;
+    const int nrow = (c < nisland) ? sh_comp_cnt[c] : 0;
+    const int nd = (c < nisland) ? (int)sh_comp_ndof[c] : 0;
+    const bool active = nd > 0;
+    // rows keep island order: exclusive prefix of row counts
+    int incl = nrow;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int v = __shfl_up_sync(FULL, incl, o);
+      if (lane >= o) incl += v;
+    }
+    const int rbegin = incl - nrow;
+    // work-ordered list: heavier components first (LPT-style pull by the warps)
+    const int key = active ? (nrow * (nd * (nd + 1) / 2) + 1) : 0;
+    int rank = 0;
+    for (int c2 = 0; c2 < 32; ++c2) {
+      const int k2 = __shfl_sync(FULL, key, c2);
+      if (k2 > key || (k2 == key && c2 < lane)) ++rank;
+    }
+    const unsigned act_mask = __ballot_sync(FULL, active);
+    sh_comp_nrow[c] = (unsigned short)nrow;
+    sh_comp_row_begin[c] = (unsigned short)rbegin;
+    if (active) sh_comp_order[rank] = (unsigned char)c;
+    if (lane == 0) {
+      sh_flags[2] = __popc(act_mask);
+      sh_flags[3] = 0;  // next component to pull
+    }
   }
   __syncthreads();
-  int nrow_open = sh_flags[4];
-  const int t = tid >> 1;
-  const int half = tid & 1;
-  // registers holding the prefetched row of the tile about to be staged (two threads per row)
-  int pf_r = 0;
-  int pf_nnz = 0;
-  float pf_D = 0.0f;
-  float pf_aref = 0.0f;
-  int pf_cols[NNZ_HALF];
-  float pf_vals[NNZ_HALF];
-  auto prefetch_tile = [&](const int tb_) {
-    const int rows_ = min(TILE, nrow_open - tb_);
-    pf_r = 0;
-    pf_nnz = 0;
-    pf_D = 0.0f;
-    pf_aref = 0.0f;
-#pragma unroll
-    for (int i = 0; i < NNZ_HALF; ++i) {
-      pf_cols[i] = 0;
-      pf_vals[i] = 0.0f;
+  const int ncomp_active = sh_flags[2];
+
+  // ---------------------------------------------------------------- phase 0d: stable bucketing
+  for (int c = warp; c < nisland; c += NWARPS) {
+    const int nrow = sh_comp_nrow[c];
+    if (nrow == 0) continue;
+    const int rb = sh_comp_row_begin[c];
+    int fill = 0;
+    for (int base = 0; base < nefc; base += 32) {
+      const int r = base + lane;
+      const bool mine = (r < nefc) && (sh_row_comp[r] == c);
+      const unsigned m = __ballot_sync(FULL, mine);
+      if (mine) sh_row_order[rb + fill + __popc(m & lanemask_lt)] = (unsigned short)r;
+      fill += __popc(m);
     }
-    if (t < rows_) {
-      pf_r = sh_row_order[tb_ + t];
-      pf_nnz = rownnz_p[pf_r];
-      const int adr = rowadr_p[pf_r];
-      pf_D = D_p[pf_r];
-      pf_aref = aref_p[pf_r];
-      const int k0 = half ? (pf_nnz + 1) / 2 : 0;
-      const int k1 = half ? pf_nnz : (pf_nnz + 1) / 2;
+  }
+  __syncthreads();
+  if (DEBUG_EXIT == 1) {
+    if (tid == 0) status_o[worldid] = 0;
+    return;
+  }
+
+  const float comp_tol = ctol / (float)max(ncomp_active, 1);
+  const int round_cap = ((DEBUG_EXIT & 15) == 3) ? 0 : (((DEBUG_EXIT & 15) == 4) ? 1 : ROUND_CAP);
+  constexpr bool DBG_NO_STAGE = (DEBUG_EXIT & 16) != 0;
+  constexpr bool DBG_NO_ACC = (DEBUG_EXIT & 32) != 0;
+  constexpr bool DBG_NO_FACTOR = (DEBUG_EXIT & 64) != 0;
+
+  // ---------------------------------------------------------------- light path (n <= LN, registers)
+  // One warp per component. Rows are dense records in registers (RES per lane) plus streamed
+  // batches of 32; the packed 6x6 Hessian is reduced with xor-butterfly shuffles and every lane
+  // factors and solves it redundantly in registers.
+  auto light_component = [&](const int c) {
+    const int n = sh_comp_ndof[c];
+    const int sb = sh_comp_begin[c];
+    const int nrow = sh_comp_nrow[c];
+    const int rb = sh_comp_row_begin[c];
+    float* const Mc = sh_Hw[warp];   // packed M_c (LP entries)
+    float* const qs = Mc + LP;       // qfrc_smooth on the component slots
+    if (lane < LP) {
+      int a = 0;
+      while ((a + 1) * (a + 2) / 2 <= lane) ++a;
+      const int b = lane - a * (a + 1) / 2;
+      float v = 0.0f;
+      if (a < n) {
+        const int ga = sh_slot_dof[sb + a];
+        const int gb = sh_slot_dof[sb + b];
+        const int elemid = M_elemid_p[max(ga, gb) * s_M_elemid + min(ga, gb)];
+        if (elemid >= 0) v = M_p[elemid];
+      }
+      Mc[lane] = v;
+    }
+    if (lane < LN) qs[lane] = (lane < n) ? qfrc_smooth_p[sh_slot_dof[sb + lane]] : 0.0f;
+    float q[LN];
 #pragma unroll
-      for (int i = 0; i < NNZ_HALF; ++i) {
-        const int k = k0 + i;
-        pf_cols[i] = (k < k1) ? colind_p[adr + k] : 0;
-        pf_vals[i] = (k < k1) ? J_p[adr + k] : 0.0f;
+    for (int i = 0; i < LN; ++i) {
+      float v = 0.0f;
+      if (i < n) {
+        const int g = sh_slot_dof[sb + i];
+        v = warmstart ? warm_p[g] : qacc_smooth_p[g];
+      }
+      q[i] = v;
+    }
+    // resident rows (fixed lane assignment: row index i*32 + lane)
+    int rr[RES];
+    float jd[RES][LN];
+    float Dd[RES];
+    float ad[RES];
+#pragma unroll
+    for (int i = 0; i < RES; ++i) {
+      const int idx = i * 32 + lane;
+      const int r = (idx < nrow) ? (int)sh_row_order[rb + idx] : -1;
+      rr[i] = r;
+      float4 v0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 v1 = v0;
+      if (r >= 0) {
+        v0 = dense4_p[DR4 * r];
+        v1 = dense4_p[DR4 * r + 1];
+      }
+      jd[i][0] = v0.x; jd[i][1] = v0.y; jd[i][2] = v0.z; jd[i][3] = v0.w;
+      jd[i][4] = v1.x; jd[i][5] = v1.y;
+      Dd[i] = v1.z;
+      ad[i] = v1.w;
+    }
+    __syncwarp();
+    float Hp[LP];
+    float g[LN];
+    float gd = 0.0f;
+    float sv = 0.0f;
+    int status = STATUS_CERTIFIED;
+    int rounds = 0;
+    for (int round = 0; round < round_cap; ++round) {
+      __syncwarp();  // keeps the M_c / qfrc reads below per round (register pressure)
+#pragma unroll
+      for (int e = 0; e < LP; ++e) Hp[e] = 0.0f;
+#pragma unroll
+      for (int a = 0; a < LN; ++a) g[a] = 0.0f;
+      // resident rows: classify at q, accumulate H += D j j^T and J^T f (QUADRATIC rows only)
+#pragma unroll
+      for (int i = 0; i < RES; ++i) {
+        float x = -ad[i];
+#pragma unroll
+        for (int k = 0; k < LN; ++k) x += jd[i][k] * q[k];
+        // _eval_constraint: equality -> QUADRATIC; limit/contact -> QUADRATIC iff jaref < 0
+        const bool quad = (rr[i] >= 0) && ((rr[i] < ne) || (x < 0.0f));
+        const float coef = quad ? Dd[i] : 0.0f;
+        const float f = -coef * x;
+#pragma unroll
+        for (int a = 0; a < LN; ++a) {
+          const float ca = coef * jd[i][a];
+          g[a] += f * jd[i][a];
+#pragma unroll
+          for (int b = 0; b < LN; ++b) {
+            if (b <= a) Hp[a * (a + 1) / 2 + b] += ca * jd[i][b];
+          }
+        }
+      }
+      // streamed rows (components with more than RES*32 rows)
+      for (int base = RES * 32; base < nrow; base += 32) {
+        const int idx = base + lane;
+        const int r = (idx < nrow) ? (int)sh_row_order[rb + idx] : -1;
+        float4 v0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 v1 = v0;
+        if (r >= 0) {
+          v0 = dense4_p[DR4 * r];
+          v1 = dense4_p[DR4 * r + 1];
+        }
+        float js[LN];
+        js[0] = v0.x; js[1] = v0.y; js[2] = v0.z; js[3] = v0.w; js[4] = v1.x; js[5] = v1.y;
+        float x = -v1.w;
+#pragma unroll
+        for (int k = 0; k < LN; ++k) x += js[k] * q[k];
+        const bool quad = (r >= 0) && ((r < ne) || (x < 0.0f));
+        const float coef = quad ? v1.z : 0.0f;
+        const float f = -coef * x;
+#pragma unroll
+        for (int a = 0; a < LN; ++a) {
+          const float ca = coef * js[a];
+          g[a] += f * js[a];
+#pragma unroll
+          for (int b = 0; b < LN; ++b) {
+            if (b <= a) Hp[a * (a + 1) / 2 + b] += ca * js[b];
+          }
+        }
+      }
+      // fixed-order all-reduce: every lane ends with the totals
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+        for (int e = 0; e < LP; ++e) Hp[e] += __shfl_xor_sync(FULL, Hp[e], o);
+#pragma unroll
+        for (int a = 0; a < LN; ++a) g[a] += __shfl_xor_sync(FULL, g[a], o);
+      }
+      // s = M q - qfrc_smooth - J^T f (the gradient; solved in place below);
+      // Hp <- M + J^T D J (identity padding beyond n)
+      float s[LN];
+#pragma unroll
+      for (int a = 0; a < LN; ++a) {
+        float mq = 0.0f;
+#pragma unroll
+        for (int b = 0; b < LN; ++b) {
+          const int hi = (a > b) ? a : b;
+          const int lo = (a > b) ? b : a;
+          mq += Mc[hi * (hi + 1) / 2 + lo] * q[b];
+        }
+        s[a] = (a < n) ? (mq - qs[a] - g[a]) : 0.0f;
+#pragma unroll
+        for (int b = 0; b < LN; ++b) {
+          if (b <= a) {
+            const int e = a * (a + 1) / 2 + b;
+            Hp[e] = (a < n) ? (Mc[e] + Hp[e]) : ((a == b) ? 1.0f : 0.0f);
+          }
+        }
+      }
+      gd = 0.0f;
+#pragma unroll
+      for (int i = 0; i < LN; ++i) gd += s[i] * s[i];
+      // packed Cholesky in registers (all lanes redundantly); the diagonal stores 1/L[p][p]
+      bool ok = true;
+#pragma unroll
+      for (int p = 0; p < LN; ++p) {
+        const int rp = p * (p + 1) / 2;
+        float d = Hp[rp + p];
+#pragma unroll
+        for (int k = 0; k < LN; ++k) {
+          if (k < p) d -= Hp[rp + k] * Hp[rp + k];
+        }
+        ok = ok && (d > 0.0f) && isfinite(d);
+        const float inv = rsqrtf(d);
+        Hp[rp + p] = inv;
+#pragma unroll
+        for (int i = 0; i < LN; ++i) {
+          if (i > p) {
+            const int ri = i * (i + 1) / 2;
+            float v = Hp[ri + p];
+#pragma unroll
+            for (int k = 0; k < LN; ++k) {
+              if (k < p) v -= Hp[ri + k] * Hp[rp + k];
+            }
+            Hp[ri + p] = v * inv;
+          }
+        }
+      }
+      rounds = round + 1;
+      if (!ok) {
+        status = STATUS_NOT_PD;
+        break;
+      }
+      // forward y = L^-1 grad (in place); s^T grad = |y|^2; backward s = L^-T y (in place)
+#pragma unroll
+      for (int i = 0; i < LN; ++i) {
+        const int ri = i * (i + 1) / 2;
+        float y = s[i];
+#pragma unroll
+        for (int k = 0; k < LN; ++k) {
+          if (k < i) y -= Hp[ri + k] * s[k];
+        }
+        s[i] = y * Hp[ri + i];
+      }
+      sv = 0.0f;
+#pragma unroll
+      for (int i = 0; i < LN; ++i) sv += s[i] * s[i];
+#pragma unroll
+      for (int i = LN - 1; i >= 0; --i) {
+        float y = s[i];
+#pragma unroll
+        for (int k = 0; k < LN; ++k) {
+          if (k > i) y -= Hp[k * (k + 1) / 2 + i] * s[k];
+        }
+        s[i] = y * Hp[i * (i + 1) / 2 + i];
+      }
+      const bool finite_ok = isfinite(gd) && isfinite(sv);
+      const float grad_r = sqrtf(gd) / scale;
+      const float mi_r = 0.5f * sv / scale;
+      const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
+      const bool last = (round + 1 >= round_cap);
+      if (!finite_ok) {
+        status = STATUS_NONFINITE;
+        break;
+      }
+      if (pass || last) break;
+      // semismooth Newton step on the current active set
+#pragma unroll
+      for (int i = 0; i < LN; ++i) q[i] -= s[i];
+    }
+    // force/state for every row of the component at the final iterate
+#pragma unroll
+    for (int i = 0; i < RES; ++i) {
+      if (rr[i] >= 0) {
+        float x = -ad[i];
+#pragma unroll
+        for (int k = 0; k < LN; ++k) x += jd[i][k] * q[k];
+        const bool quad = (rr[i] < ne) || (x < 0.0f);
+        force_o[rr[i]] = quad ? -Dd[i] * x : 0.0f;
+        state_o[rr[i]] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
       }
     }
+    for (int base = RES * 32; base < nrow; base += 32) {
+      const int idx = base + lane;
+      if (idx < nrow) {
+        const int r = sh_row_order[rb + idx];
+        const float4 v0 = dense4_p[DR4 * r];
+        const float4 v1 = dense4_p[DR4 * r + 1];
+        const float x = v0.x * q[0] + v0.y * q[1] + v0.z * q[2] + v0.w * q[3] + v1.x * q[4] + v1.y * q[5] - v1.w;
+        const bool quad = (r < ne) || (x < 0.0f);
+        force_o[r] = quad ? -v1.z * x : 0.0f;
+        state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
+      }
+    }
+    if (lane < n) {
+      // select (not index) so q/g stay in registers
+      float qv = 0.0f;
+      float gv = 0.0f;
+#pragma unroll
+      for (int i = 0; i < LN; ++i) {
+        qv = (lane == i) ? q[i] : qv;
+        gv = (lane == i) ? g[i] : gv;
+      }
+      sh_q[sb + lane] = qv;
+      sh_qfrc[sb + lane] = gv;
+    }
+    if (lane == 0) {
+      sh_comp_status[c] = (unsigned char)status;
+      sh_comp_rounds[c] = (unsigned char)rounds;
+      sh_comp_gd[c] = gd;
+      sh_comp_dec[c] = sv;
+    }
+    __syncwarp();
   };
 
-  for (int round = 0; round < ROUND_CAP; ++round) {
-    // drop the rows of components that finished last round (stable, in place)
-    if (sh_flags[5]) {
-      if (tid == 0) {
-        int acc = 0;
-        for (int c = 0; c < nisland; ++c) {
-          sh_bucket_count[c] = acc;  // new row begin
-          if (!sh_comp_done[c]) acc += sh_comp_nrow[c];
-        }
-        sh_flags[4] = acc;
+  // ---------------------------------------------------------------- mid path (LN < n <= MNL)
+  // Rows are staged row-major into a shared tile (TS floats per row: j[0..MNL), D, aref,
+  // coef, F). Lane a owns row a of the Hessian / factor in registers: per tile row it reads
+  // the row as float4 broadcasts plus its own column, and accumulates H[a][b] += coef j_a j_b.
+  // The factor is a right-looking packed Cholesky with shuffles; the backward solve reads the
+  // packed L from shared memory. MNL = MNS: dense row records (32-row tiles, per-warp packed
+  // M_c / L); MNL = MN: sparse J (two lanes per row), M from global, L aliased onto the tile.
+  auto mid_component = [&](auto tag, const int c) {
+    constexpr int MNL = (int)sizeof(*tag);
+    constexpr bool DENSE = MNL <= MNS;
+    constexpr int TS = MNL + 4;                       // tile row stride
+    constexpr int TB = DENSE ? 32 : (TILE_FLOATS / TS);
+    constexpr int MPL = MNL * (MNL + 1) / 2;
+    static_assert(MNL == MNS || MNL == MN, "mid variants: dense records up to MNS, sparse up to MN");
+    static_assert(TS % 4 == 0 && TB >= 1 && TB * TS <= TILE_FLOATS, "tile rows fit the per-warp arena");
+    static_assert(DENSE ? (MPL <= MP) : (MPL <= TILE_FLOATS), "packed H / L fits its arena");
+    static_assert(TB <= 32, "one lane per tile row");
+    const int n = sh_comp_ndof[c];
+    const int sb = sh_comp_begin[c];
+    const int nrow = sh_comp_nrow[c];
+    const int rb = sh_comp_row_begin[c];
+    const bool own_row = lane < n;
+    // the single tile stays staged across rounds (the sparse variant reuses the tile for L)
+    const bool resident = DENSE && nrow <= TB;
+    float* const tile = sh_tile[warp];
+    float* const Lpk = DENSE ? sh_Hacc[warp] : tile;   // packed L for the backward solve
+    float* const Mpk = sh_Hw[warp];                     // packed M_c (dense variant only)
+    float* const qc = sh_qw[warp];
+    // packed M_c: lane a gathers its row (b <= a)
+    if (DENSE && own_row) {
+      const int ga = sh_slot_dof[sb + lane];
+      const int rowp = lane * (lane + 1) / 2;
+#pragma unroll 4
+      for (int b = 0; b <= lane; ++b) {
+        const int gb = sh_slot_dof[sb + b];
+        const int elemid = M_elemid_p[max(ga, gb) * s_M_elemid + min(ga, gb)];
+        Mpk[rowp + b] = (elemid >= 0) ? M_p[elemid] : 0.0f;
       }
-      __syncthreads();
-      for (int base = 0; base < nrow_open; base += BLOCK) {
-        const int i = base + tid;
-        int val = 0;
-        int dst = -1;
-        if (i < nrow_open) {
-          int c = 0;
-          while (c + 1 < nisland && i >= sh_comp_row_begin[c + 1]) ++c;
-          if (!sh_comp_done[c]) {
-            val = sh_row_order[i];
-            dst = sh_bucket_count[c] + (i - sh_comp_row_begin[c]);
+    }
+    float qfs = 0.0f;
+    if (own_row) {
+      const int g = sh_slot_dof[sb + lane];
+      qfs = qfrc_smooth_p[g];
+      qc[lane] = warmstart ? warm_p[g] : qacc_smooth_p[g];
+    }
+    const int np = n * (n + 1) / 2;
+    // dense variant: this lane owns packed Hessian entries E = lane + 32k, kept as (a << 8) | b
+    // with their M_c values (the sparse variant accumulates lane-owned rows instead and keeps
+    // its register peak low: the whole kernel shares one register budget)
+    constexpr int EPLL = DENSE ? (MPL + 31) / 32 : 1;
+    int eab[EPLL];
+    float mc[EPLL];
+#pragma unroll
+    for (int k = 0; k < EPLL; ++k) {
+      if (!DENSE) break;
+      const int E = lane + 32 * k;
+      int a = (int)((sqrtf(8.0f * (float)E + 1.0f) - 1.0f) * 0.5f);
+      while ((a + 1) * (a + 2) / 2 <= E) ++a;
+      while (a * (a + 1) / 2 > E) --a;
+      const int b = E - a * (a + 1) / 2;
+      eab[k] = (a << 8) | b;
+      float v = 0.0f;
+      if (E < np) {
+        const int ga_ = sh_slot_dof[sb + a];
+        const int gb = sh_slot_dof[sb + b];
+        const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
+        if (elemid >= 0) v = M_p[elemid];
+      }
+      mc[k] = v;
+    }
+    __syncwarp();
+    // stage rows [tb, tb+rows) row-major: tile[t * TS + a] = J[row t, slot a]; D, aref, coef, F
+    // follow. Dense streamed batches classify straight from the loaded registers.
+    auto stage_batch = [&](const int tb, const int rows, const bool classify) {
+      if (DENSE) {
+        const int t = lane;
+        if (t < rows) {
+          const int r = sh_row_order[rb + tb + t];
+          float4 w[MNS / 4 + 1];
+#pragma unroll
+          for (int i = 0; i <= MNS / 4; ++i) w[i] = dense4_p[DR4 * r + i];
+          if (classify) {
+            float x = -w[MNS / 4].y;
+#pragma unroll
+            for (int b = 0; b < MNS; ++b) {
+              if (b >= n) break;
+              const float4 wb = w[b >> 2];
+              const float vb = ((b & 3) == 0) ? wb.x : (((b & 3) == 1) ? wb.y : (((b & 3) == 2) ? wb.z : wb.w));
+              x += vb * qc[b];
+            }
+            const bool quad = (r < ne) || (x < 0.0f);
+            const float Dv = w[MNS / 4].x;
+            const float f = quad ? -Dv * x : 0.0f;
+            w[MNS / 4].z = quad ? Dv : 0.0f;
+            w[MNS / 4].w = f;
+            force_o[r] = f;
+            state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
+          }
+          float4* const row4 = reinterpret_cast<float4*>(tile + t * TS);
+#pragma unroll
+          for (int i = 0; i <= MNS / 4; ++i) row4[i] = w[i];
+        }
+      } else {
+        const int t = lane >> 1;
+        const int half = lane & 1;
+        const bool own = t < rows;
+        int r = -1;
+        int nnz = 0;
+        int k0 = 0;
+        int k1 = 0;
+        int cols[NNZ_HALF];
+        float vals[NNZ_HALF];
+        if (own) {
+          r = sh_row_order[rb + tb + t];
+          nnz = rownnz_p[r];
+          const int adr = rowadr_p[r];
+          k0 = half ? (nnz + 1) / 2 : 0;
+          k1 = half ? nnz : (nnz + 1) / 2;
+#pragma unroll
+          for (int i = 0; i < NNZ_HALF; ++i) {
+            const int k = k0 + i;
+            cols[i] = (k < k1) ? colind_p[adr + k] : 0;
+            vals[i] = (k < k1) ? J_p[adr + k] : 0.0f;
+          }
+          if (half == 0) {
+            tile[t * TS + MNL] = D_p[r];
+            tile[t * TS + MNL + 1] = aref_p[r];
+          }
+          for (int a = half; a < n; a += 2) tile[t * TS + a] = 0.0f;
+        } else {
+#pragma unroll
+          for (int i = 0; i < NNZ_HALF; ++i) {
+            cols[i] = 0;
+            vals[i] = 0.0f;
           }
         }
-        __syncthreads();
-        if (dst >= 0) sh_row_order[dst] = (unsigned short)val;
-        __syncthreads();
-      }
-      if (tid < nisland) sh_comp_row_begin[tid] = sh_bucket_count[tid];
-      if (tid == 0) {
-        sh_comp_row_begin[nisland] = sh_flags[4];
-        sh_flags[5] = 0;
-      }
-      __syncthreads();
-      nrow_open = sh_flags[4];
-    }
-    for (int E = tid; E < npacked; E += BLOCK) {
-      const unsigned short me = sh_Melem[E];
-      sh_H[E] = (me != 0xffff) ? M_p[me] : 0.0f;
-    }
-    for (int s = tid; s < ncdof; s += BLOCK) {
-      if (!sh_comp_done[sh_slot_comp[s]]) sh_qfrc[s] = 0.0f;
-    }
-    prefetch_tile(0);
-    __syncthreads();
-
-    // stage rows in tiles (two threads per row): classify at q, dense component-local J scaled
-    // by sqrt(D) (0 for SATISFIED rows) and force / sqrt(D), so H += Jt Jt^T and J^T f = sum Ft Jt
-    for (int tb = 0; tb < nrow_open; tb += TILE) {
-      const int rows = min(TILE, nrow_open - tb);
-      const bool own = t < rows;
-      float* const Jt = sh_tile_J + t * CDOF;
-      const int r = pf_r;
-      const int k0 = half ? (pf_nnz + 1) / 2 : 0;
-      const int k1 = half ? pf_nnz : (pf_nnz + 1) / 2;
-      int slots[NNZ_HALF];
-      float xh = 0.0f;
-      int comp_half = ROW_NONE;
+        __syncwarp();
+        if (own) {
 #pragma unroll
-      for (int i = 0; i < NNZ_HALF; ++i) {
-        const int s = (own && k0 + i < k1) ? (int)sh_dof_slot[pf_cols[i]] : -1;
-        slots[i] = s;
-        if (s >= 0) {
-          comp_half = min(comp_half, (int)sh_slot_comp[s]);
-          xh += pf_vals[i] * sh_q[s];
+          for (int i = 0; i < NNZ_HALF; ++i) {
+            const int s = (k0 + i < k1) ? (int)sh_dof_slot[cols[i]] : -1;
+            if (s >= 0) tile[t * TS + (s - sb)] = vals[i];
+          }
         }
-      }
-      // pair reduction (both halves of a row are adjacent lanes; executed by the whole warp)
-      const int comp = min(comp_half, __shfl_xor_sync(FULL, comp_half, 1));
-      const float x = xh + __shfl_xor_sync(FULL, xh, 1) - pf_aref;
-      int sb = 0;
-      float sd = 0.0f;
-      if (own) {
-        // _eval_constraint: equality -> QUADRATIC; limit/contact -> QUADRATIC iff jaref < 0
-        const bool quad = (r < ne) || (x < 0.0f);
-        sd = quad ? sqrtf(pf_D) : 0.0f;
-        if (comp != ROW_NONE) {
-          sb = sh_comp_begin[comp];
-          const int n = sh_comp_ndof[comp];
-          for (int a = half; a < n; a += 2) Jt[a] = 0.0f;
-        }
-        if (half == 0) sh_tile_F[t] = (quad && sd > 0.0f) ? (-pf_D * x) / sd : 0.0f;
       }
       __syncwarp();
-      if (own && comp != ROW_NONE) {
-#pragma unroll
-        for (int i = 0; i < NNZ_HALF; ++i) {
-          if (slots[i] >= 0) Jt[slots[i] - sb] = pf_vals[i] * sd;
-        }
-      }
-      __syncthreads();
-      // issue the next tile's global loads before this tile's accumulation
-      if (tb + TILE < nrow_open) prefetch_tile(tb + TILE);
-      if (DEBUG_EXIT != 5) {
-        // H += Jt^T Jt: a lane pair per packed entry, each lane summing half of the component's
-        // tile rows; the pair sum is a fixed two-term addition so the result is replay-stable
-        const int npairs = ((2 * npacked + 31) / 32) * 32;
-        for (int E2 = tid; E2 < npairs; E2 += BLOCK) {
-          const int E = E2 >> 1;
-          const int hh = E2 & 1;
-          float acc = 0.0f;
-          bool write = false;
-          if (E < npacked) {
-            const int c = sh_entry_comp[E];
-            if (!sh_comp_done[c]) {
-              const int rb = sh_comp_row_begin[c];
-              const int t0 = max(0, rb - tb);
-              const int t1 = min(rows, rb + (int)sh_comp_nrow[c] - tb);
-              if (t1 > t0) {
-                const int tm = (t0 + t1) >> 1;
-                const int ta = hh ? tm : t0;
-                const int tz = hh ? t1 : tm;
-                const int ab = sh_entry_ab[E];
-                const int a = ab >> 8;
-                const int b = ab & 0xff;
+    };
+    // classify tile rows at the current q (lane = row): coef = D on QUADRATIC rows, F = -D x;
+    // force/state are published every round (the final round wins)
+    auto classify_tile = [&](const int tb, const int rows) {
+      if (lane < rows) {
+        const int r = sh_row_order[rb + tb + lane];
+        float* const row = tile + lane * TS;
+        float x = -row[MNL + 1];
 #pragma unroll 4
-                for (int tt = ta; tt < tz; ++tt) acc += sh_tile_J[tt * CDOF + a] * sh_tile_J[tt * CDOF + b];
-                write = (hh == 0);
-              }
-            }
-          }
-          acc += __shfl_xor_sync(FULL, acc, 1);
-          if (write) sh_H[E] += acc;
-        }
-        // J^T f += Jt^T Ft: a lane pair per active slot
-        const int spairs = ((2 * ncdof + 31) / 32) * 32;
-        for (int S2 = tid; S2 < spairs; S2 += BLOCK) {
-          const int s = S2 >> 1;
-          const int hh = S2 & 1;
-          float acc = 0.0f;
-          bool write = false;
-          if (s < ncdof) {
-            const int c = sh_slot_comp[s];
-            if (!sh_comp_done[c]) {
-              const int rb = sh_comp_row_begin[c];
-              const int t0 = max(0, rb - tb);
-              const int t1 = min(rows, rb + (int)sh_comp_nrow[c] - tb);
-              if (t1 > t0) {
-                const int tm = (t0 + t1) >> 1;
-                const int ta = hh ? tm : t0;
-                const int tz = hh ? t1 : tm;
-                const int a = s - sh_comp_begin[c];
+        for (int a = 0; a < n; ++a) x += row[a] * qc[a];
+        const bool quad = (r < ne) || (x < 0.0f);
+        const float Dv = row[MNL];
+        const float f = quad ? -Dv * x : 0.0f;
+        row[MNL + 2] = quad ? Dv : 0.0f;
+        row[MNL + 3] = f;
+        force_o[r] = f;
+        state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
+      }
+      __syncwarp();
+    };
+    stage_batch(0, min(TB, nrow), false);
+    float gd = 0.0f;
+    float sv = 0.0f;
+    int status = STATUS_CERTIFIED;
+    int rounds = 0;
+    float ga = 0.0f;
+    for (int round = 0; round < round_cap; ++round) {
+      // mq = M_c q (lane a); packed entries start from M_c
+      float mq = 0.0f;
+      if (own_row) {
+        if (DENSE) {
 #pragma unroll 4
-                for (int tt = ta; tt < tz; ++tt) acc += sh_tile_F[tt] * sh_tile_J[tt * CDOF + a];
-                write = (hh == 0);
-              }
-            }
+          for (int b = 0; b < n; ++b) {
+            const int hi = max(lane, b);
+            const int lo = min(lane, b);
+            mq += Mpk[hi * (hi + 1) / 2 + lo] * qc[b];
           }
-          acc += __shfl_xor_sync(FULL, acc, 1);
-          if (write) sh_qfrc[s] += acc;
-        }
-      }
-      __syncthreads();
-    }
-
-    // grad = Ma - qfrc_smooth - J^T force per slot
-    for (int s = tid; s < ncdof; s += BLOCK) {
-      const int c = sh_slot_comp[s];
-      if (sh_comp_done[c]) continue;
-      const int sb = sh_comp_begin[c];
-      const int n = sh_comp_ndof[c];
-      const int pb = sh_comp_pbegin[c];
-      const int a = s - sb;
-      float ma = 0.0f;
-      for (int b = 0; b < n; ++b) {
-        const int hi = max(a, b);
-        const int lo = min(a, b);
-        const unsigned short me = sh_Melem[pb + hi * (hi + 1) / 2 + lo];
-        if (me != 0xffff) ma += M_p[me] * sh_q[sb + b];
-      }
-      sh_grad[s] = ma - qfrc_smooth_p[sh_slot_dof[s]] - sh_qfrc[s];
-    }
-    __syncthreads();
-
-    // per component: factor H, s = H^-1 grad, certificate, Newton step.
-    // Small components (n <= SMALL_N) run fully serial on one lane of the last warp (no warp
-    // syncs, up to 32 components at once); larger ones take a whole warp on the other warps.
-    constexpr int SMALL_N = 9;
-    if (DEBUG_EXIT == 3 || DEBUG_EXIT == 5) {
-      if (tid < nisland) {
-        sh_comp_done[tid] = 1;
-        sh_comp_rounds[tid] = 1;
-        sh_flags[5] = 1;
-      }
-    } else if (warp == NWARPS - 1) {
-      const int c = lane;
-      if (c < nisland && !sh_comp_done[c] && sh_comp_ndof[c] <= SMALL_N) {
-        const int n = sh_comp_ndof[c];
-        const int sb = sh_comp_begin[c];
-        float* const Hc = sh_H + sh_comp_pbegin[c];
-        float* const gc = sh_grad + sb;
-        float* const sc = sh_s + sb;
-        bool ok = true;
-        for (int p = 0; p < n; ++p) {
-          const int rp = p * (p + 1) / 2;
-          float d = Hc[rp + p];
-          for (int k = 0; k < p; ++k) {
-            const float l = Hc[rp + k];
-            d -= l * l;
-          }
-          if (!(d > 0.0f) || !isfinite(d)) {
-            ok = false;
-            break;
-          }
-          const float ld = sqrtf(d);
-          const float inv = 1.0f / ld;
-          Hc[rp + p] = ld;
-          for (int i = p + 1; i < n; ++i) {
-            const int ri = i * (i + 1) / 2;
-            float v = Hc[ri + p];
-            for (int k = 0; k < p; ++k) v -= Hc[ri + k] * Hc[rp + k];
-            Hc[ri + p] = v * inv;
-          }
-        }
-        if (!ok) {
-          sh_comp_status[c] = STATUS_NOT_PD;
-          sh_comp_done[c] = 1;
-          sh_comp_rounds[c] = round + 1;
-          sh_flags[5] = 1;
         } else {
-          float gd = 0.0f;
-          for (int i = 0; i < n; ++i) {
-            const int ri = i * (i + 1) / 2;
-            const float g = gc[i];
-            gd += g * g;
-            float y = g;
-            for (int k = 0; k < i; ++k) y -= Hc[ri + k] * sc[k];
-            sc[i] = y / Hc[ri + i];
-          }
-          for (int i = n - 1; i >= 0; --i) {
-            float y = sc[i];
-            for (int k = i + 1; k < n; ++k) y -= Hc[k * (k + 1) / 2 + i] * sc[k];
-            sc[i] = y / Hc[i * (i + 1) / 2 + i];
-          }
-          float sv = 0.0f;
-          for (int i = 0; i < n; ++i) sv += sc[i] * gc[i];
-          const bool finite_ok = isfinite(gd) && isfinite(sv);
-          const float grad_r = sqrtf(gd) / scale;
-          const float mi_r = 0.5f * sv / scale;
-          const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
-          const bool last = (round + 1 >= ROUND_CAP);
-          sh_comp_gd[c] = gd;
-          sh_comp_dec[c] = sv;
-          sh_comp_rounds[c] = round + 1;
-          if (!finite_ok) {
-            sh_comp_status[c] = STATUS_NONFINITE;
-            sh_comp_done[c] = 1;
-            sh_flags[5] = 1;
-          } else if (pass || last) {
-            sh_comp_done[c] = 1;
-            sh_flags[5] = 1;
-          } else {
-            // semismooth Newton step on the current active set
-            for (int i = 0; i < n; ++i) sh_q[sb + i] -= sc[i];
+          const int ga_ = sh_slot_dof[sb + lane];
+#pragma unroll 4
+          for (int b = 0; b < n; ++b) {
+            const int gb = sh_slot_dof[sb + b];
+            const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
+            mq += ((elemid >= 0) ? M_p[elemid] : 0.0f) * qc[b];
           }
         }
       }
-    } else {
-      constexpr int NBIG_WARPS = (NWARPS > 1) ? (NWARPS - 1) : 1;
-      for (int c = warp; c < nisland; c += NBIG_WARPS) {
-        if (sh_comp_done[c] || sh_comp_ndof[c] <= SMALL_N) continue;
-        const int n = sh_comp_ndof[c];
-        const int sb = sh_comp_begin[c];
-        float* const Hc = sh_H + sh_comp_pbegin[c];
-        float* const gc = sh_grad + sb;
-        float* const sc = sh_s + sb;
-        int ok = 1;
-        for (int p = 0; p < n; ++p) {
-          const int dp = p * (p + 1) / 2 + p;
-          const float d = Hc[dp];
-          if (!(d > 0.0f) || !isfinite(d)) {
-            ok = 0;
-            break;
-          }
-          const float ld = sqrtf(d);
-          const float inv = 1.0f / ld;
-          __syncwarp();
-          if (lane == 0) Hc[dp] = ld;
-          for (int i = p + 1 + lane; i < n; i += 32) Hc[i * (i + 1) / 2 + p] *= inv;
-          __syncwarp();
-          // trailing update, row by row: lane j updates H[i][p+1+j] for j <= i-p-1
-          const int lj = p + 1 + lane;
-          const float lpj = (lj < n) ? Hc[lj * (lj + 1) / 2 + p] : 0.0f;
-          for (int i = p + 1; i < n; ++i) {
-            if (lj <= i) Hc[i * (i + 1) / 2 + lj] -= Hc[i * (i + 1) / 2 + p] * lpj;
+      float Hrow[MNL];
+      ga = 0.0f;
+      const int trow = own_row ? lane : 0;
+      if (DENSE) {
+        float hp[EPLL];
+#pragma unroll
+        for (int k = 0; k < EPLL; ++k) hp[k] = mc[k];
+        for (int tb = 0; tb < nrow; tb += TB) {
+          const int rows = min(TB, nrow - tb);
+          if (!resident && !DBG_NO_STAGE) stage_batch(tb, rows, true);
+          if (resident) classify_tile(tb, rows);
+          // H[a][b] += coef j_a j_b over the tile rows (SATISFIED rows carry coef = 0)
+#pragma unroll 4
+          for (int tt = 0; tt < (DBG_NO_ACC ? 0 : rows); ++tt) {
+            const float* const row = tile + tt * TS;
+            const float cf = row[MNL + 2];
+            const float fL = row[MNL + 3];
+#pragma unroll
+            for (int k = 0; k < EPLL; ++k) hp[k] += cf * row[eab[k] >> 8] * row[eab[k] & 255];
+            ga += fL * row[trow];
           }
           __syncwarp();
         }
-        if (!ok) {
-          if (lane == 0) {
-            sh_comp_status[c] = STATUS_NOT_PD;
-            sh_comp_done[c] = 1;
-            sh_comp_rounds[c] = round + 1;
-            sh_flags[5] = 1;
-          }
-          __syncwarp();
-          continue;
-        }
-        float v = (lane < n) ? gc[lane] : 0.0f;
-        float gd = v * v;
-        for (int o = 16; o > 0; o >>= 1) gd += __shfl_xor_sync(FULL, gd, o);
-        if (lane < n) sc[lane] = gc[lane];
-        __syncwarp();
-        for (int j = 0; j < n; ++j) {
-          const float yj = sc[j] / Hc[j * (j + 1) / 2 + j];
-          __syncwarp();
-          if (lane == 0) sc[j] = yj;
-          for (int i = j + 1 + lane; i < n; i += 32) sc[i] -= Hc[i * (i + 1) / 2 + j] * yj;
-          __syncwarp();
-        }
-        for (int j = n - 1; j >= 0; --j) {
-          const float sj = sc[j] / Hc[j * (j + 1) / 2 + j];
-          __syncwarp();
-          if (lane == 0) sc[j] = sj;
-          for (int i = lane; i < j; i += 32) sc[i] -= Hc[j * (j + 1) / 2 + i] * sj;
-          __syncwarp();
-        }
-        float sv = (lane < n) ? sc[lane] * gc[lane] : 0.0f;
-        for (int o = 16; o > 0; o >>= 1) sv += __shfl_xor_sync(FULL, sv, o);
-        const bool finite_ok = isfinite(gd) && isfinite(sv);
-        const float grad_r = sqrtf(gd) / scale;
-        const float mi_r = 0.5f * sv / scale;
-        const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
-        const bool last = (round + 1 >= ROUND_CAP);
-        if (lane == 0) {
-          sh_comp_gd[c] = gd;
-          sh_comp_dec[c] = sv;
-          sh_comp_rounds[c] = round + 1;
-          if (!finite_ok) {
-            sh_comp_status[c] = STATUS_NONFINITE;
-            sh_comp_done[c] = 1;
-            sh_flags[5] = 1;
-          } else if (pass || last) {
-            sh_comp_done[c] = 1;
-            sh_flags[5] = 1;
-          }
+        // packed entries -> shared -> lane a owns row a in registers
+#pragma unroll
+        for (int k = 0; k < EPLL; ++k) {
+          const int E = lane + 32 * k;
+          if (E < np) Lpk[E] = hp[k];
         }
         __syncwarp();
-        if (finite_ok && !pass && !last) {
-          // semismooth Newton step on the current active set
-          for (int i = lane; i < n; i += 32) sh_q[sb + i] -= sc[i];
+        const int rowp = lane * (lane + 1) / 2;
+#pragma unroll
+        for (int b = 0; b < MNL; ++b) {
+          if (b >= n) break;
+          Hrow[b] = (own_row && b <= lane) ? Lpk[rowp + b] : 0.0f;
         }
         __syncwarp();
+      } else {
+        // sparse variant: lane a accumulates its own Hessian row (M row from global)
+#pragma unroll
+        for (int b = 0; b < MNL; ++b) Hrow[b] = 0.0f;
+        if (own_row) {
+          const int ga_ = sh_slot_dof[sb + lane];
+#pragma unroll
+          for (int b = 0; b < MNL; ++b) {
+            if (b >= n) break;
+            if (b <= lane) {
+              const int gb = sh_slot_dof[sb + b];
+              const int elemid = M_elemid_p[max(ga_, gb) * s_M_elemid + min(ga_, gb)];
+              Hrow[b] = (elemid >= 0) ? M_p[elemid] : 0.0f;
+            }
+          }
+        }
+        for (int tb = 0; tb < nrow; tb += TB) {
+          const int rows = min(TB, nrow - tb);
+          if (!DBG_NO_STAGE) stage_batch(tb, rows, false);
+          classify_tile(tb, rows);
+          for (int tt = 0; tt < (DBG_NO_ACC ? 0 : rows); ++tt) {
+            const float* const row = tile + tt * TS;
+            const float ja = row[trow];
+            const float cja = row[MNL + 2] * ja;
+            ga += row[MNL + 3] * ja;
+#pragma unroll
+            for (int b = 0; b < MNL; ++b) {
+              if (b >= n) break;
+              if (b <= lane) Hrow[b] += cja * row[b];
+            }
+          }
+          __syncwarp();
+        }
       }
+      const float gv = own_row ? (mq - qfs - ga) : 0.0f;
+      // packed Cholesky, lane = row, right-looking; inv_own = 1/L[lane][lane]
+      bool ok = true;
+      float inv_own = 0.0f;
+#pragma unroll
+      for (int p = 0; p < MNL; ++p) {
+        if (p >= n || DBG_NO_FACTOR) break;
+        const float d = __shfl_sync(FULL, Hrow[p], p);
+        ok = ok && (d > 0.0f) && isfinite(d);
+        const float inv = rsqrtf(d);
+        if (lane == p) inv_own = inv;
+        if (lane > p) Hrow[p] *= inv;  // L[lane][p]
+        const float lp = Hrow[p];
+#pragma unroll
+        for (int j = p + 1; j < MNL; ++j) {
+          if (j >= n) break;
+          const float ljp = __shfl_sync(FULL, lp, j);
+          if (lane >= j) Hrow[j] -= lp * ljp;
+        }
+      }
+      rounds = round + 1;
+      if (!ok) {
+        status = STATUS_NOT_PD;
+        break;
+      }
+      gd = gv * gv;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) gd += __shfl_xor_sync(FULL, gd, o);
+      // forward: y = L^-1 grad (lane k publishes y_k at step k)
+      float acc = gv;
+      float y_own = 0.0f;
+#pragma unroll
+      for (int k = 0; k < MNL; ++k) {
+        if (k >= n || DBG_NO_FACTOR) break;
+        const float yk = __shfl_sync(FULL, acc * inv_own, k);
+        if (lane == k) y_own = yk;
+        if (lane > k) acc -= Hrow[k] * yk;
+      }
+      // packed L to shared (own row) for the backward solve
+      {
+        const int rowp = lane * (lane + 1) / 2;
+#pragma unroll
+        for (int b = 0; b < MNL; ++b) {
+          if (b >= n) break;
+          if (own_row && b <= lane) Lpk[rowp + b] = Hrow[b];
+        }
+      }
+      __syncwarp();
+      // backward: s = L^-T y (L[j][lane] from the shared packed copy)
+      acc = y_own;
+      float s_own = 0.0f;
+      for (int j = (DBG_NO_FACTOR ? -1 : n - 1); j >= 0; --j) {
+        const float sj = __shfl_sync(FULL, acc * inv_own, j);
+        if (lane == j) s_own = sj;
+        if (lane < j) acc -= Lpk[j * (j + 1) / 2 + lane] * sj;
+      }
+      sv = s_own * gv;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) sv += __shfl_xor_sync(FULL, sv, o);
+      const bool finite_ok = isfinite(gd) && isfinite(sv);
+      const float grad_r = sqrtf(gd) / scale;
+      const float mi_r = 0.5f * sv / scale;
+      const bool pass = finite_ok && ((grad_r < comp_tol) || (mi_r < comp_tol));
+      const bool last = (round + 1 >= round_cap);
+      if (!finite_ok) {
+        status = STATUS_NONFINITE;
+        break;
+      }
+      if (pass || last) break;
+      // semismooth Newton step on the current active set
+      __syncwarp();
+      if (own_row) qc[lane] -= s_own;
+      __syncwarp();
     }
-    __syncthreads();
-    if (DEBUG_EXIT == 4) break;
-    int any_open = 0;
-    if (tid < nisland && sh_comp_done[tid] == 0) any_open = 1;
-    if (__syncthreads_or(any_open) == 0) break;
+    // force/state were stored by the last round's classification (the final iterate)
+    if (own_row) {
+      sh_q[sb + lane] = qc[lane];
+      sh_qfrc[sb + lane] = ga;
+    }
+    if (lane == 0) {
+      sh_comp_status[c] = (unsigned char)status;
+      sh_comp_rounds[c] = (unsigned char)rounds;
+      sh_comp_gd[c] = gd;
+      sh_comp_dec[c] = sv;
+    }
+    __syncwarp();
+  };
+
+  // ---------------------------------------------------------------- phase 1: warps pull components
+  for (;;) {
+    int next = 0;
+    if (lane == 0) next = atomicAdd(&sh_flags[3], 1);
+    next = __shfl_sync(FULL, next, 0);
+    if (next >= ncomp_active) break;
+    const int c = sh_comp_order[next];
+    const int nd = sh_comp_ndof[c];
+    if (nd <= LN) light_component(c);
+    else if (nd <= MNS) mid_component((char(*)[16])nullptr, c);
+    else mid_component((char(*)[32])nullptr, c);
   }
+  __syncthreads();
 
   // ---------------------------------------------------------------- world certificate
   if (tid == 0) {
@@ -766,13 +1044,12 @@ _NATIVE_TEMPLATE = r"""
       if (sh_comp_status[c] != STATUS_CERTIFIED) status = sh_comp_status[c];
       world_gd += sh_comp_gd[c];
       world_dec += sh_comp_dec[c];
-      max_rounds = max(max_rounds, sh_comp_rounds[c]);
+      max_rounds = max(max_rounds, (int)sh_comp_rounds[c]);
     }
     const float grad_r = sqrtf(world_gd) / scale;
     const float mi_r = 0.5f * world_dec / scale;
     const bool pass = isfinite(grad_r) && isfinite(mi_r) && ((grad_r < ctol) || (mi_r < ctol));
     if (status == STATUS_CERTIFIED && !pass) status = STATUS_UNCERTIFIED;
-    sh_flags[7] = status;
     status_o[worldid] = status;
     gradient_o[worldid] = grad_r;
     decrement_o[worldid] = mi_r;
@@ -784,9 +1061,8 @@ _NATIVE_TEMPLATE = r"""
       stock_o[worldid] = 0;
     }
   }
-  __syncthreads();
-
   if (DEBUG_EXIT == 2) return;
+
   // ---------------------------------------------------------------- phase 3: publication
   for (int g = tid; g < NV; g += BLOCK) {
     const int s = sh_dof_slot[g];
@@ -805,26 +1081,10 @@ _NATIVE_TEMPLATE = r"""
     }
     Ma_o[i] = acc;
   }
-  // force/state for every row from the final Jaref (output-only rows: Jaref = -aref)
+  // rows without active columns (output-only): Jaref = -aref
   for (int r = tid; r < nefc; r += BLOCK) {
-    const int nnz = rownnz_p[r];
-    const int adr = rowadr_p[r];
-    int cols[NNZ_PREFETCH];
-    float vals[NNZ_PREFETCH];
-#pragma unroll
-    for (int k = 0; k < NNZ_PREFETCH; ++k) {
-      cols[k] = (k < nnz) ? colind_p[adr + k] : 0;
-      vals[k] = (k < nnz) ? J_p[adr + k] : 0.0f;
-    }
-    float x = 0.0f;
-#pragma unroll
-    for (int k = 0; k < NNZ_PREFETCH; ++k) {
-      if (k < nnz) {
-        const int s = sh_dof_slot[cols[k]];
-        if (s >= 0) x += vals[k] * sh_q[s];
-      }
-    }
-    x -= aref_p[r];
+    if (sh_row_comp[r] != ROW_NONE) continue;
+    const float x = -aref_p[r];
     const bool quad = (r < ne) || (x < 0.0f);
     force_o[r] = quad ? -D_p[r] * x : 0.0f;
     state_o[r] = quad ? STATE_QUADRATIC : STATE_SATISFIED;
@@ -832,18 +1092,37 @@ _NATIVE_TEMPLATE = r"""
 }
 """
 
+_RANK_SNIPPET = r"""
+{
+  const unsigned FULL = 0xffffffffu;
+  const int* const nefc_p = reinterpret_cast<const int*>(nefc.data);
+  int* const order_p = reinterpret_cast<int*>(world_order.data);
+  const int nworld = (int)nefc.shape[0];
+  const int key = nefc_p[worldid];
+  int cnt = 0;
+  for (int v = lane; v < nworld; v += 32) {
+    const int kv = nefc_p[v];
+    if (kv > key || (kv == key && v < worldid)) ++cnt;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) cnt += __shfl_xor_sync(FULL, cnt, o);
+  if (lane == 0) order_p[cnt] = worldid;
+}
+"""
+
 
 def _render(nv: int, njmax: int, debug_exit: int = 0) -> str:
   replacements = {
     "__BLOCK__": str(BLOCK_DIM),
-    "__TILE__": str(TILE_ROWS),
-    "__CDOF__": str(COMP_DOF_CAP),
+    "__ROW_CAP__": str(ROW_CAP),
+    "__LN__": str(LIGHT_DOF_CAP),
+    "__RES__": str(RESIDENT_ROWS_PER_LANE),
+    "__DR4__": str(DENSE_ROW_FLOATS // 4),
+    "__MN__": str(COMP_DOF_CAP),
     "__NCDOF__": str(NCDOF_CAP),
     "__NTREE__": str(NTREE_CAP),
-    "__NJMAX__": str(njmax),
     "__NV__": str(nv),
     "__ROUND_CAP__": str(ROUND_CAP),
-    "__PACKED_TOTAL__": str(PACKED_TOTAL_CAP),
     "__DEBUG_EXIT__": str(debug_exit),
     "__STATE_SATISFIED__": str(int(types.ConstraintState.SATISFIED)),
     "__STATE_QUADRATIC__": str(int(types.ConstraintState.QUADRATIC)),
@@ -876,7 +1155,6 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     M_mulm_rowadr: wp.array(dtype=int),
     M_mulm_col: wp.array(dtype=int),
     M_mulm_madr: wp.array(dtype=int),
-    dof_treeid: wp.array(dtype=int),
     tree_dofadr: wp.array(dtype=int),
     tree_dofnum: wp.array(dtype=int),
     stat_meaninertia: wp.array(dtype=float),
@@ -897,6 +1175,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     qacc_smooth_in: wp.array2d(dtype=float),
     qfrc_smooth_in: wp.array2d(dtype=float),
     qacc_warmstart_in: wp.array2d(dtype=float),
+    dense_rows: wp.array3d(dtype=float),
     qacc_out: wp.array2d(dtype=float),
     qfrc_constraint_out: wp.array2d(dtype=float),
     efc_force_out: wp.array2d(dtype=float),
@@ -910,17 +1189,17 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     world_decrement_out: wp.array(dtype=float),
   ): ...
 
-  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK_DIM, 2))
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK_DIM, MIN_BLOCKS_PER_SM))
   def kernel(
     ntree: int,
     njmax: int,
     nv_scale: int,
     warmstart: int,
+    world_order: wp.array(dtype=int),
     M_elemid: wp.array2d(dtype=int),
     M_mulm_rowadr: wp.array(dtype=int),
     M_mulm_col: wp.array(dtype=int),
     M_mulm_madr: wp.array(dtype=int),
-    dof_treeid: wp.array(dtype=int),
     tree_dofadr: wp.array(dtype=int),
     tree_dofnum: wp.array(dtype=int),
     stat_meaninertia: wp.array(dtype=float),
@@ -941,6 +1220,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     qacc_smooth_in: wp.array2d(dtype=float),
     qfrc_smooth_in: wp.array2d(dtype=float),
     qacc_warmstart_in: wp.array2d(dtype=float),
+    dense_rows: wp.array3d(dtype=float),
     qacc_out: wp.array2d(dtype=float),
     qfrc_constraint_out: wp.array2d(dtype=float),
     efc_force_out: wp.array2d(dtype=float),
@@ -953,7 +1233,10 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     world_gradient_out: wp.array(dtype=float),
     world_decrement_out: wp.array(dtype=float),
   ):
-    worldid, tid = wp.tid()
+    block, tid = wp.tid()
+    worldid = block
+    if world_order.shape[0] > 0:
+      worldid = world_order[block]
     native(
       worldid,
       tid,
@@ -965,7 +1248,6 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
       M_mulm_rowadr,
       M_mulm_col,
       M_mulm_madr,
-      dof_treeid,
       tree_dofadr,
       tree_dofnum,
       stat_meaninertia,
@@ -986,6 +1268,7 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
       qacc_smooth_in,
       qfrc_smooth_in,
       qacc_warmstart_in,
+      dense_rows,
       qacc_out,
       qfrc_constraint_out,
       efc_force_out,
@@ -1003,6 +1286,17 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
   return kernel
 
 
+@wp.func_native(snippet=_RANK_SNIPPET)
+def _rank_world(worldid: int, lane: int, nefc: wp.array(dtype=int), world_order: wp.array(dtype=int)): ...
+
+
+@wp.kernel(module="unique", enable_backward=False, grid_stride=False)
+def _rank_worlds_by_rows(nefc: wp.array(dtype=int), world_order: wp.array(dtype=int)):
+  """Stable descending sort of worlds by row count (one warp per world)."""
+  worldid, lane = wp.tid()
+  _rank_world(worldid, lane, nefc, world_order)
+
+
 @dataclasses.dataclass
 class WorldSolverContext:
   """Per-world routing and certificate telemetry of the world solver.
@@ -1013,6 +1307,8 @@ class WorldSolverContext:
     status: STATUS_* code per world                                   (nworld,)
     gradient: rescaled gradient norm of the world certificate         (nworld,)
     decrement: rescaled half Newton decrement of the certificate      (nworld,)
+    world_order: CTA -> world permutation (heavy worlds first)        (nworld,)
+    dense_rows: dense row records (j[0..16), D, aref)                  (nworld, ROW_CAP, 20)
   """
 
   stock_world: wp.array
@@ -1020,6 +1316,8 @@ class WorldSolverContext:
   status: wp.array
   gradient: wp.array
   decrement: wp.array
+  world_order: wp.array
+  dense_rows: wp.array
 
 
 def create_world_solver_context(nworld: int, device=None) -> WorldSolverContext:
@@ -1029,6 +1327,8 @@ def create_world_solver_context(nworld: int, device=None) -> WorldSolverContext:
     status=wp.zeros(nworld, dtype=int, device=device),
     gradient=wp.zeros(nworld, dtype=float, device=device),
     decrement=wp.zeros(nworld, dtype=float, device=device),
+    world_order=wp.zeros(nworld, dtype=int, device=device),
+    dense_rows=wp.empty((nworld, ROW_CAP, DENSE_ROW_FLOATS), dtype=float, device=device),
   )
 
 
@@ -1071,7 +1371,7 @@ def launch_world_solver(
   M_mulm_rowadr,
   M_mulm_col,
   M_mulm_madr,
-  dof_treeid,
+  dof_treeid=None,
   tree_dofadr,
   tree_dofnum,
   stat_meaninertia,
@@ -1100,9 +1400,19 @@ def launch_world_solver(
   solver_niter,
   ctx: WorldSolverContext,
   debug_exit: int = 0,
+  heavy_first: bool = True,
 ):
-  """Launch the per-world solver on explicit arrays (zeroes ``ctx.nstock`` first)."""
+  """Launch the per-world solver on explicit arrays (zeroes ``ctx.nstock`` first).
+
+  ``dof_treeid`` is accepted for call-site compatibility and unused.
+  """
+  del dof_treeid
   ctx.nstock.zero_()
+  if heavy_first:
+    wp.launch_tiled(_rank_worlds_by_rows, dim=nworld, inputs=[nefc], outputs=[ctx.world_order], block_dim=32)
+    order = ctx.world_order
+  else:
+    order = None
   wp.launch_tiled(
     world_solver_kernel(nv, njmax, debug_exit),
     dim=nworld,
@@ -1111,11 +1421,11 @@ def launch_world_solver(
       njmax,
       nv_scale,
       int(warmstart),
+      order,
       M_elemid,
       M_mulm_rowadr,
       M_mulm_col,
       M_mulm_madr,
-      dof_treeid,
       tree_dofadr,
       tree_dofnum,
       stat_meaninertia,
@@ -1136,6 +1446,7 @@ def launch_world_solver(
       qacc_smooth,
       qfrc_smooth,
       qacc_warmstart,
+      ctx.dense_rows,
     ],
     outputs=[
       qacc,
@@ -1154,7 +1465,7 @@ def launch_world_solver(
   )
 
 
-def world_solve(m: types.Model, d: types.Data, ctx: WorldSolverContext):
+def world_solve(m: types.Model, d: types.Data, ctx: WorldSolverContext, heavy_first: bool = True):
   """Run the per-world solver on canonical Data arrays."""
   launch_world_solver(
     nworld=d.nworld,
@@ -1167,7 +1478,6 @@ def world_solve(m: types.Model, d: types.Data, ctx: WorldSolverContext):
     M_mulm_rowadr=m.M_mulm_rowadr,
     M_mulm_col=m.M_mulm_col,
     M_mulm_madr=m.M_mulm_madr,
-    dof_treeid=m.dof_treeid,
     tree_dofadr=m.tree_dofadr,
     tree_dofnum=m.tree_dofnum,
     stat_meaninertia=m.stat.meaninertia,
@@ -1195,4 +1505,5 @@ def world_solve(m: types.Model, d: types.Data, ctx: WorldSolverContext):
     efc_Ma=d.efc.Ma,
     solver_niter=d.solver_niter,
     ctx=ctx,
+    heavy_first=heavy_first,
   )
