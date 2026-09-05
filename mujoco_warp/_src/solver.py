@@ -4466,12 +4466,21 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data, *, materialize_island_mapping: bool = True):
-  """Solve constraints and optionally publish the public island mapping."""
+def solve(m: types.Model, d: types.Data, *, materialize_island_mapping: bool = True, active_dofs_fresh: bool = False):
+  """Solve constraints and optionally publish the public island mapping.
+
+  Args:
+    m: The model containing kinematic and dynamic information (device).
+    d: The data object containing the current state and output arrays (device).
+    materialize_island_mapping: publish the public island mapping after the compact solve.
+    active_dofs_fresh: the caller already rebuilt the active-DOF compaction maps for the current
+      ``tree_awake``/``tree_island`` (e.g. the fused forward path), so ``update_active_dofs`` is skipped.
+  """
   if m.opt.enableflags & types.EnableBit.SLEEP:
     # Self-contained like the island branch below: rebuild the active-DOF mapping from
     # tree_awake so solve() works when called directly (not only via fwd_acceleration).
-    island.update_active_dofs(m, d)
+    if not active_dofs_fresh:
+      island.update_active_dofs(m, d)
     solve_compact(m, d)
     if materialize_island_mapping and m.ntree > 1:
       island.compute_island_mapping(m, d)

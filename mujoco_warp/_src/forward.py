@@ -20,6 +20,7 @@ import warp as wp
 from mujoco_warp._src import collision_driver
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
+from mujoco_warp._src import fused_world
 from mujoco_warp._src import history
 from mujoco_warp._src import island
 from mujoco_warp._src import math
@@ -1369,9 +1370,40 @@ def _energy_vel(m: Model, d: Data):
       sensor.energy_vel(m, d)
 
 
+def _forward_fused(m: Model, d: Data, finalize: bool):
+  """Forward dynamics with the per-world fused smooth stages (see fused_world.fused_world)."""
+  # sleep.wake/update_sleep, fwd_position (kinematics, com_pos, crb, transmission), fwd_velocity
+  # and fwd_actuation: none of them depend on the constraint set, so they precede make_constraint
+  fused_world.forward_a(m, d)
+  if m.ncam or m.nlight:
+    smooth.camlight(m, d)
+
+  constraint.make_constraint(m, d)
+  if m.neq > 0:
+    sleep.wake_equality(m, d)
+  sleep.update_sleep(m, d)
+  island.island(m, d)
+
+  # position and velocity sensors only read data published by forward_a
+  d.sensordata.zero_()
+  sensor.sensor_pos(m, d)
+  _energy_pos(m, d)
+  sensor.sensor_vel(m, d)
+  _energy_vel(m, d)
+
+  # qfrc_smooth with the post-wake_equality tree_awake, factor/solve and compaction maps
+  fused_world.forward_b(m, d)
+  solver.solve(m, d, materialize_island_mapping=finalize or _has_callback(m), active_dofs_fresh=True)
+  sensor.sensor_acc(m, d)
+
+
 @event_scope
 def forward(m: Model, d: Data, *, _finalize: bool = True):
   """Forward dynamics."""
+  if fused_world.fused_world(m, d):
+    _forward_fused(m, d, _finalize)
+    return
+
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
     sleep.wake(m, d)
