@@ -885,6 +885,10 @@ class Option:
       velocity-dependent ones (``fused_world.DERIVED_FIELDS_REFRESHED``). Ignored for models with
       sensors (``fused_world.publish_derived``). Opt-in for callers that never read those fields
       (Newton's body_qdd/body_parent_f conversion reads cacc and cfrc_int)
+    world_solver: on the sleeping (compact) path, solve every world with the per-world
+      component-local solver (world_solver.py) and run the stock compact recurrence only for the
+      worlds it did not certify, inside a conditional graph node on ``nstock``; requires the
+      sparse Jacobian
   """
 
   timestep: array("*", float)
@@ -918,6 +922,7 @@ class Option:
   fused_world: bool
   run_sleep_wake: bool
   fused_world_publish_derived: bool
+  world_solver: bool
 
   # TODO(team): remove in future version
   @property

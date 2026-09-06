@@ -15,7 +15,6 @@
 
 """Tests for solver functions."""
 
-from unittest import mock
 
 import mujoco
 import numpy as np
@@ -1811,10 +1810,10 @@ class CompactSolverTest(absltest.TestCase):
         baseline_d, d = mjw.put_data(mjm, mjd, nvmax=mjm.nv), mjw.put_data(mjm, mjd, nvmax=mjm.nv)
         for model in (baseline_m, m):
           model.opt.enableflags |= types.EnableBit.SLEEP
+        m.opt.world_solver = True
 
         mjw.step(baseline_m, baseline_d)
-        with mock.patch.object(solver, "WORLD_SOLVER_ENABLED", True):
-          mjw.step(m, d)
+        mjw.step(m, d)
 
         # the chain is one island of 6 * nbodies DOFs; the world was certified (no stock fallback)
         tree_island = d.tree_island.numpy()[0]

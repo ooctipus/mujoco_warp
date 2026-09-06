@@ -14,7 +14,6 @@
 # ==============================================================================
 
 import dataclasses
-import os
 import warnings
 from math import ceil
 from typing import Any
@@ -44,11 +43,6 @@ wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 _BLOCK_CHOLESKY_DIM = 32
 _LINESEARCH_MV_JV_ROW_SPAN = 512
 
-# Opt-in: on the sleeping (compact) path, solve every world with the per-world component-local
-# solver (world_solver.py) and run the stock compact Newton recurrence only for the worlds it
-# did not certify, inside a conditional graph node on ``nstock``. Set the module flag or
-# MJWARP_WORLD_SOLVER=1 in the environment.
-WORLD_SOLVER_ENABLED = os.environ.get("MJWARP_WORLD_SOLVER", "0") == "1"
 _WORLD_SOLVER_CTX: dict[int, world_solver.WorldSolverContext] = {}
 _WORLD_SOLVER_WARNED: set[str] = set()
 
@@ -4522,7 +4516,7 @@ def solve(m: types.Model, d: types.Data, *, materialize_island_mapping: bool = T
       ``tree_awake``/``tree_island`` (e.g. the fused forward path), so ``update_active_dofs`` is skipped.
   """
   if m.opt.enableflags & types.EnableBit.SLEEP:
-    if WORLD_SOLVER_ENABLED and _world_solver_applicable(m, d):
+    if m.opt.world_solver and _world_solver_applicable(m, d):
       _solve_world_first(m, d, active_dofs_fresh=active_dofs_fresh)
     else:
       # Self-contained like the island branch below: rebuild the active-DOF mapping from
