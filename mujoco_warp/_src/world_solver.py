@@ -71,6 +71,8 @@ COMP_DOF_CAP = 32
 NCDOF_CAP = 128
 NTREE_CAP = 32
 ROUND_CAP = 10
+RESOLVE_ROUND_CAP = 40
+RESOLVE_WORLD_CAP = 64
 RESIDENT_ROWS_PER_LANE = 2
 WIDE_GROUP_WARPS = 2
 MIN_BLOCKS_PER_SM = 4
@@ -1526,7 +1528,7 @@ _RANK_SNIPPET = r"""
 """
 
 
-def _render(nv: int, njmax: int, debug_exit: int = 0) -> str:
+def _render(nv: int, njmax: int, debug_exit: int = 0, round_cap: int = ROUND_CAP) -> str:
   replacements = {
     "__BLOCK__": str(BLOCK_DIM),
     "__ROW_CAP__": str(ROW_CAP),
@@ -1541,7 +1543,7 @@ def _render(nv: int, njmax: int, debug_exit: int = 0) -> str:
     "__NCDOF__": str(NCDOF_CAP),
     "__NTREE__": str(NTREE_CAP),
     "__NV__": str(nv),
-    "__ROUND_CAP__": str(ROUND_CAP),
+    "__ROUND_CAP__": str(round_cap),
     "__DEBUG_EXIT__": str(debug_exit),
     "__STATE_SATISFIED__": str(int(types.ConstraintState.SATISFIED)),
     "__STATE_QUADRATIC__": str(int(types.ConstraintState.QUADRATIC)),
@@ -1552,17 +1554,17 @@ def _render(nv: int, njmax: int, debug_exit: int = 0) -> str:
   return source
 
 
-_KERNELS: dict[tuple[int, int, int], wp.Kernel] = {}
+_KERNELS: dict[tuple[int, int, int, int], wp.Kernel] = {}
 
 
-def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
-  """Build (and cache) the per-world solver kernel for a model size."""
-  key = (nv, njmax, debug_exit)
+def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0, round_cap: int = ROUND_CAP) -> wp.Kernel:
+  """Build (and cache) the per-world solver kernel for a model size and round cap."""
+  key = (nv, njmax, debug_exit, round_cap)
   kernel = _KERNELS.get(key)
   if kernel is not None:
     return kernel
 
-  @wp.func_native(snippet=_render(nv, njmax, debug_exit))
+  @wp.func_native(snippet=_render(nv, njmax, debug_exit, round_cap))
   def native(
     worldid: int,
     tid: int,
@@ -1662,6 +1664,9 @@ def world_solver_kernel(nv: int, njmax: int, debug_exit: int = 0) -> wp.Kernel:
     worldid = block
     if world_order.shape[0] > 0:
       worldid = world_order[block]
+      if worldid < 0:
+        # padded entry of a flagged-world list (uniform per CTA: no thread reaches a barrier)
+        return
     native(
       worldid,
       tid,
@@ -1739,6 +1744,8 @@ class WorldSolverContext:
     gradient: rescaled gradient norm of the world certificate         (nworld,)
     decrement: rescaled half Newton decrement of the certificate      (nworld,)
     world_order: CTA -> world permutation (heavy worlds first)        (nworld,)
+    flagged: worlds flagged by the last launch, padded with -1         (RESOLVE_WORLD_CAP,)
+    flagged_count: number of flagged worlds appended to ``flagged``    (1,)
     dense_rows: dense row records (j[0..16), D, aref)                  (nworld, ROW_CAP, 20)
     wide_rows: dense records of rows of 17..32 DOF components           (nworld, WIDE_ROW_CAP, 36)
     wide_M: packed M_c of the 17..32 DOF component being solved         (nworld, 528)
@@ -1751,6 +1758,8 @@ class WorldSolverContext:
   gradient: wp.array
   decrement: wp.array
   world_order: wp.array
+  flagged: wp.array
+  flagged_count: wp.array
   dense_rows: wp.array
   wide_rows: wp.array
   wide_M: wp.array
@@ -1765,6 +1774,8 @@ def create_world_solver_context(nworld: int, device=None) -> WorldSolverContext:
     gradient=wp.zeros(nworld, dtype=float, device=device),
     decrement=wp.zeros(nworld, dtype=float, device=device),
     world_order=wp.zeros(nworld, dtype=int, device=device),
+    flagged=wp.full(RESOLVE_WORLD_CAP, -1, dtype=int, device=device),
+    flagged_count=wp.zeros(1, dtype=int, device=device),
     dense_rows=wp.empty((nworld, ROW_CAP, DENSE_ROW_FLOATS), dtype=float, device=device),
     wide_rows=wp.empty((nworld, WIDE_ROW_CAP, WIDE_ROW_FLOATS), dtype=float, device=device),
     wide_M=wp.empty((nworld, COMP_DOF_CAP * (COMP_DOF_CAP + 1) // 2), dtype=float, device=device),
@@ -1840,20 +1851,21 @@ def launch_world_solver(
   ctx: WorldSolverContext,
   debug_exit: int = 0,
   heavy_first: bool = True,
+  order: wp.array | None = None,
+  round_cap: int = ROUND_CAP,
 ):
   """Launch the per-world solver on explicit arrays (zeroes ``ctx.nstock`` first).
 
   ``dof_treeid`` is accepted for call-site compatibility and unused.
   """
   del dof_treeid
-  ctx.nstock.zero_()
-  if heavy_first:
-    wp.launch_tiled(_rank_worlds_by_rows, dim=nworld, inputs=[nefc], outputs=[ctx.world_order], block_dim=32)
-    order = ctx.world_order
-  else:
-    order = None
+  if order is None:
+    ctx.nstock.zero_()
+    if heavy_first:
+      wp.launch_tiled(_rank_worlds_by_rows, dim=nworld, inputs=[nefc], outputs=[ctx.world_order], block_dim=32)
+      order = ctx.world_order
   wp.launch_tiled(
-    world_solver_kernel(nv, njmax, debug_exit),
+    world_solver_kernel(nv, njmax, debug_exit, round_cap),
     dim=nworld,
     inputs=[
       ntree,
@@ -1907,10 +1919,54 @@ def launch_world_solver(
   )
 
 
+@wp.kernel(module="unique", enable_backward=False)
+def _collect_flagged_worlds(
+  stock_world: wp.array(dtype=int),
+  flagged: wp.array(dtype=int),
+  flagged_count: wp.array(dtype=int),
+  nstock: wp.array(dtype=int),
+):
+  """Append flagged worlds to the padded list; worlds past its capacity stay counted in nstock."""
+  worldid = wp.tid()
+  if stock_world[worldid] == 0:
+    return
+  slot = wp.atomic_add(flagged_count, 0, 1)
+  if slot < flagged.shape[0]:
+    flagged[slot] = worldid
+  else:
+    wp.atomic_add(nstock, 0, 1)
+
+
+def world_resolve_flagged(m: types.Model, d: types.Data, ctx: WorldSolverContext):
+  """Re-run the world solver with RESOLVE_ROUND_CAP rounds on the worlds the last launch flagged.
+
+  ``ctx.nstock`` is rebuilt: worlds that certify now clear their flag, the others (and any beyond
+  RESOLVE_WORLD_CAP) stay routed to the stock solve. A flagged first pass leaves its inputs
+  untouched, so the re-solve sees the same problem.
+  """
+  ctx.nstock.zero_()
+  ctx.flagged_count.zero_()
+  ctx.flagged.fill_(-1)
+  wp.launch(_collect_flagged_worlds, dim=d.nworld, inputs=[ctx.stock_world, ctx.flagged, ctx.flagged_count, ctx.nstock])
+  _launch_world_solver_impl(m, d, ctx, order=ctx.flagged, nworld=RESOLVE_WORLD_CAP, round_cap=RESOLVE_ROUND_CAP)
+
+
 def world_solve(m: types.Model, d: types.Data, ctx: WorldSolverContext, heavy_first: bool = True):
   """Run the per-world solver on canonical Data arrays."""
+  _launch_world_solver_impl(m, d, ctx, heavy_first=heavy_first)
+
+
+def _launch_world_solver_impl(
+  m: types.Model,
+  d: types.Data,
+  ctx: WorldSolverContext,
+  heavy_first: bool = True,
+  order: wp.array | None = None,
+  nworld: int | None = None,
+  round_cap: int = ROUND_CAP,
+):
   launch_world_solver(
-    nworld=d.nworld,
+    nworld=d.nworld if nworld is None else nworld,
     nv=m.nv,
     ntree=m.ntree,
     njmax=d.njmax,
@@ -1948,4 +2004,6 @@ def world_solve(m: types.Model, d: types.Data, ctx: WorldSolverContext, heavy_fi
     solver_niter=d.solver_niter,
     ctx=ctx,
     heavy_first=heavy_first,
+    order=order,
+    round_cap=round_cap,
   )

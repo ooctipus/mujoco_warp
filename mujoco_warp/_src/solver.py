@@ -5006,6 +5006,8 @@ def _solve_world_first(m: types.Model, d: types.Data, active_dofs_fresh: bool = 
     island.update_active_dofs(m, d)
   wctx = _world_solver_context(d)
   world_solver.world_solve(m, d, wctx)
+  # flagged worlds get a longer world-solver pass first: the stock solve below runs over every world
+  wp.capture_if(wctx.nstock, on_true=world_solver.world_resolve_flagged, m=m, d=d, ctx=wctx)
   m2, d2, sctx = _compact_solver_setup(m, d)
   nsolving = wp.empty(shape=(1,), dtype=int)
   wp.capture_if(
