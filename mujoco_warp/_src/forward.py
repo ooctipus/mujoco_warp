@@ -1434,9 +1434,11 @@ def _forward_fused(m: Model, d: Data, finalize: bool):
   sensor.sensor_vel(m, d)
   _energy_vel(m, d)
 
-  # qfrc_smooth with the post-wake_equality tree_awake, factor/solve and compaction maps
-  fused_world.forward_b(m, d)
-  solver.solve(m, d, materialize_island_mapping=finalize or _has_callback(m), active_dofs_fresh=True)
+  # qfrc_smooth with the post-wake_equality tree_awake and factor/solve; the compaction maps only
+  # when the stock compact solver consumes them (the per-world solver rebuilds them in its fallback)
+  compact_maps = not solver.uses_world_solver(m, d)
+  fused_world.forward_b(m, d, compact_maps=compact_maps)
+  solver.solve(m, d, materialize_island_mapping=finalize or _has_callback(m), active_dofs_fresh=compact_maps)
   sensor.sensor_acc(m, d)
 
 

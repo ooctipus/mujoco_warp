@@ -185,7 +185,7 @@ def _share_contacts(m, d_src, d_dst):
   wp.synchronize()
 
 
-def _rows(m, d, w: int):
+def _rows(m, d, w: int, skip=()):
   """Constraint rows of world w keyed by (type, id, dim) with their scalar and Jacobian values."""
   nefc = min(int(d.nefc.numpy()[w]), d.njmax)
   efc = d.efc
@@ -196,7 +196,8 @@ def _rows(m, d, w: int):
   colind = efc.J_colind.numpy()[w, 0]
   J = efc.J.numpy()[w, 0]
   efc_address = d.contact.efc_address.numpy()
-  scalars = {name: getattr(efc, name).numpy()[w] for name in ("pos", "margin", "D", "aref", "vel", "frictionloss")}
+  names = tuple(n for n in ("pos", "margin", "D", "aref", "vel", "frictionloss") if n not in skip)
+  scalars = {name: getattr(efc, name).numpy()[w] for name in names}
   rows = {}
   for efcid in range(nefc):
     t, i = int(typ[efcid]), int(ids[efcid])
@@ -352,7 +353,7 @@ class FusedWorldTest(absltest.TestCase):
         fused_ind = getattr(d_fused, name).numpy()[w, : n[w]]
         self.assertEqual(set(fused_ind.tolist()), ref_set, f"mismatch: {name} world {w}")
 
-  def _assert_rows_equal(self, m, d_fused, d_ref, rtol=_RTOL, atol=_ATOL):
+  def _assert_rows_equal(self, m, d_fused, d_ref, rtol=_RTOL, atol=_ATOL, skip=()):
     """Per world, the row multisets (values, Jacobians, jtdaj blocks, contact addresses) agree."""
     self._assert_int_equal(d_fused, d_ref, ("ne", "nf", "nl", "nefc"))
     np.testing.assert_array_equal(d_fused.efc.jtdaj_nblock.numpy(), d_ref.efc.jtdaj_nblock.numpy(), err_msg="jtdaj_nblock")
@@ -361,8 +362,8 @@ class FusedWorldTest(absltest.TestCase):
     np.testing.assert_array_equal(efc_address_fused < 0, efc_address_ref < 0, err_msg="contact.efc_address validity")
     max_diff = {}
     for w in range(d_ref.nworld):
-      rows_ref = _rows(m, d_ref, w)
-      rows_fused = _rows(m, d_fused, w)
+      rows_ref = _rows(m, d_ref, w, skip)
+      rows_fused = _rows(m, d_fused, w, skip)
       self.assertEqual(sorted(rows_fused), sorted(rows_ref), f"row keys differ in world {w}")
       for key, (scal_ref, jac_ref, _) in rows_ref.items():
         scal_fused, jac_fused, _ = rows_fused[key]
@@ -1192,10 +1193,19 @@ class FusedWorldTest(absltest.TestCase):
     with self.assertRaises(TypeError):
       mjw.forward_worlds(m, d_sub, wp.array(selected.astype(np.int64)))
 
+  @staticmethod
+  def _field(d, name):
+    """Data field by (possibly dotted) name, e.g. ``efc.pos``."""
+    obj = d
+    for part in name.split("."):
+      obj = getattr(obj, part)
+    return obj
+
   def _poison_derived(self, d):
-    """Fill fused_world.DERIVED_FIELDS with NaN (floats) or -7 (ints) so that a read shows up."""
-    for name in fused_world.DERIVED_FIELDS:
-      arr = getattr(d, name)
+    """Fill the derived fields with NaN (floats) or -7 (ints) so that a read shows up."""
+    names = fused_world.DERIVED_FIELDS + tuple(f"efc.{n}" for n in fused_world.DERIVED_EFC_FIELDS)
+    for name in names:
+      arr = self._field(d, name)
       host = arr.numpy()
       if host.dtype.kind == "f":
         arr.assign(np.full(host.shape, np.nan, dtype=host.dtype))
@@ -1204,19 +1214,19 @@ class FusedWorldTest(absltest.TestCase):
 
   def _assert_poisoned(self, d, names, poisoned: bool):
     for name in names:
-      host = getattr(d, name).numpy()
+      host = self._field(d, name).numpy()
       if host.size == 0:
         continue
       stale = np.isnan(host).all() if host.dtype.kind == "f" else (host == -7).all()
       self.assertEqual(bool(stale), poisoned, f"{name} {'read or written' if poisoned else 'not rebuilt'}")
 
   def test_publish_derived_opt_in(self):
-    """Option.fused_world_publish_derived=False leaves exactly fused_world.DERIVED_FIELDS stale.
+    """Option.fused_world_publish_derived=False leaves exactly the derived fields stale.
 
-    The stale fields are poisoned with NaN before the step: every other field of an intermediate
-    and of a finalizing fused step matches the published run (an in-step consumer of a stale field
-    would propagate the NaN), the finalizing refresh rebuilds DERIVED_FIELDS_REFRESHED, and a model
-    with sensors forces the full publish.
+    The stale fields (DERIVED_FIELDS and the sensor-only efc fields) are poisoned with NaN before
+    the step: every other field of an intermediate and of a finalizing fused step matches the
+    published run (an in-step consumer of a stale field would propagate the NaN), the finalizing
+    refresh is skipped so nothing is rebuilt, and a model with sensors forces the full publish.
     """
     mjm, m, datas = self._make(seed=8, contact=True, equality=True, resting=True)
     d_ref, d_opt = datas
@@ -1249,16 +1259,17 @@ class FusedWorldTest(absltest.TestCase):
       "M",
       "actuator_force",
       "qfrc_actuator",
-      "cvel",
       "qfrc_gravcomp",
       "qfrc_passive",
       "qfrc_bias",
       "qfrc_smooth",
     )
     solver_limited = ("qacc_smooth", "qacc", "qacc_warmstart", "qvel", "qpos")
-    # the finalizing forward_c recomputes these from the post-sleep (solver-limited) velocities
-    c_refresh = ("cvel", "qfrc_passive", "qfrc_bias") + fused_world.DERIVED_FIELDS_REFRESHED
+    # the published run's finalizing forward_c recomputes these from the post-sleep velocities; the
+    # opt-out run skips that refresh, so they keep the values of the last substep
+    c_refresh = ("qfrc_passive", "qfrc_bias")
     self.assertFalse(set(fields + solver_limited) & set(fused_world.DERIVED_FIELDS))
+    efc_derived = tuple(f"efc.{n}" for n in fused_world.DERIVED_EFC_FIELDS)
     state = ("qpos", "qvel", "qacc", "qacc_warmstart", "time", "tree_asleep", "tree_awake")
     try:
       for finalize in (False, True):
@@ -1271,19 +1282,16 @@ class FusedWorldTest(absltest.TestCase):
         m.opt.fused_world_publish_derived = False
         self.assertFalse(fused_world.publish_derived(m))
         self._run_step(m, d_opt, fused=True, finalize=finalize)
-        refreshed = fused_world.DERIVED_FIELDS_REFRESHED if finalize else ()
-        stale = tuple(name for name in fused_world.DERIVED_FIELDS if name not in refreshed)
-        self._assert_poisoned(d_opt, stale, True)
-        self._assert_poisoned(d_opt, refreshed, False)
+        self._assert_poisoned(d_opt, fused_world.DERIVED_FIELDS + efc_derived, True)
         self._assert_int_equal(d_opt, d_ref, exact_int)
         self._assert_awake_sets_equal(d_opt, d_ref)
-        scaled = solver_limited + (c_refresh if finalize else ())
+        skipped = c_refresh if finalize else ()
         for name in fields:
-          if name not in scaled:
+          if name not in solver_limited and name not in skipped:
             self._assert_close(name, getattr(d_opt, name).numpy(), getattr(d_ref, name).numpy())
-        for name in scaled:
+        for name in solver_limited:
           self._assert_close_scaled(name, getattr(d_opt, name).numpy(), getattr(d_ref, name).numpy(), rel=1e-4)
-        self._assert_rows_equal(m, d_opt, d_ref)
+        self._assert_rows_equal(m, d_opt, d_ref, skip=fused_world.DERIVED_EFC_FIELDS)
         self.assertGreater(int(d_ref.nefc.numpy().min()), 0)
     finally:
       m.opt.fused_world_publish_derived = True

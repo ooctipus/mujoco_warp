@@ -4995,15 +4995,18 @@ def _world_solver_context(d: types.Data) -> world_solver.WorldSolverContext:
   return ctx
 
 
+def uses_world_solver(m: types.Model, d: types.Data) -> bool:
+  """Whether :func:`solve` dispatches to the per-world solver for this model."""
+  return bool(m.opt.enableflags & types.EnableBit.SLEEP) and bool(m.opt.world_solver) and _world_solver_applicable(m, d)
+
+
 def _solve_world_first(m: types.Model, d: types.Data, active_dofs_fresh: bool = False):
   """World solver for every world, stock compact solve only for the uncertified ones.
 
   The stock fallback runs inside ``wp.capture_if(nstock)``; everything it needs is allocated
-  before the conditional body so the call stays graph-capturable.
+  before the conditional body so the call stays graph-capturable. The compaction maps
+  (dof_cdof, ncdof, nsingleton6) are rebuilt inside the fallback when the caller did not.
   """
-  # keep the compaction maps (dof_cdof, ncdof, nsingleton6) current like the stock path does
-  if not active_dofs_fresh:
-    island.update_active_dofs(m, d)
   wctx = _world_solver_context(d)
   world_solver.world_solve(m, d, wctx)
   # flagged worlds get a longer world-solver pass first: the stock solve below runs over every world
@@ -5020,10 +5023,13 @@ def _solve_world_first(m: types.Model, d: types.Data, active_dofs_fresh: bool = 
     sctx=sctx,
     nsolving=nsolving,
     wctx=wctx,
+    rebuild_maps=not active_dofs_fresh,
   )
 
 
-def _stock_fallback(m, d, m2, d2, sctx, nsolving, wctx):
+def _stock_fallback(m, d, m2, d2, sctx, nsolving, wctx, rebuild_maps=False):
+  if rebuild_maps:
+    island.update_active_dofs(m, d)
   _compact_gather(m, d)
   _solve(m2, d2, sctx, compact=True, stock_world=wctx.stock_world, nstock=wctx.nstock, nsolving=nsolving)
   _compact_scatter(m, d, stock_world=wctx.stock_world)

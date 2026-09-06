@@ -776,7 +776,13 @@ DERIVED_FIELDS = (
   "qfrc_adhesion",
   "cacc",
   "cfrc_int",
+  "cvel",
+  "qLD",
 )
+# ``efc`` row fields that only sensors read (constraint._efc_row publishes them for sensor_acc)
+DERIVED_EFC_FIELDS = ("pos", "margin", "vel", "Jqvel")
+# rebuilt by the finalizing forward_c refresh when the derived fields are published; otherwise the
+# refresh is skipped entirely and these (with qfrc_passive/qfrc_bias) keep their pre-sleep values
 DERIVED_FIELDS_REFRESHED = ("actuator_velocity", "cdof_dot", "qfrc_spring", "qfrc_damper", "cacc", "cfrc_int")
 
 
@@ -785,9 +791,11 @@ def publish_derived(m: Model) -> bool:
 
   False only when ``Option.fused_world_publish_derived`` is False and the model has no sensors
   (sensors read the derived frames, velocities and accelerations). Only host state is read, so the
-  helper is safe under graph capture. Callers that read a field of :data:`DERIVED_FIELDS` from
-  ``Data`` after a step (Newton's ``body_qdd``/``body_parent_f`` conversion reads ``cacc`` and
-  ``cfrc_int``) must leave the option on.
+  helper is safe under graph capture. Callers that read a field of :data:`DERIVED_FIELDS` or
+  :data:`DERIVED_EFC_FIELDS` from ``Data`` after a step (Newton's ``body_qdd``/``body_parent_f``
+  conversion reads ``cacc`` and ``cfrc_int``) must leave the option on. When False the finalizing
+  post-sleep refresh is skipped as well, so ``qfrc_passive`` and ``qfrc_bias`` keep the pre-sleep
+  values of the last substep (the next forward recomputes them).
   """
   return bool(getattr(m.opt, "fused_world_publish_derived", True) or m.nsensor > 0)
 
@@ -1504,8 +1512,8 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET:
     if is_body:
       if tid > 0:
         _st_body_sv(cacc_sh, tid, cacc)
-      _st_sv(cvel_out, worldid, tid, cvel)
       if PUBLISH:
+        _st_sv(cvel_out, worldid, tid, cvel)
         _st_sv(cacc_out, worldid, tid, cacc)
     _sync()
 
@@ -1674,7 +1682,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET:
 
 
 @cache_kernel
-def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG: int):
+def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG: int, PUBLISH: bool, COMPACT_MAPS: bool):
   BLOCK = NV
   # dense scratch slot per tree: n*n factor followed by n solution entries
   SMALL_SLOT = NSMALL * NSMALL + NSMALL
@@ -1802,9 +1810,11 @@ def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG
       d_rownnz = M_rownnz[tid]
       d_block_adr = qLD_block_adr[tid]
       d_start = tree_dofadr[d_tree]
-      dof_cdof_out[worldid, tid] = -1
-    for i in range(tid, nvmax_pad_in, BLOCK):
-      cdof_dof_out[worldid, i] = -1
+    if wp.static(COMPACT_MAPS):
+      if is_dof:
+        dof_cdof_out[worldid, tid] = -1
+      for i in range(tid, nvmax_pad_in, BLOCK):
+        cdof_dof_out[worldid, i] = -1
     _sync()
     any_xfrc = (xfrc_flags_sh[0] + xfrc_flags_sh[1] + xfrc_flags_sh[2] + xfrc_flags_sh[3]) != 0
     d_dense = is_dof and d_block_adr != Q_LD_BLOCK_COMPACT
@@ -1874,91 +1884,93 @@ def _forward_b_kernel(NB: int, NV: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG
     _dense_factor_solve(fac_sh, d_dense, d_base, d_n, d_i, nvtree_max)
     if d_dense:
       # publish the packed upper factor (the unused lower triangle reads as zero) and the solution
-      for r in range(d_n):
-        value = float(0.0)
-        if d_i >= r:
-          value = fac_sh[d_base + r * d_n + d_i]
-        qLD_out[worldid, d_block_adr + r * d_n + d_i] = value
+      if wp.static(PUBLISH):
+        for r in range(d_n):
+          value = float(0.0)
+          if d_i >= r:
+            value = fac_sh[d_base + r * d_n + d_i]
+          qLD_out[worldid, d_block_adr + r * d_n + d_i] = value
       x = fac_sh[d_base + d_n * d_n + d_i]
       if tree_awake_sh[d_tree] == 0:
         x = 0.0
       qacc_smooth_out[worldid, tid] = x
 
-    # ------------------------------------------- Q3: compaction layout (island._compact_dof_layout)
-    if tid == 0:
-      count = int(0)
-      singleton_count = int(0)
-      for t in range(ntree):
-        island_id = tree_island_sh[t]
-        if tree_awake_sh[t] == 1 and island_id >= 0:
-          num = tree_dofnum_sh[t]
-          count += num
-          if num == 6 and island_nv_sh[island_id] == 6:
-            singleton_count += 1
-
-      if count > nvmax_in:
-        if warn_overflow:
-          wp.printf(
-            "nvmax overflow: world %d needs %d active DOFs but nvmax = %d (behavior undefined)\n",
-            worldid,
-            count,
-            nvmax_in,
-          )
-        overflow_out[worldid] = overflow_out[worldid] | OverflowType.NVMAX
-        ncdof_out[worldid] = nvmax_in
-        nsingleton6_out[worldid] = 0
-        _st_misc_i(layout_sh, 0, nvmax_in)
-        _st_misc_i(layout_sh, 1, 0)
-      else:
-        general_count = count - 6 * singleton_count
-        general_end = int(0)
-        if general_count > 0:
-          general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
-        # keep the final slot free for the augmented Cholesky column; fold six-DOF trees back into
-        # the aligned general block only as far as necessary
-        while singleton_count > 0 and general_end + 6 * singleton_count >= nvmax_pad_in:
-          singleton_count -= 1
-          general_count += 6
-          general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
-        ncdof_out[worldid] = count
-        nsingleton6_out[worldid] = singleton_count
-        _st_misc_i(layout_sh, 0, count)
-        _st_misc_i(layout_sh, 1, singleton_count)
-    _sync()
-
-    # ---------------------------------------------- Q3b: compaction maps (island._map_compact_dofs)
-    if is_tree:
-      if tree_awake_sh[tid] != 0 and tree_island_sh[tid] >= 0:
-        singleton_count = layout_sh[1]
-        general_count = layout_sh[0] - 6 * singleton_count
-        general_end = int(0)
-        if general_count > 0:
-          general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
-
-        # prefix counts preserve tree order while each tree maps independently
-        general = int(0)
-        singleton = int(0)
-        for t in range(tid):
+    if wp.static(COMPACT_MAPS):
+      # ----------------------------------------- Q3: compaction layout (island._compact_dof_layout)
+      if tid == 0:
+        count = int(0)
+        singleton_count = int(0)
+        for t in range(ntree):
           island_id = tree_island_sh[t]
-          if tree_awake_sh[t] == 0 or island_id < 0:
-            continue
-          is_singleton = singleton < singleton_count and tree_dofnum_sh[t] == 6 and island_nv_sh[island_id] == 6
-          if is_singleton:
-            singleton += 1
-          else:
-            general += tree_dofnum_sh[t]
+          if tree_awake_sh[t] == 1 and island_id >= 0:
+            num = tree_dofnum_sh[t]
+            count += num
+            if num == 6 and island_nv_sh[island_id] == 6:
+              singleton_count += 1
 
-        island_id = tree_island_sh[tid]
-        is_singleton = singleton < singleton_count and t_n == 6 and island_nv_sh[island_id] == 6
-        start = general
-        if is_singleton:
-          start = general_end + 6 * singleton
-        for j in range(t_n):
-          compact = start + j
-          if singleton_count > 0 or compact < nvmax_in:
-            dof = t_start + j
-            dof_cdof_out[worldid, dof] = compact
-            cdof_dof_out[worldid, compact] = dof
+        if count > nvmax_in:
+          if warn_overflow:
+            wp.printf(
+              "nvmax overflow: world %d needs %d active DOFs but nvmax = %d (behavior undefined)\n",
+              worldid,
+              count,
+              nvmax_in,
+            )
+          overflow_out[worldid] = overflow_out[worldid] | OverflowType.NVMAX
+          ncdof_out[worldid] = nvmax_in
+          nsingleton6_out[worldid] = 0
+          _st_misc_i(layout_sh, 0, nvmax_in)
+          _st_misc_i(layout_sh, 1, 0)
+        else:
+          general_count = count - 6 * singleton_count
+          general_end = int(0)
+          if general_count > 0:
+            general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
+          # keep the final slot free for the augmented Cholesky column; fold six-DOF trees back into
+          # the aligned general block only as far as necessary
+          while singleton_count > 0 and general_end + 6 * singleton_count >= nvmax_pad_in:
+            singleton_count -= 1
+            general_count += 6
+            general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
+          ncdof_out[worldid] = count
+          nsingleton6_out[worldid] = singleton_count
+          _st_misc_i(layout_sh, 0, count)
+          _st_misc_i(layout_sh, 1, singleton_count)
+      _sync()
+
+      # -------------------------------------------- Q3b: compaction maps (island._map_compact_dofs)
+      if is_tree:
+        if tree_awake_sh[tid] != 0 and tree_island_sh[tid] >= 0:
+          singleton_count = layout_sh[1]
+          general_count = layout_sh[0] - 6 * singleton_count
+          general_end = int(0)
+          if general_count > 0:
+            general_end = ((general_count + tile_size_in - 1) // tile_size_in) * tile_size_in
+
+          # prefix counts preserve tree order while each tree maps independently
+          general = int(0)
+          singleton = int(0)
+          for t in range(tid):
+            island_id = tree_island_sh[t]
+            if tree_awake_sh[t] == 0 or island_id < 0:
+              continue
+            is_singleton = singleton < singleton_count and tree_dofnum_sh[t] == 6 and island_nv_sh[island_id] == 6
+            if is_singleton:
+              singleton += 1
+            else:
+              general += tree_dofnum_sh[t]
+
+          island_id = tree_island_sh[tid]
+          is_singleton = singleton < singleton_count and t_n == 6 and island_nv_sh[island_id] == 6
+          start = general
+          if is_singleton:
+            start = general_end + 6 * singleton
+          for j in range(t_n):
+            compact = start + j
+            if singleton_count > 0 or compact < nvmax_in:
+              dof = t_start + j
+              dof_cdof_out[worldid, dof] = compact
+              cdof_dof_out[worldid, compact] = dof
 
   return kernel
 
@@ -1982,17 +1994,61 @@ def _contact_row(
   efc_aref_out: wp.array2d[float],
   efc_frictionloss_out: wp.array2d[float],
   efc_Jqvel_out: wp.array2d[float],
+  publish_sensor_fields: int,
 ):
-  """Row parameters of one contact row from its contact's (k, b, imp, D) (constraint._efc_row)."""
-  efc_Jqvel_out[worldid, efcid] = Jqvel
+  """Row parameters of one contact row from its contact's (k, b, imp, D) (constraint._efc_row).
+
+  ``publish_sensor_fields`` gates the fields only sensors read (:data:`DERIVED_EFC_FIELDS`).
+  """
   efc_D_out[worldid, efcid] = kbid[3]
-  efc_vel_out[worldid, efcid] = Jqvel
   efc_aref_out[worldid, efcid] = -kbid[0] * kbid[2] * pos - kbid[1] * Jqvel
-  efc_pos_out[worldid, efcid] = pos + margin
-  efc_margin_out[worldid, efcid] = margin
+  if publish_sensor_fields != 0:
+    efc_Jqvel_out[worldid, efcid] = Jqvel
+    efc_vel_out[worldid, efcid] = Jqvel
+    efc_pos_out[worldid, efcid] = pos + margin
+    efc_margin_out[worldid, efcid] = margin
   efc_frictionloss_out[worldid, efcid] = 0.0
   efc_type_out[worldid, efcid] = efc_type
   efc_id_out[worldid, efcid] = cid
+
+
+@wp.func
+def _general_row(
+  opt_disableflags: int,
+  worldid: int,
+  timestep: float,
+  efcid: int,
+  pos_aref: float,
+  pos_imp: float,
+  invweight: float,
+  solref: wp.vec2,
+  solimp: vec5,
+  margin: float,
+  vel: float,
+  frictionloss: float,
+  type: int,
+  id: int,
+  type_out: wp.array2d[int],
+  id_out: wp.array2d[int],
+  pos_out: wp.array2d[float],
+  margin_out: wp.array2d[float],
+  D_out: wp.array2d[float],
+  vel_out: wp.array2d[float],
+  aref_out: wp.array2d[float],
+  frictionloss_out: wp.array2d[float],
+  publish_sensor_fields: int,
+):
+  """constraint._efc_row with the sensor-only fields (:data:`DERIVED_EFC_FIELDS`) behind a flag."""
+  kbid = constraint._efc_kbid(opt_disableflags, timestep, pos_imp, invweight, solref, solimp)
+  D_out[worldid, efcid] = kbid[3]
+  aref_out[worldid, efcid] = -kbid[0] * kbid[2] * pos_aref - kbid[1] * vel
+  if publish_sensor_fields != 0:
+    vel_out[worldid, efcid] = vel
+    pos_out[worldid, efcid] = pos_aref + margin
+    margin_out[worldid, efcid] = margin
+  frictionloss_out[worldid, efcid] = frictionloss
+  type_out[worldid, efcid] = type
+  id_out[worldid, efcid] = id
 
 
 # ------------------------------------------------------------------------------------------------
@@ -2094,7 +2150,7 @@ _FORWARD_M_MIN_BLOCKS = 7
 
 
 @cache_kernel
-def _forward_m_kernel(NB: int, NV: int, NT: int):
+def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool):
   BLOCK = NV
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK, _FORWARD_M_MIN_BLOCKS))
@@ -2433,7 +2489,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
           else:
             _mark_tree_edge(edge_sh, first_tree, -1)
 
-      constraint._efc_row(
+      _general_row(
         opt_disableflags,
         worldid,
         timestep,
@@ -2456,6 +2512,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         efc_vel_out,
         efc_aref_out,
         efc_frictionloss_out,
+        wp.static(int(PUBLISH)),
       )
 
     if f_rows == 1 and f_efcid < njmax_in:
@@ -2471,7 +2528,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         efc_J_colind_out[worldid, 0, f_rowadr] = tid
         efc_J_out[worldid, 0, f_rowadr] = 1.0
       _mark_tree_edge(edge_sh, d_tree, -1)
-      constraint._efc_row(
+      _general_row(
         opt_disableflags,
         worldid,
         timestep,
@@ -2494,6 +2551,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         efc_vel_out,
         efc_aref_out,
         efc_frictionloss_out,
+        wp.static(int(PUBLISH)),
       )
 
     if l_rows == 1 and l_efcid < njmax_in:
@@ -2510,7 +2568,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         efc_J_colind_out[worldid, 0, l_rowadr] = l_dofadr
         efc_J_out[worldid, 0, l_rowadr] = J
       _mark_tree_edge(edge_sh, dof_treeid[l_dofadr], -1)
-      constraint._efc_row(
+      _general_row(
         opt_disableflags,
         worldid,
         timestep,
@@ -2533,6 +2591,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
         efc_vel_out,
         efc_aref_out,
         efc_frictionloss_out,
+        wp.static(int(PUBLISH)),
       )
     row_base = ne + nf + nl
 
@@ -2662,6 +2721,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
                 efc_aref_out,
                 efc_frictionloss_out,
                 efc_Jqvel_out,
+                wp.static(int(PUBLISH)),
               )
       else:
         cid = -1
@@ -2846,6 +2906,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int):
                   efc_aref_out,
                   efc_frictionloss_out,
                   efc_Jqvel_out,
+                  wp.static(int(PUBLISH)),
                 )
       _sync()
       # next chunk, third round
@@ -2983,7 +3044,7 @@ _FORWARD_C_MIN_BLOCKS = 7
 
 
 @cache_kernel
-def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG: int, REFRESH: bool):
+def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: int, NBIG: int, REFRESH: bool, PUBLISH: bool):
   """forward_c kernel factory; ``NU`` is the actuator capacity (a power of two >= nu)."""
   BLOCK = NV
   SMALL_SLOT = NSMALL * NSMALL + NSMALL
@@ -3389,7 +3450,7 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
       qvel_out[worldid, tid] = qvel_sh[tid]
 
     # --------------------------------------------------- C4: post-sleep velocity refresh (finalize)
-    if wp.static(REFRESH):
+    if wp.static(REFRESH and PUBLISH):
       # fwd_velocity on the post-sleep qvel: cdof/cinert/subtree_com are the pre-integration values.
       # Same ancestor-walk structure as forward_a's P6/P8: every body stores its own joint term,
       # then sums the terms of its chain from shared memory (one barrier per pass instead of one per
@@ -3763,14 +3824,17 @@ def forward_a(
 
 
 @event_scope
-def forward_b(m: Model, d: Data):
+def forward_b(m: Model, d: Data, *, compact_maps: bool = True):
   """Fused acceleration stage as one CTA per world.
 
-  ``qfrc_smooth``, ``xfrc_accumulate``, the per-tree factor/solve with the sleeping-tree freeze and
-  the active-DOF compaction maps (``island.update_active_dofs``).
+  ``qfrc_smooth``, ``xfrc_accumulate``, the per-tree factor/solve with the sleeping-tree freeze and,
+  with ``compact_maps``, the active-DOF compaction maps (``island.update_active_dofs``). The
+  per-world solver derives its own slot map, so its path passes False and lets the stock fallback
+  rebuild the maps on demand; the packed factor ``qLD`` is published only with
+  :func:`publish_derived` (the stock fallback re-factors).
   """
   wp.launch(
-    _forward_b_kernel(NBODY_CAP, NV_CAP, NTREE_CAP, NVTREE_SMALL, NVTREE_CAP, NBIG_CAP),
+    _forward_b_kernel(NBODY_CAP, NV_CAP, NTREE_CAP, NVTREE_SMALL, NVTREE_CAP, NBIG_CAP, publish_derived(m), bool(compact_maps)),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nbody,
@@ -3842,7 +3906,7 @@ def _launch_forward_m(m: Model, d: Data, groups: ContactGroups):
     ptr=d.contact.frame.ptr, dtype=wp.vec3, shape=(d.naconmax, 3), device=d.contact.frame.device, copy=False
   )
   wp.launch(
-    _forward_m_kernel(NBODY_CAP, NV_CAP, NTREE_CAP),
+    _forward_m_kernel(NBODY_CAP, NV_CAP, NTREE_CAP, publish_derived(m)),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nv,
@@ -3959,7 +4023,9 @@ def forward_c(m: Model, d: Data, *, finalize: bool):
   ``sleep.update_sleep``.
   """
   wp.launch(
-    _forward_c_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, NVTREE_SMALL, NVTREE_CAP, NBIG_CAP, bool(finalize)),
+    _forward_c_kernel(
+      NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, NVTREE_SMALL, NVTREE_CAP, NBIG_CAP, bool(finalize), publish_derived(m)
+    ),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nbody,
