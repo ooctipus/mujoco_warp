@@ -117,6 +117,11 @@ def _sync():
   pass
 
 
+@wp.func_native(snippet="__syncwarp();")
+def _syncwarp():
+  pass
+
+
 # Warp-level ballot/popcount for deterministic in-block compaction (all 32 lanes must participate).
 # Multi-line snippets must live at module scope: Warp dedents the function source before parsing.
 @wp.func_native(
@@ -381,6 +386,45 @@ def _dense_factor_solve(fac_sh: wp.tile[float, _FAC_SIZE], active: bool, base: i
         value -= fac_sh[base + j * n + k] * fac_sh[xbase + k]
       _st_fac_sh(fac_sh, xbase + j, value / fac_sh[base + j * n + j])
     _sync()
+
+
+@wp.func
+def _dense_factor_solve_warp(fac_sh: wp.tile[float, _FAC_SIZE], active: bool, base: int, n: int, j: int, nmax: int):
+  """``_dense_factor_solve`` for blocks whose dof columns all lie within one warp.
+
+  Same arithmetic and order (bitwise results); the column steps are separated by ``__syncwarp``
+  instead of block barriers, so every thread of every warp must still call it with the same
+  ``nmax`` while only the warps holding active columns do work. Callers guarantee that no active
+  block straddles a warp boundary.
+  """
+  xbase = base + n * n
+  for i in range(nmax):
+    if active and i < n and j >= i:
+      diagonal_value = fac_sh[base + i * n + i]
+      for k in range(i):
+        factor = fac_sh[base + k * n + i]
+        diagonal_value -= factor * factor
+      diagonal_factor = wp.sqrt(diagonal_value)
+      diagonal_inv = 1.0 / diagonal_factor
+      if j == i:
+        rhs_value = fac_sh[xbase + i]
+        for k in range(i):
+          rhs_value -= fac_sh[base + k * n + i] * fac_sh[xbase + k]
+        _st_fac_sh(fac_sh, base + i * n + i, diagonal_factor)
+        _st_fac_sh(fac_sh, xbase + i, rhs_value * diagonal_inv)
+      else:
+        value = fac_sh[base + j * n + i]
+        for k in range(i):
+          value -= fac_sh[base + k * n + i] * fac_sh[base + k * n + j]
+        _st_fac_sh(fac_sh, base + i * n + j, value * diagonal_inv)
+    _syncwarp()
+  for r in range(nmax):
+    if active and r < n and j == n - 1 - r:
+      value = fac_sh[xbase + j]
+      for k in range(j + 1, n):
+        value -= fac_sh[base + j * n + k] * fac_sh[xbase + k]
+      _st_fac_sh(fac_sh, xbase + j, value / fac_sh[base + j * n + j])
+    _syncwarp()
 
 
 @wp.func
@@ -3174,6 +3218,7 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
     tree_dofnum_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
     tree_base_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
     can_sleep_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
+    tree_implicit_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
     body_awake_sh = wp.tile_empty(shape=(NB,), dtype=int, storage="shared")
     misc_sh = wp.tile_empty(shape=(16,), dtype=int, storage="shared")
 
@@ -3189,6 +3234,8 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
     t_n = int(0)
     t_start = int(0)
     t_compact = int(0)
+    if tid == 0:
+      _st_misc16_i(misc_sh, 15, 0)
     if is_tree:
       t_n = tree_dofnum[tid]
       t_start = tree_dofadr[tid]
@@ -3196,6 +3243,7 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
       _st_tree32_i(tree_island_sh, tid, tree_island_in[worldid, tid])
       _st_tree32_i(tree_dofnum_sh, tid, t_n)
       _st_tree32_i(can_sleep_sh, tid, 1)
+      _st_tree32_i(tree_implicit_sh, tid, 0)
       if qLD_block_adr[t_start] == Q_LD_BLOCK_COMPACT:
         t_compact = 1
       base = tid * wp.static(SMALL_SLOT)
@@ -3269,6 +3317,14 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
     # solver). The integrated acceleration of a dof stays with its own thread.
     qacc_int = d_qacc
     if implicit_factor != 0:
+      # A dense tree whose dofs all have a zero velocity derivative would factor M itself and
+      # solve M^-1 (M qacc) = qacc, so it takes qacc directly (fp32 round-off apart). The trees
+      # that do carry a derivative are factored per warp with __syncwarp whenever each of them lies
+      # within one warp; a straddling tree falls back to the block-barrier factor.
+      diag = float(0.0)
+      rhs = float(0.0)
+      rowadr = int(0)
+      rownnz = int(0)
       if is_dof:
         rowadr = M_rowadr[tid]
         rownnz = M_rownnz[tid]
@@ -3285,10 +3341,19 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
         qderiv *= timestep
         diag = M_in[worldid, rowadr + rownnz - 1] - qderiv
         rhs = efc_Ma_in[worldid, tid]
+        if qderiv != 0.0 and d_tree >= 0:
+          _st_tree32_i(tree_implicit_sh, d_tree, 1)
+          if d_dense and (d_start >> 5) != ((d_start + d_n - 1) >> 5):
+            _st_misc16_i(misc_sh, 15, 1)
+      _sync()
+      d_factor = False
+      if d_dense:
+        d_factor = tree_implicit_sh[d_tree] != 0
+      if is_dof:
         if qLD_block_adr[tid] == Q_LD_BLOCK_COMPACT:
           inverse = 1.0 / diag
           qacc_int = inverse * rhs
-        else:
+        elif d_factor:
           # this dof's row of the dense block (zeroed first: branching trees leave structural zeros)
           for c in range(d_n):
             _st_fac(fac_sh, d_base + d_i * d_n + c, 0.0)
@@ -3298,9 +3363,13 @@ def _forward_c_kernel(NB: int, NV: int, NU: int, NT: int, NSMALL: int, NBIGDOF: 
           _st_fac(fac_sh, d_base + d_i * d_n + d_i, diag)
           _st_fac(fac_sh, d_base + d_n * d_n + d_i, rhs)
       _sync()
-      # one column per dof thread (smooth._small_cholesky_factorize_solve_block order)
-      _dense_factor_solve(fac_sh, d_dense, d_base, d_n, d_i, nvtree_max)
-      if d_dense:
+      # one column per dof thread (smooth._small_cholesky_factorize_solve_block order); the path is
+      # block-uniform since every thread reads the same flag after the barrier
+      if misc_sh[15] == 0:
+        _dense_factor_solve_warp(fac_sh, d_factor, d_base, d_n, d_i, nvtree_max)
+      else:
+        _dense_factor_solve(fac_sh, d_factor, d_base, d_n, d_i, nvtree_max)
+      if d_factor:
         qacc_int = fac_sh[d_base + d_n * d_n + d_i]
 
     # --------------------------------------------------------- C2: advance velocity, position, time
