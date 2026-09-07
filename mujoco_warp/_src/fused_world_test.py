@@ -845,6 +845,8 @@ class FusedWorldTest(absltest.TestCase):
       row_capacity=capacity,
       row_count=wp.zeros(self.NWORLD, dtype=int),
       row_ids=wp.zeros(n_ids, dtype=int),
+      tree_asleep_prev=None,
+      wake_event=None,
     )
 
     self._run_forward(m, d_ref, fused=False)
@@ -888,6 +890,85 @@ class FusedWorldTest(absltest.TestCase):
     # the refreshed dist carries the fp32 roundoff of the body-frame round trip (~1e-8 m), which the
     # contact stiffness scales into aref by ~1e3
     self._assert_rows_equal(m, d_fused, d_ref, rtol=1e-4, atol=1e-4)
+
+  def test_contact_records_collision_wake(self):
+    """forward_a wakes a sleeping tree touched by an awake one through the records' tree pairs."""
+    mjm, m, datas = self._make(seed=9, contact=True, resting=True)
+    d_ref, d_fused = datas
+    d = d_fused
+    # world 2: tree 5 asleep (self cycle) and quiet; world 3: tree 6 asleep, no touching contact
+    tree_asleep = d.tree_asleep.numpy()
+    qvel = d.qvel.numpy()
+    tree_dofadr, tree_dofnum = m.tree_dofadr.numpy(), m.tree_dofnum.numpy()
+    for w, t in ((2, 5), (3, 6)):
+      tree_asleep[w, t] = t
+      qvel[w, tree_dofadr[t] : tree_dofadr[t] + tree_dofnum[t]] = 0.0
+    d.tree_asleep.assign(tree_asleep)
+    d.qvel.assign(qvel)
+    sleep.update_sleep(m, d)
+    smooth.kinematics(m, d_ref)
+    _share_contacts(m, d_ref, d_fused)
+    nacon = int(d.nacon.numpy()[0])
+    capacity = d.naconmax // self.NWORLD
+    worldid = d.contact.worldid.numpy()[:nacon]
+    count = np.bincount(worldid, minlength=self.NWORLD)
+    n_ids = self.NWORLD * capacity
+    # records: every contact of world w sits at id w * capacity + rank; the first contact of world 2
+    # is declared between the arm tree (awake) and tree 5; the others carry the same tree twice (no
+    # wake)
+    new_cid = np.zeros(nacon, dtype=np.int64)
+    rank = np.zeros(self.NWORLD, dtype=np.int64)
+    for c in range(nacon):
+      new_cid[c] = worldid[c] * capacity + rank[worldid[c]]
+      rank[worldid[c]] += 1
+    for f in dataclasses.fields(d.contact):
+      src = getattr(d.contact, f.name)
+      if isinstance(src, wp.array) and src.shape[0] == d.naconmax:
+        values = src.numpy()
+        moved = values.copy()
+        moved[new_cid] = values[:nacon]
+        src.assign(moved)
+    trees = np.zeros((n_ids, 2), dtype=np.int32)
+    first_w2 = int(new_cid[np.flatnonzero(worldid == 2)[0]])
+    trees[first_w2] = (0, 5)
+    tree_asleep_prev = np.full((self.NWORLD, m.ntree), 0, dtype=np.int32)  # "asleep" everywhere at the snapshot
+    prev = wp.array(tree_asleep_prev, dtype=int)
+    wake_event = wp.zeros(1, dtype=int)
+    records = mjw.ContactRecords(
+      capacity=capacity,
+      count=wp.array(count.astype(np.int32), dtype=int),
+      body=wp.zeros(n_ids, dtype=wp.vec2i),
+      tree=wp.array(trees, dtype=wp.vec2i),
+      point0=wp.zeros(n_ids, dtype=wp.vec3),
+      point1=wp.zeros(n_ids, dtype=wp.vec3),
+      normal=wp.zeros(n_ids, dtype=wp.vec3),
+      offset0=wp.zeros(n_ids, dtype=wp.vec3),
+      offset1=wp.zeros(n_ids, dtype=wp.vec3),
+      radius=wp.full(n_ids, -1.0, dtype=float),  # dist = +1 for every contact: no rows
+      row_capacity=capacity,
+      row_count=wp.zeros(self.NWORLD, dtype=int),
+      row_ids=wp.zeros(n_ids, dtype=int),
+      tree_asleep_prev=prev,
+      wake_event=wake_event,
+    )
+    asleep_before = d.tree_asleep.numpy().copy()
+    m.callback.contact_records = records
+    try:
+      self._run_forward(m, d, fused=True)
+    finally:
+      m.callback.contact_records = None
+    asleep_after = d.tree_asleep.numpy()
+    # tree 5 of world 2 woke with the arm's countdown; tree 6 of world 3 (no touching contact)
+    # stayed asleep
+    self.assertLess(asleep_after[2, 5], 0)
+    self.assertEqual(asleep_after[2, 5], asleep_after[2, 0])
+    self.assertEqual(asleep_after[3, 6], asleep_before[3, 6])
+    # the wake was recorded for the supplier's injection; the scan refreshed the snapshot elsewhere
+    prev_after = prev.numpy()
+    self.assertEqual(prev_after[2, 5], asleep_after[2, 5])
+    self.assertEqual(int(wake_event.numpy()[0]), 1)
+    self.assertTrue((prev_after[3] == asleep_after[3]).all())
+    self.assertEqual(int(records.row_count.numpy().sum()), 0)
 
   def test_efc_overflow_matches_stock(self):
     """Rows beyond njmax are dropped and flagged like stock; the written rows are valid rows."""

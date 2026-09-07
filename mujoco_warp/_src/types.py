@@ -1011,6 +1011,14 @@ class ContactRecords:
     row_count: row-building contacts of each world                        (nworld,)
     row_ids: row-building ids of world w at [w * row_capacity, + row_count[w])
              (nworld * row_capacity,)
+    tree_asleep_prev: supplier's sleep-state snapshot for its wake injection, or None; the position
+      stage flags trees that woke since it and refreshes it                (nworld, ntree)
+    wake_event: raised when a tree woke since the supplier's snapshot, or None (1,)
+
+  With records bound, the position stage also performs the collision wake of
+  ``sleep.wake_collision`` over the supplier's contacts: a sleeping tree touched by an awake one (in
+  the snapshot taken after the force/velocity wake) wakes with its partner's countdown, requests
+  applied in id order.
   """
 
   capacity: int
@@ -1026,6 +1034,8 @@ class ContactRecords:
   row_capacity: int
   row_count: wp.array[int]
   row_ids: wp.array[int]
+  tree_asleep_prev: wp.array2d[int] | None = None
+  wake_event: wp.array[int] | None = None
 
 
 @dataclasses.dataclass
