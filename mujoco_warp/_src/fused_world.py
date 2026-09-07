@@ -25,9 +25,9 @@ constraint solver for models that satisfy :func:`fused_world`:
   and pyramidal contact rows from the world's contact list), ``sleep.wake_equality``,
   ``sleep.update_sleep`` and the ``island`` bitset flood fill. One small bucket launch (contact ids
   per world) precedes it because externally supplied contacts carry a global id order, unless the
-  supplier binds ``Callback.contact_records``: its contacts then sit in world-contiguous id ranges
-  and forward_m refreshes their ``dist``/``pos`` from the body poses of the step and applies the row
-  predicate itself.
+  supplier binds ``Callback.contact_records``: its contacts then sit in world-contiguous id ranges,
+  ``forward_a`` refreshes their ``dist``/``pos`` from the body poses of the step and lists the
+  row-building ids per world itself, and no bucket pass runs.
 * ``forward_b``: ``qfrc_smooth`` (with the sleeping-tree freeze), ``xfrc_accumulate``, the per-tree
   factor/solve for ``qacc_smooth`` (``qLD``/``qLDiagInv``) and the active-DOF compaction maps that
   the compact constraint solver consumes.
@@ -113,10 +113,6 @@ NBIG_CAP = 2
 
 # tree_asleep value for a fully awake tree (see sleep.py)
 _K_AWAKE_VAL = -(1 + types.MJ_MINAWAKE)
-
-# row-building contacts per world that forward_m compacts from a ContactRecords range (a world with
-# more raises OverflowType.NARROWPHASE and keeps the first ones)
-_ELIGIBLE_CAP = 512
 
 
 @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -342,10 +338,6 @@ def _st_chunk_i(values: wp.tile[int, NV_CAP], index: int, value: int): ...
 
 @wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
 def _st_chunk_f(values: wp.tile[float, NV_CAP], index: int, value: float): ...
-
-
-@wp.func_native(snippet="values.data(wp::tile_coord(index)) = value;")
-def _st_elig_i(values: wp.tile[int, _ELIGIBLE_CAP], index: int, value: int): ...
 
 
 # dense per-tree scratch of forward_b / forward_c: n*n factor, then n solution entries per tree
@@ -636,18 +628,19 @@ def _refresh_record(
   rec_offset1: wp.array[wp.vec3],
   rec_radius: wp.array[float],
   xpos_in: wp.array2d[wp.vec3],
-  xquat_in: wp.array2d[wp.quat],
+  xquat_sh: wp.tile[wp.quat, NBODY_CAP],
   contact_dist: wp.array[float],
   contact_pos: wp.array[wp.vec3],
 ) -> float:
   """Recompute ``dist``/``pos`` of contact ``cid`` from this step's body poses (``ContactRecords``).
 
-  Returns the new ``dist``. Operands and their order follow the supplier's own refresh, so the rows
-  built from them are those of a supplier-side refresh.
+  The orientations come from the CTA's resident ``xquat`` tile, the positions from the canonical
+  ``xpos`` this CTA published. Returns the new ``dist``. Operands and their order follow the
+  supplier's own refresh, so the rows built from them are those of a supplier-side refresh.
   """
   bodies = rec_body[cid]
-  qa = xquat_in[worldid, bodies[0]]
-  qb = xquat_in[worldid, bodies[1]]
+  qa = xquat_sh[bodies[0]]
+  qb = xquat_sh[bodies[1]]
   X_a = wp.transform(xpos_in[worldid, bodies[0]], wp.quat(qa[1], qa[2], qa[3], qa[0]))
   X_b = wp.transform(xpos_in[worldid, bodies[1]], wp.quat(qb[1], qb[2], qb[3], qb[0]))
   point_a = rec_point0[cid]
@@ -905,7 +898,7 @@ def _pow2_at_least(n: int) -> int:
 
 
 @cache_kernel
-def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET: bool):
+def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET: bool, RECORDS: bool):
   """forward_a kernel factory.
 
   ``PUBLISH`` compiles the derived publishes in (see ``Option.fused_world_publish_derived``), so the
@@ -1013,10 +1006,31 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET:
     # In:
     world_ids: wp.array[int],
     world_count: wp.array[int],
+    # ContactRecords of an external supplier (RECORDS variant): the world's contacts occupy the ids
+    # [worldid * con_capacity_in, + con_count_in[worldid]); the row-building ones are listed per
+    # world in the supplier's row lists
+    con_capacity_in: int,
+    con_count_in: wp.array[int],
+    rec_body: wp.array[wp.vec2i],
+    rec_point0: wp.array[wp.vec3],
+    rec_point1: wp.array[wp.vec3],
+    rec_normal: wp.array[wp.vec3],
+    rec_offset0: wp.array[wp.vec3],
+    rec_offset1: wp.array[wp.vec3],
+    rec_radius: wp.array[float],
+    contact_type_in: wp.array[int],
+    contact_includemargin_in: wp.array[float],
+    row_capacity_in: int,
     # Data out:
     tree_asleep_out: wp.array2d[int],
     tree_awake_out: wp.array2d[int],
     world_con_count_out: wp.array[int],
+    row_count_out: wp.array[int],
+    row_ids_out: wp.array[int],
+    contact_dist_out: wp.array[float],
+    contact_pos_out: wp.array[wp.vec3],
+    contact_efc_address_out: wp.array2d[int],
+    con_overflow_out: wp.array[int],
     xpos_out: wp.array2d[wp.vec3],
     xquat_out: wp.array2d[wp.quat],
     xmat_out: wp.array2d[wp.mat33],
@@ -1079,6 +1093,7 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET:
     act_dof_sh = wp.tile_empty(shape=(NU,), dtype=int, storage="shared")
     tree_asleep_sh = wp.tile_empty(shape=(NT,), dtype=int, storage="shared")
     misc_sh = wp.tile_empty(shape=(16,), dtype=int, storage="shared")
+    scan_sh = wp.tile_empty(shape=(8,), dtype=int, storage="shared")
 
     lane = tid & 31
     warp = tid >> 5
@@ -1771,6 +1786,55 @@ def _forward_a_kernel(NB: int, NV: int, NU: int, NT: int, PUBLISH: bool, SUBSET:
           qfrc = wp.clamp(qfrc, d_frcrange[0], d_frcrange[1])
         qfrc_actuator_out[worldid, tid] = qfrc
 
+    if wp.static(RECORDS):
+      # ------------------------------------------ P10: external contact refresh and row predicate
+      # the world's contacts sit in the id range [cstart, cstart + nlive): refresh dist/pos of every
+      # constraint contact from this step's poses (xquat resident, xpos from the canonical array
+      # this CTA published), reset the addresses of the contacts that build no rows and list the
+      # row-building ids for forward_m in the supplier's row list of this world (predicate of
+      # constraint._efc_contact_init); the supplier appends the ids it injects afterwards
+      p10_lane = tid & 31
+      p10_warp = tid >> 5
+      nlive = wp.min(con_count_in[worldid], con_capacity_in)
+      cstart = worldid * con_capacity_in
+      lstart = worldid * row_capacity_in
+      ncon = int(0)
+      for s0 in range(0, nlive, BLOCK):
+        s = s0 + tid
+        cid = cstart + s
+        eligible = int(0)
+        if s < nlive:
+          if (contact_type_in[cid] & ContactType.CONSTRAINT) != 0:
+            dist = _refresh_record(
+              cid,
+              worldid,
+              rec_body,
+              rec_point0,
+              rec_point1,
+              rec_normal,
+              rec_offset0,
+              rec_offset1,
+              rec_radius,
+              xpos_out,
+              xquat_sh,
+              contact_dist_out,
+              contact_pos_out,
+            )
+            if dist - contact_includemargin_in[cid] < 0.0:
+              eligible = 1
+          if eligible == 0:
+            for k in range(contact_efc_address_out.shape[1]):
+              contact_efc_address_out[cid, k] = -1
+        slot = ncon + _block_scan(scan_sh, eligible, p10_lane, p10_warp)
+        if eligible == 1:
+          if slot < row_capacity_in:
+            row_ids_out[lstart + slot] = cid
+          else:
+            wp.atomic_or(con_overflow_out, worldid, OverflowType.NARROWPHASE)
+        ncon += scan_sh[4]
+      if tid == 0:
+        row_count_out[worldid] = wp.min(ncon, row_capacity_in)
+
   return kernel
 
 
@@ -2251,12 +2315,16 @@ def _records_placeholder(device) -> types.ContactRecords:
         capacity=0,
         count=wp.zeros(1, dtype=int),
         body=wp.zeros(1, dtype=wp.vec2i),
+        tree=wp.zeros(1, dtype=wp.vec2i),
         point0=wp.zeros(1, dtype=wp.vec3),
         point1=wp.zeros(1, dtype=wp.vec3),
         normal=wp.zeros(1, dtype=wp.vec3),
         offset0=wp.zeros(1, dtype=wp.vec3),
         offset1=wp.zeros(1, dtype=wp.vec3),
         radius=wp.zeros(1, dtype=float),
+        row_capacity=0,
+        row_count=wp.zeros(1, dtype=int),
+        row_ids=wp.zeros(1, dtype=int),
       )
     _RECORDS_PLACEHOLDERS[key] = placeholder
   return placeholder
@@ -2268,8 +2336,7 @@ _FORWARD_M_MIN_BLOCKS = 7
 
 
 @cache_kernel
-def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
-  """forward_m kernel factory; ``RANGES`` reads and refreshes the contacts of ContactRecords."""
+def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool):
   BLOCK = NV
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False, launch_bounds=(BLOCK, _FORWARD_M_MIN_BLOCKS))
@@ -2320,12 +2387,8 @@ def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
     qvel_in: wp.array2d[float],
     eq_active_in: wp.array2d[bool],
     tree_awake_in: wp.array2d[int],
-    xpos_in: wp.array2d[wp.vec3],
-    xquat_in: wp.array2d[wp.quat],
     subtree_com_in: wp.array2d[wp.vec3],
     cdof_in: wp.array2d[wp.spatial_vector],
-    # contact dist/pos are rewritten in place by the RANGES variant
-    contact_type_in: wp.array[int],
     contact_dist_in: wp.array[float],
     contact_dim_in: wp.array[int],
     contact_includemargin_in: wp.array[float],
@@ -2338,13 +2401,6 @@ def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
     world_con_capacity_in: int,
     world_con_count_in: wp.array[int],
     world_con_list_in: wp.array[int],
-    rec_body: wp.array[wp.vec2i],
-    rec_point0: wp.array[wp.vec3],
-    rec_point1: wp.array[wp.vec3],
-    rec_normal: wp.array[wp.vec3],
-    rec_offset0: wp.array[wp.vec3],
-    rec_offset1: wp.array[wp.vec3],
-    rec_radius: wp.array[float],
     # Data out:
     tree_asleep_out: wp.array2d[int],
     tree_awake_out: wp.array2d[int],
@@ -2410,8 +2466,6 @@ def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
     c_D_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
     c_pos_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
     c_margin_sh = wp.tile_empty(shape=(NV,), dtype=float, storage="shared")
-    # row-building contact ids compacted from the world's ContactRecords range (RANGES variant)
-    elig_sh = wp.tile_empty(shape=(_ELIGIBLE_CAP,), dtype=int, storage="shared")
 
     lane = tid & 31
     warp = tid >> 5
@@ -2508,51 +2562,8 @@ def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
     # after the scan
     ncon = int(0)
     cstart = worldid * world_con_capacity_in
-    if wp.static(RANGES):
-      # the world's contacts sit in [cstart, cstart + count): refresh dist/pos of every constraint
-      # contact from this step's body poses, reset the addresses of those that build no rows and
-      # compact the row-building ids (constraint._efc_contact_init predicate) into elig_sh
-      nlive = int(0)
-      if con_on:
-        nlive = wp.min(world_con_count_in[worldid], world_con_capacity_in)
-      for s0 in range(0, nlive, BLOCK):
-        s = s0 + tid
-        cid = cstart + s
-        eligible = int(0)
-        if s < nlive:
-          if (contact_type_in[cid] & ContactType.CONSTRAINT) != 0:
-            dist = _refresh_record(
-              cid,
-              worldid,
-              rec_body,
-              rec_point0,
-              rec_point1,
-              rec_normal,
-              rec_offset0,
-              rec_offset1,
-              rec_radius,
-              xpos_in,
-              xquat_in,
-              contact_dist_in,
-              contact_pos_in,
-            )
-            if dist - contact_includemargin_in[cid] < 0.0:
-              eligible = 1
-          if eligible == 0:
-            for k in range(contact_efc_address_out.shape[1]):
-              contact_efc_address_out[cid, k] = -1
-        slot = ncon + _block_scan(scan_sh, eligible, lane, warp)
-        if eligible == 1:
-          if slot < _ELIGIBLE_CAP:
-            _st_elig_i(elig_sh, slot, cid)
-          else:
-            wp.atomic_or(overflow_out, worldid, OverflowType.NARROWPHASE)
-        ncon += scan_sh[4]
-      ncon = wp.min(ncon, _ELIGIBLE_CAP)
-      _sync()
-    else:
-      if con_on:
-        ncon = wp.min(world_con_count_in[worldid], world_con_capacity_in)
+    if con_on:
+      ncon = wp.min(world_con_count_in[worldid], world_con_capacity_in)
     p_cid = int(-1)
     p_dist = float(0.0)
     p_includemargin = float(0.0)
@@ -2561,10 +2572,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
     p_gb1 = int(0)
     p_gb2 = int(0)
     if tid < ncon:
-      if wp.static(RANGES):
-        p_cid = elig_sh[tid]
-      else:
-        p_cid = world_con_list_in[cstart + tid]
+      p_cid = world_con_list_in[cstart + tid]
       p_dist = contact_dist_in[p_cid]
       p_includemargin = contact_includemargin_in[p_cid]
       p_condim = contact_dim_in[p_cid]
@@ -2923,10 +2931,7 @@ def _forward_m_kernel(NB: int, NV: int, NT: int, PUBLISH: bool, RANGES: bool):
       i_next = i0 + BLOCK + tid
       p_cid = -1
       if i_next < ncon:
-        if wp.static(RANGES):
-          p_cid = elig_sh[i_next]
-        else:
-          p_cid = world_con_list_in[cstart + i_next]
+        p_cid = world_con_list_in[cstart + i_next]
       # column slots: contact c owns [c_col[c], c_col[c] + rownnz) packed so that no contact
       # straddles a warp (rownnz <= 2 * NVTREE_CAP = 32), which lets the segmented warp reduction
       # below sum a contact's columns without cross-warp carries; the total lands in scan_sh[5]
@@ -3907,6 +3912,7 @@ def forward_a(
   world_ids: wp.array | None = None,
   count: int | wp.array | None = None,
   run_wake: bool | None = None,
+  records: types.ContactRecords | None = None,
 ):
   """Fused sleep wake/update, position, velocity and actuation stages (one CTA per world).
 
@@ -3914,8 +3920,11 @@ def forward_a(
   ``smooth.crb``, ``smooth.transmission``, ``fwd_velocity`` (actuator velocity, ``com_vel``, passive
   forces, ``rne``) and ``fwd_actuation`` for models accepted by :func:`fused_world`. The body/dof
   awake arrays are published once, by ``forward_m`` after ``wake_equality``. ``groups`` are the
-  contact buckets shared with ``forward_m`` (their per-world counts are zeroed here). The wake pass
-  is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``);
+  contact buckets shared with ``forward_m`` (their per-world counts are zeroed here). With
+  ``records`` (:class:`ContactRecords`, normally ``m.callback.contact_records``) the epilogue also
+  refreshes ``dist``/``pos`` of the supplier's contacts from the poses of this step and fills the
+  supplier's per-world row lists with the row-building ids, so no bucket pass is needed. The wake
+  pass is skipped when ``Option.run_sleep_wake`` is False (the caller already ran ``sleep.wake``);
   ``run_wake`` overrides that option (``tree_awake`` is republished from ``tree_asleep``
   regardless). :data:`DERIVED_FIELDS` are left stale when :func:`publish_derived` is False.
 
@@ -3929,8 +3938,13 @@ def forward_a(
     run_wake = getattr(m.opt, "run_sleep_wake", True)
   publish = publish_derived(m)
   grid_worlds, world_count = subset_launch_dim(d, world_ids, count)
+  if records is None:
+    records = _records_placeholder(d.qpos.device)
+    variant_records = False
+  else:
+    variant_records = True
   wp.launch(
-    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, publish, world_ids is not None),
+    _forward_a_kernel(NBODY_CAP, NV_CAP, _pow2_at_least(m.nu), NTREE_CAP, publish, world_ids is not None, variant_records),
     dim=(grid_worlds, NV_CAP),
     inputs=[
       m.nbody,
@@ -3985,11 +3999,29 @@ def forward_a(
       d.ctrl,
       world_ids,
       world_count,
+      records.capacity,
+      records.count,
+      records.body,
+      records.point0,
+      records.point1,
+      records.normal,
+      records.offset0,
+      records.offset1,
+      records.radius,
+      d.contact.type,
+      d.contact.includemargin,
+      records.row_capacity,
     ],
     outputs=[
       d.tree_asleep,
       d.tree_awake,
       groups.count,
+      records.row_count,
+      records.row_ids,
+      d.contact.dist,
+      d.contact.pos,
+      d.contact.efc_address,
+      d.overflow,
       d.xpos,
       d.xquat,
       d.xmat,
@@ -4098,30 +4130,26 @@ def forward_m(m: Model, d: Data, groups: ContactGroups | None = None):
   pyramidal contact rows), ``sleep.wake_equality``, ``sleep.update_sleep`` and ``island.island`` for
   models accepted by :func:`fused_world`; one bucket launch sorts the contacts by world first. Pass
   the ``groups`` given to ``forward_a`` (which zeroes the counts) or let this function allocate
-  them. With ``m.callback.contact_records`` bound there is no bucket pass: each world's contacts
-  are read from its id range and their ``dist``/``pos`` are recomputed from the body poses of this
-  step inside the kernel (see :class:`ContactRecords`).
+  them. With ``m.callback.contact_records`` bound there is no bucket pass: the rows come from the
+  supplier's per-world row lists that ``forward_a`` filled and the supplier's injection appended to.
   """
-  if groups is None:
-    groups = contact_groups(d)
-    groups.count.zero_()
   records = m.callback.contact_records
-  if records is None:
+  if records is not None:
+    groups = ContactGroups(records.row_capacity, records.row_count, records.row_ids)
+  else:
+    if groups is None:
+      groups = contact_groups(d)
+      groups.count.zero_()
     _bucket_contacts(m, d, groups)
-  _launch_forward_m(m, d, groups, records)
+  _launch_forward_m(m, d, groups)
 
 
-def _launch_forward_m(m: Model, d: Data, groups: ContactGroups, records: types.ContactRecords | None = None):
+def _launch_forward_m(m: Model, d: Data, groups: ContactGroups):
   contact_frame_2d = wp.array(
     ptr=d.contact.frame.ptr, dtype=wp.vec3, shape=(d.naconmax, 3), device=d.contact.frame.device, copy=False
   )
-  if records is None:
-    records = _records_placeholder(d.qpos.device)
-    capacity, count = groups.capacity, groups.count
-  else:
-    capacity, count = records.capacity, records.count
   wp.launch(
-    _forward_m_kernel(NBODY_CAP, NV_CAP, NTREE_CAP, publish_derived(m), m.callback.contact_records is not None),
+    _forward_m_kernel(NBODY_CAP, NV_CAP, NTREE_CAP, publish_derived(m)),
     dim=(d.nworld, NV_CAP),
     inputs=[
       m.nv,
@@ -4168,11 +4196,8 @@ def _launch_forward_m(m: Model, d: Data, groups: ContactGroups, records: types.C
       d.qvel,
       d.eq_active,
       d.tree_awake,
-      d.xpos,
-      d.xquat,
       d.subtree_com,
       d.cdof,
-      d.contact.type,
       d.contact.dist,
       d.contact.dim,
       d.contact.includemargin,
@@ -4182,16 +4207,9 @@ def _launch_forward_m(m: Model, d: Data, groups: ContactGroups, records: types.C
       d.contact.friction,
       d.contact.solref,
       d.contact.solimp,
-      capacity,
-      count,
+      groups.capacity,
+      groups.count,
       groups.ids,
-      records.body,
-      records.point0,
-      records.point1,
-      records.normal,
-      records.offset0,
-      records.offset1,
-      records.radius,
     ],
     outputs=[
       d.tree_asleep,

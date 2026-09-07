@@ -835,12 +835,16 @@ class FusedWorldTest(absltest.TestCase):
       capacity=capacity,
       count=wp.array(count.astype(np.int32), dtype=int),
       body=wp.array(bodies, dtype=wp.vec2i),
+      tree=wp.zeros(n_ids, dtype=wp.vec2i),
       point0=wp.array(point0, dtype=wp.vec3),
       point1=wp.array(point1, dtype=wp.vec3),
       normal=wp.array(normals, dtype=wp.vec3),
       offset0=wp.zeros(n_ids, dtype=wp.vec3),
       offset1=wp.zeros(n_ids, dtype=wp.vec3),
       radius=wp.array(radius, dtype=float),
+      row_capacity=capacity,
+      row_count=wp.zeros(self.NWORLD, dtype=int),
+      row_ids=wp.zeros(n_ids, dtype=int),
     )
 
     self._run_forward(m, d_ref, fused=False)
@@ -856,6 +860,12 @@ class FusedWorldTest(absltest.TestCase):
     efc_address = d_fused.contact.efc_address.numpy()[new_cid]
     self.assertTrue((efc_address[inactive] == -1).all())
     self.assertTrue((efc_address[~inactive, 0] >= 0).all())
+    # forward_a listed exactly the row-building ids of every world
+    row_count = records.row_count.numpy()
+    row_ids = records.row_ids.numpy()
+    for w in range(self.NWORLD):
+      listed = sorted(row_ids[w * capacity : w * capacity + row_count[w]].tolist())
+      self.assertEqual(listed, sorted(new_cid[(worldid == w) & ~inactive].tolist()))
     self._assert_int_equal(
       d_fused, d_ref, ("ne", "nf", "nl", "nefc", "nisland", "tree_island", "island_nv", "tree_asleep", "tree_awake", "overflow")
     )

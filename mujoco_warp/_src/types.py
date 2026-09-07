@@ -983,11 +983,14 @@ class TileSet:
 class ContactRecords:
   """Contacts of an external supplier in world-contiguous id ranges, with their refresh records.
 
-  Bound through ``Callback.contact_records``, the fused per-world constraint stage reads the
-  contacts of world ``w`` from the ids ``[w * capacity, w * capacity + count[w])`` instead of
-  bucketing the global pool, recomputes their ``Data.contact.dist``/``pos`` from the ``Data.xpos``
-  and ``Data.xquat`` of the current step, resets ``Data.contact.efc_address`` and applies the
-  constraint row predicate itself before building rows. ``dist`` is the separation of the two
+  Bound through ``Callback.contact_records``, the fused per-world forward reads the contacts of
+  world ``w`` from the ids ``[w * capacity, w * capacity + count[w])`` instead of bucketing the
+  global pool. Its position stage recomputes their ``Data.contact.dist``/``pos`` from the
+  ``Data.xpos`` and ``Data.xquat`` of the current step, resets ``Data.contact.efc_address`` of the
+  contacts that build no rows and writes the row-building ids of each world into ``row_ids`` with
+  their count in ``row_count``; the constraint stage builds its rows from those lists. A supplier
+  that appends contacts to a world's range between the two stages (its ``post_position`` callback)
+  appends their row-building ids to the lists the same way. ``dist`` is the separation of the two
   support points along the normal minus ``radius``; ``pos`` is the midpoint of the two support
   points shifted by their offsets. The per-contact arrays are indexed by contact id. ``Data.nacon``
   still counts the contacts, but the ids no longer form the prefix ``[0, nacon)``: kernels that walk
@@ -997,23 +1000,32 @@ class ContactRecords:
     capacity: contact ids per world
     count: contacts of each world                                         (nworld,)
     body: bodies of the two shapes                                        (naconmax,)
+    tree: trees of the two shapes, -1 for a static shape                  (naconmax,)
     point0: shape-0 support point in its body frame                       (naconmax,)
     point1: shape-1 support point in its body frame                       (naconmax,)
     normal: unit contact normal from shape 0 toward shape 1               (naconmax,)
     offset0: shape-0 surface offset in its body frame                     (naconmax,)
     offset1: shape-1 surface offset in its body frame                     (naconmax,)
     radius: sum of the two surface radii                                  (naconmax,)
+    row_capacity: row-building ids per world in ``row_ids``
+    row_count: row-building contacts of each world                        (nworld,)
+    row_ids: row-building ids of world w at [w * row_capacity, + row_count[w])
+             (nworld * row_capacity,)
   """
 
   capacity: int
   count: wp.array[int]
   body: wp.array[wp.vec2i]
+  tree: wp.array[wp.vec2i]
   point0: wp.array[wp.vec3]
   point1: wp.array[wp.vec3]
   normal: wp.array[wp.vec3]
   offset0: wp.array[wp.vec3]
   offset1: wp.array[wp.vec3]
   radius: wp.array[float]
+  row_capacity: int
+  row_count: wp.array[int]
+  row_ids: wp.array[int]
 
 
 @dataclasses.dataclass

@@ -1417,7 +1417,7 @@ def _forward_fused(m: Model, d: Data, finalize: bool):
   # sleep.wake/update_sleep, fwd_position (kinematics, com_pos, crb, transmission), fwd_velocity
   # and fwd_actuation: none of them depend on the constraint set, so they precede make_constraint
   groups = fused_world.contact_groups(d)
-  fused_world.forward_a(m, d, groups)
+  fused_world.forward_a(m, d, groups, records=m.callback.contact_records)
   if m.ncam or m.nlight:
     smooth.camlight(m, d)
   # body poses are final and the contact rows are not read before forward_m's bucket pass
