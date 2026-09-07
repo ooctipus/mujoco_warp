@@ -108,7 +108,6 @@ from mujoco_warp._src.types import Callback as Callback
 from mujoco_warp._src.types import ConeType as ConeType
 from mujoco_warp._src.types import Constraint as Constraint
 from mujoco_warp._src.types import Contact as Contact
-from mujoco_warp._src.types import ContactRecords as ContactRecords
 from mujoco_warp._src.types import DisableBit as DisableBit
 from mujoco_warp._src.types import DynType as DynType
 from mujoco_warp._src.types import EnableBit as EnableBit
