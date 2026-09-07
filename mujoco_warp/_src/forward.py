@@ -1448,6 +1448,8 @@ def forward(m: Model, d: Data, *, _finalize: bool = True):
   if fused_world.fused_world(m, d):
     _forward_fused(m, d, _finalize)
     return
+  if m.callback.contact_records is not None:
+    raise ValueError("Callback.contact_records requires the fused per-world forward (see fused_world.fused_world).")
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:

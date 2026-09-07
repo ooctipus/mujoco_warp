@@ -980,6 +980,43 @@ class TileSet:
 
 
 @dataclasses.dataclass
+class ContactRecords:
+  """Contacts of an external supplier in world-contiguous id ranges, with their refresh records.
+
+  Bound through ``Callback.contact_records``, the fused per-world constraint stage reads the
+  contacts of world ``w`` from the ids ``[w * capacity, w * capacity + count[w])`` instead of
+  bucketing the global pool, recomputes their ``Data.contact.dist``/``pos`` from the ``Data.xpos``
+  and ``Data.xquat`` of the current step, resets ``Data.contact.efc_address`` and applies the
+  constraint row predicate itself before building rows. ``dist`` is the separation of the two
+  support points along the normal minus ``radius``; ``pos`` is the midpoint of the two support
+  points shifted by their offsets. The per-contact arrays are indexed by contact id. ``Data.nacon``
+  still counts the contacts, but the ids no longer form the prefix ``[0, nacon)``: kernels that walk
+  the pool by ``nacon`` (contact sensors, adhesion, ``rne_postconstraint``) do not apply to records.
+
+  Attributes:
+    capacity: contact ids per world
+    count: contacts of each world                                         (nworld,)
+    body: bodies of the two shapes                                        (naconmax,)
+    point0: shape-0 support point in its body frame                       (naconmax,)
+    point1: shape-1 support point in its body frame                       (naconmax,)
+    normal: unit contact normal from shape 0 toward shape 1               (naconmax,)
+    offset0: shape-0 surface offset in its body frame                     (naconmax,)
+    offset1: shape-1 surface offset in its body frame                     (naconmax,)
+    radius: sum of the two surface radii                                  (naconmax,)
+  """
+
+  capacity: int
+  count: wp.array[int]
+  body: wp.array[wp.vec2i]
+  point0: wp.array[wp.vec3]
+  point1: wp.array[wp.vec3]
+  normal: wp.array[wp.vec3]
+  offset0: wp.array[wp.vec3]
+  offset1: wp.array[wp.vec3]
+  radius: wp.array[float]
+
+
+@dataclasses.dataclass
 class Callback:
   """Callbacks for custom physics behavior.
 
@@ -1000,6 +1037,10 @@ class Callback:
       step; writes to ``Data.contact``. It must only read position-stage outputs, so it neither
       disables the fused per-world forward nor forces the materialization of deferred derived data
       on intermediate substeps.
+    contact_records: contacts of an external supplier in world-contiguous id ranges
+      (:class:`ContactRecords`); when bound, the fused per-world forward reads each world's contacts
+      from its range and refreshes ``Data.contact`` from the body poses of the current step in its
+      constraint stage, so ``post_position`` needs neither a bucket pass nor a refresh pass.
   """
 
   passive: Callable | None = None
@@ -1010,15 +1051,19 @@ class Callback:
   sensor: Callable | None = None
   contactfilter: Callable | None = None
   post_position: Callable | None = None
+  contact_records: ContactRecords | None = None
 
   def observes_derived_state(self) -> bool:
     """Return whether a callback other than ``post_position`` is set.
 
     Those callbacks may read intermediate derived data (island mapping, velocity-dependent
     quantities) that the stepping paths otherwise defer or fuse; ``post_position`` only reads the
-    position-stage outputs, which every path publishes before invoking it.
+    position-stage outputs, which every path publishes before invoking it, and ``contact_records``
+    is data rather than a callback.
     """
-    return any(name != "post_position" and callback is not None for name, callback in vars(self).items())
+    return any(
+      name not in ("post_position", "contact_records") and callback is not None for name, callback in vars(self).items()
+    )
 
 
 @dataclasses.dataclass

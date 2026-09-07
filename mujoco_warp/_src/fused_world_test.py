@@ -761,6 +761,124 @@ class FusedWorldTest(absltest.TestCase):
     self._assert_close_scaled("qfrc_constraint", d_fused.qfrc_constraint.numpy(), d_ref.qfrc_constraint.numpy(), rel=1e-4)
     self._assert_close_scaled("qacc", d_fused.qacc.numpy(), d_ref.qacc.numpy(), rel=1e-4)
 
+  def test_contact_records_match_stock(self):
+    """Contacts in world-contiguous ranges with refresh records build the stock rows, no bucket."""
+    mjm, m, datas = self._make(seed=9, contact=True, equality=True, resting=True)
+    d_ref, d_fused = datas
+    for d in datas:
+      sleep.update_sleep(m, d)
+    # collide at the poses of the assigned state so that the records below reproduce the contacts
+    smooth.kinematics(m, d_ref)
+    _share_contacts(m, d_ref, d_fused)
+    nacon = int(d_ref.nacon.numpy()[0])
+    self.assertGreater(nacon, 4 * self.NWORLD)
+    capacity = d_ref.naconmax // self.NWORLD
+    worldid = d_ref.contact.worldid.numpy()[:nacon]
+    count = np.bincount(worldid, minlength=self.NWORLD)
+    self.assertLessEqual(int(count.max()), capacity)
+
+    # the first contact of every world gets a radius of -1 (and a matching stock dist) that puts it
+    # beyond the margin; the stock reference keeps the dense layout with the same dist
+    inactive = np.zeros(nacon, dtype=bool)
+    ref_dist = d_ref.contact.dist.numpy()
+    for w in range(self.NWORLD):
+      inactive[np.flatnonzero(worldid == w)[0]] = True
+    ref_dist[:nacon][inactive] += 1.0
+    d_ref.contact.dist.assign(ref_dist)
+
+    # d_fused: contact c of world w moves to id w * capacity + rank; records from the stock geometry
+    # (the support points are the contact's surface points in the body frames, no offsets, radius 0
+    # or -1)
+    new_cid = np.zeros(nacon, dtype=np.int64)
+    rank = np.zeros(self.NWORLD, dtype=np.int64)
+    for c in range(nacon):
+      new_cid[c] = worldid[c] * capacity + rank[worldid[c]]
+      rank[worldid[c]] += 1
+    for f in dataclasses.fields(d_ref.contact):
+      src = getattr(d_ref.contact, f.name)
+      if isinstance(src, wp.array) and src.shape[0] == d_ref.naconmax:
+        values = src.numpy()
+        moved = values.copy()
+        moved[new_cid] = values[:nacon]
+        getattr(d_fused.contact, f.name).assign(moved)
+    geom = d_ref.contact.geom.numpy()[:nacon]
+    dist = d_ref.contact.dist.numpy()[:nacon].astype(np.float64)
+    pos = d_ref.contact.pos.numpy()[:nacon].astype(np.float64)
+    normal = d_ref.contact.frame.numpy()[:nacon, 0].astype(np.float64)
+    xpos = d_ref.xpos.numpy().astype(np.float64)
+    xquat = d_ref.xquat.numpy().astype(np.float64)
+    geom_bodyid = m.geom_bodyid.numpy()
+
+    def to_body(w, body, point):
+      q = xquat[w, body]  # wxyz
+      v = point - xpos[w, body]
+      t = 2.0 * np.cross(q[1:], v)
+      return v - q[0] * t + np.cross(q[1:], t)
+
+    n_ids = self.NWORLD * capacity
+    bodies = np.zeros((n_ids, 2), dtype=np.int32)
+    point0 = np.zeros((n_ids, 3), dtype=np.float32)
+    point1 = np.zeros((n_ids, 3), dtype=np.float32)
+    normals = np.zeros((n_ids, 3), dtype=np.float32)
+    radius = np.zeros(n_ids, dtype=np.float32)
+    for c in range(nacon):
+      w, i = worldid[c], new_cid[c]
+      bodies[i] = (geom_bodyid[geom[c, 0]], geom_bodyid[geom[c, 1]])
+      # the stock dist of an inactive contact was raised by one; the record reproduces it through
+      # the radius
+      d_geo = dist[c] - (1.0 if inactive[c] else 0.0)
+      point0[i] = to_body(w, bodies[i, 0], pos[c] - 0.5 * d_geo * normal[c])
+      point1[i] = to_body(w, bodies[i, 1], pos[c] + 0.5 * d_geo * normal[c])
+      normals[i] = normal[c]
+      radius[i] = -1.0 if inactive[c] else 0.0
+    records = mjw.ContactRecords(
+      capacity=capacity,
+      count=wp.array(count.astype(np.int32), dtype=int),
+      body=wp.array(bodies, dtype=wp.vec2i),
+      point0=wp.array(point0, dtype=wp.vec3),
+      point1=wp.array(point1, dtype=wp.vec3),
+      normal=wp.array(normals, dtype=wp.vec3),
+      offset0=wp.zeros(n_ids, dtype=wp.vec3),
+      offset1=wp.zeros(n_ids, dtype=wp.vec3),
+      radius=wp.array(radius, dtype=float),
+    )
+
+    self._run_forward(m, d_ref, fused=False)
+    m.callback.contact_records = records
+    try:
+      self.assertTrue(fused_world.fused_world(m, d_fused))
+      self._run_forward(m, d_fused, fused=True)
+    finally:
+      m.callback.contact_records = None
+
+    self._assert_close("contact.dist", d_fused.contact.dist.numpy()[new_cid], ref_dist[:nacon], rtol=1e-5, atol=1e-6)
+    self._assert_close("contact.pos", d_fused.contact.pos.numpy()[new_cid], pos.astype(np.float32), rtol=1e-5, atol=1e-6)
+    efc_address = d_fused.contact.efc_address.numpy()[new_cid]
+    self.assertTrue((efc_address[inactive] == -1).all())
+    self.assertTrue((efc_address[~inactive, 0] >= 0).all())
+    self._assert_int_equal(
+      d_fused, d_ref, ("ne", "nf", "nl", "nefc", "nisland", "tree_island", "island_nv", "tree_asleep", "tree_awake", "overflow")
+    )
+    self.assertEqual(int(d_ref.overflow.numpy().max()), 0)
+
+    # bring d_fused back to the dense ids for the row comparison: efc.id of the contact rows and the
+    # contact addresses are re-indexed by the original id
+    old_of_new = {int(n): c for c, n in enumerate(new_cid)}
+    efc_id = d_fused.efc.id.numpy()
+    efc_type = d_fused.efc.type.numpy()
+    nefc = d_fused.nefc.numpy()
+    for w in range(self.NWORLD):
+      for r in range(nefc[w]):
+        if efc_type[w, r] >= ConstraintType.CONTACT_FRICTIONLESS:
+          efc_id[w, r] = old_of_new[int(efc_id[w, r])]
+    d_fused.efc.id.assign(efc_id)
+    efc_address_dense = d_ref.contact.efc_address.numpy().copy()
+    efc_address_dense[:nacon] = efc_address
+    d_fused.contact.efc_address.assign(efc_address_dense)
+    # the refreshed dist carries the fp32 roundoff of the body-frame round trip (~1e-8 m), which the
+    # contact stiffness scales into aref by ~1e3
+    self._assert_rows_equal(m, d_fused, d_ref, rtol=1e-4, atol=1e-4)
+
   def test_efc_overflow_matches_stock(self):
     """Rows beyond njmax are dropped and flagged like stock; the written rows are valid rows."""
     mjm, m, datas = self._make(seed=5, contact=True, equality=True, resting=True, nconmax=128, njmax=24, njmax_nnz=3072)
