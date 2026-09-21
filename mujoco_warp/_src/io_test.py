@@ -914,6 +914,10 @@ class IOTest(parameterized.TestCase):
   )
   def test_get_data_into_io_test_models(self, xml, cone, integrator):
     """Tests get_data_into for field coverage across diverse model types."""
+    # TODO(team): Support integrator="discrete" for flex models once implemented in mujoco_warp.
+    if xml == "flex/floppy.xml" and integrator in (IntegratorType.IMPLICIT, IntegratorType.IMPLICITFAST):
+      self.skipTest("TODO(team): Flex elasticity under implicit/implicitfast is rejected by MuJoCo.")
+
     mjm, _, m, d = test_data.fixture(xml, nworld=2, overrides={"opt.cone": cone, "opt.integrator": integrator})
     mjwarp.step(m, d)
 
@@ -982,6 +986,10 @@ class IOTest(parameterized.TestCase):
     body_has = m.body_fluid_ellipsoid.numpy()
     self.assertTrue(body_has[mjm.geom_bodyid[0]])
     self.assertFalse(body_has[0])
+
+    is_free = m.body_is_free.numpy()
+    self.assertTrue(is_free[mjm.geom_bodyid[0]])
+    self.assertFalse(is_free[0])
 
   def test_jacobian_auto(self):
     mjm = mujoco.MjModel.from_xml_string("""
@@ -2653,13 +2661,12 @@ class IOTest(parameterized.TestCase):
 
     # Should succeed without NotImplementedError
     m = mjwarp.put_model(mjm)
+    self.assertEqual(m.has_1d_flex, False)
+    self.assertEqual(m.has_2d_flex, False)
     self.assertEqual(m.has_3d_flex, True)
 
   # TODO(team): remove after implementing multicontact support for CCD pairs.
   @parameterized.parameters(
-    ("cylinder", "box"),
-    ("cylinder", "cylinder"),
-    ("cylinder", "mesh"),
     ("capsule", "cylinder"),
     ("capsule", "mesh"),
   )
@@ -2700,6 +2707,49 @@ class IOTest(parameterized.TestCase):
       mjwarp.put_model(mjm)
 
     mjm.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_MULTICCD
+    with warnings.catch_warnings():
+      warnings.simplefilter("error")
+      mjwarp.put_model(mjm)
+
+  @parameterized.parameters(
+    ("cylinder", "box"),
+    ("cylinder", "cylinder"),
+    ("cylinder", "mesh"),
+  )
+  def test_supported_cylinder_multiccd_no_warning(self, geom1_type, geom2_type):
+    """Tests that supported cylinder MultiCCD pairs emit no warning."""
+
+    def _make_geom_xml(gtype: str) -> str:
+      if gtype == "mesh":
+        return '<geom type="mesh" mesh="m"/>'
+      elif gtype in ("cylinder", "capsule"):
+        return f'<geom type="{gtype}" size=".1 .1"/>'
+      elif gtype == "sphere":
+        return '<geom type="sphere" size=".1"/>'
+      else:
+        return f'<geom type="{gtype}" size=".1 .1 .1"/>'
+
+    mesh_asset = '<mesh name="m" vertex="0 0 0 1 0 0 0 1 0 0 0 1"/>' if "mesh" in (geom1_type, geom2_type) else ""
+    mjm = mujoco.MjModel.from_xml_string(
+      f"""
+      <mujoco>
+        <asset>
+          {mesh_asset}
+        </asset>
+        <worldbody>
+          <body>
+            <freejoint/>
+            {_make_geom_xml(geom1_type)}
+          </body>
+          <body pos="0 0 .5">
+            <freejoint/>
+            {_make_geom_xml(geom2_type)}
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+
     with warnings.catch_warnings():
       warnings.simplefilter("error")
       mjwarp.put_model(mjm)

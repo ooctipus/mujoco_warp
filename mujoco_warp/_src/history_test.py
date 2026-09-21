@@ -28,6 +28,8 @@ from mujoco_warp import init_ctrl_history
 from mujoco_warp import init_sensor_history
 from mujoco_warp import read_ctrl
 from mujoco_warp import read_sensor
+from mujoco_warp import reset_data
+from mujoco_warp import reset_history
 from mujoco_warp import set_state
 from mujoco_warp import step
 from mujoco_warp import test_data
@@ -1188,6 +1190,454 @@ class StateParityTest(absltest.TestCase):
     set_state(m, d2, state_wp, State.PHYSICS.value)
 
     np.testing.assert_allclose(d2.history.numpy(), d.history.numpy(), atol=_TOLERANCE)
+
+
+class ResetHistoryTest(parameterized.TestCase):
+  """Tests for full history and delay reset matching MuJoCo C."""
+
+  @parameterized.parameters(1, 2)
+  def test_reset_history_parity_and_reproducibility(self, nworld):
+    """Test initial make_data parity, reset_data parity, and trajectory reproducibility."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <motor joint="slide" delay="0.02" nsample="3"/>
+        </actuator>
+        <sensor>
+          <jointpos joint="slide" delay="0.02" nsample="3"/>
+          <jointvel joint="slide" interval="0.05 0" nsample="4"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+
+    # 1. Initial make_data parity with MuJoCo C
+    self.assertGreater(mjm.nhistory, 0)
+    for w in range(nworld):
+      np.testing.assert_allclose(d.history.numpy()[w], mjd.history, atol=1e-6)
+
+    # 2. Step pass 1 and verify history changes
+    d.ctrl.fill_(10.0)
+    for _ in range(15):
+      step(m, d)
+    qpos_pass1 = d.qpos.numpy().copy()
+    sensordata_pass1 = d.sensordata.numpy().copy()
+    self.assertFalse(np.allclose(d.history.numpy()[0], mjd.history))
+
+    # 3. reset_data parity with mj_resetData
+    reset_data(m, d)
+    mujoco.mj_resetData(mjm, mjd)
+    for w in range(nworld):
+      np.testing.assert_allclose(d.history.numpy()[w], mjd.history, atol=1e-6)
+
+    # 4. Step pass 2 and verify trajectory reproducibility
+    d.ctrl.fill_(10.0)
+    for _ in range(15):
+      step(m, d)
+    np.testing.assert_allclose(d.qpos.numpy(), qpos_pass1, atol=1e-6)
+    np.testing.assert_allclose(d.sensordata.numpy(), sensordata_pass1, atol=1e-6)
+
+  @parameterized.parameters(1, 2)
+  def test_selective_reset_data(self, nworld):
+    """Test selective reset mask resets targeted worlds while preserving others."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <motor joint="slide" delay="0.02" nsample="3"/>
+        </actuator>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+
+    d.ctrl.fill_(5.0)
+    for _ in range(10):
+      step(m, d)
+    hist_before = d.history.numpy().copy()
+
+    # World 0 is reset, world 1 (if present) is not reset
+    mask_list = [True] if nworld == 1 else [True, False]
+    mask = wp.array(mask_list, dtype=bool)
+    reset_data(m, d, reset=mask)
+
+    hist_after = d.history.numpy()
+    mujoco.mj_resetData(mjm, mjd)
+
+    # World 0 should be reset to initial state
+    np.testing.assert_allclose(hist_after[0], mjd.history, atol=1e-6)
+    # Unreset worlds should be preserved
+    for w in range(1, nworld):
+      np.testing.assert_allclose(hist_after[w], hist_before[w], atol=1e-6)
+
+    # Selective reset with reverse mask
+    if nworld == 2:
+      for _ in range(10):
+        step(m, d)
+      hist_dirty = d.history.numpy().copy()
+      mask_alt = wp.array([False, True], dtype=bool)
+      reset_data(m, d, reset=mask_alt)
+      hist_after_alt = d.history.numpy()
+      # World 0 preserved dirty, World 1 reset
+      np.testing.assert_allclose(hist_after_alt[0], hist_dirty[0], atol=1e-6)
+      np.testing.assert_allclose(hist_after_alt[1], mjd.history, atol=1e-6)
+
+  @parameterized.parameters(1, 2)
+  def test_interval_sensor_at_t0(self, nworld):
+    """Test interval sensor with phase=0 computes at t=0 matching MuJoCo C."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <sensor>
+          <jointpos joint="slide" interval="0.05 0" nsample="3"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+
+    # Move joint position before first step
+    d.qpos.fill_(0.42)
+    mjd.qpos[:] = 0.42
+
+    # Step at t=0
+    step(m, d)
+    mujoco.mj_step(mjm, mjd)
+
+    for w in range(nworld):
+      np.testing.assert_allclose(d.sensordata.numpy()[w], mjd.sensordata, atol=1e-6)
+
+  @parameterized.parameters(1, 2)
+  def test_init_history_none_times_preserves_buffer(self, nworld):
+    """Test init_ctrl_history and init_sensor_history with times=None preserve timestamps."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <motor joint="slide" delay="0.02" nsample="3"/>
+        </actuator>
+        <sensor>
+          <jointpos joint="slide" delay="0.02" nsample="3"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+    )
+    orig_history = d.history.numpy().copy()
+
+    # Actuator buffer
+    ctrl_vals = wp.array2d(np.tile([10.0, 20.0, 30.0], (nworld, 1)), dtype=float)
+    init_ctrl_history(m, d, ctrlid=0, times=None, values=ctrl_vals)
+
+    # Sensor buffer
+    sensor_vals = wp.array2d(np.tile([1.0, 2.0, 3.0], (nworld, 1)), dtype=float)
+    init_sensor_history(m, d, sensorid=0, times=None, values=sensor_vals)
+
+    act_adr = m.actuator_historyadr.numpy()[0, 0]
+    act_n = m.actuator_history.numpy()[0, 0][0]
+    act_t = act_adr + 2
+    act_v = act_t + act_n
+
+    sens_adr = m.sensor_historyadr.numpy()[0, 0]
+    sens_n = m.sensor_history.numpy()[0, 0][0]
+    sens_dim = m.sensor_dim.numpy()[0]
+    sens_t = sens_adr + 2
+    sens_v = sens_t + sens_n
+
+    updated_history = d.history.numpy()
+    for w in range(nworld):
+      # Timestamps preserved
+      np.testing.assert_allclose(updated_history[w, act_t : act_t + act_n], orig_history[w, act_t : act_t + act_n], atol=1e-6)
+      np.testing.assert_allclose(
+        updated_history[w, sens_t : sens_t + sens_n], orig_history[w, sens_t : sens_t + sens_n], atol=1e-6
+      )
+      # Values updated
+      np.testing.assert_allclose(updated_history[w, act_v : act_v + act_n], [10.0, 20.0, 30.0], atol=1e-6)
+      np.testing.assert_allclose(updated_history[w, sens_v : sens_v + sens_n * sens_dim], [1.0, 2.0, 3.0], atol=1e-6)
+
+  def test_init_sensor_history_phase_none_preserves_user_slot(self):
+    """Test init_sensor_history with phase=None preserves interval user slot (time_prev)."""
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <sensor>
+          <jointpos joint="slide" interval="0.05 0" nsample="3"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=1,
+    )
+    sens_adr = m.sensor_historyadr.numpy()[0, 0]
+    user_slot_orig = d.history.numpy()[0, sens_adr]  # -0.05
+    self.assertAlmostEqual(user_slot_orig, -0.05)
+
+    vals = wp.array2d(np.array([[1.0, 2.0, 3.0]]), dtype=float)
+    init_sensor_history(m, d, sensorid=0, times=None, values=vals, phase=None)
+
+    # User slot should remain -0.05, NOT be overwritten by 0.0
+    self.assertAlmostEqual(d.history.numpy()[0, sens_adr], user_slot_orig)
+
+  def test_init_history_shape_and_range_validation(self):
+    """Test host-side shape, range, and type validation for init functions."""
+    xml = """
+    <mujoco>
+      <option timestep="0.01"/>
+      <worldbody>
+        <body>
+          <joint name="slide" type="slide"/>
+          <geom size="0.1" mass="1"/>
+        </body>
+      </worldbody>
+      <actuator>
+        <motor joint="slide" delay="0.02" nsample="3"/>
+        <motor joint="slide"/>
+      </actuator>
+      <sensor>
+        <jointpos joint="slide" delay="0.02" nsample="3"/>
+        <jointvel joint="slide"/>
+      </sensor>
+    </mujoco>
+    """
+    _, _, m, d = test_data.fixture(xml=xml, nworld=2)
+
+    good_times = wp.array([0.01, 0.02, 0.03], dtype=float)
+    bad_times = wp.array([0.01, 0.02], dtype=float)
+    good_ctrl_vals = wp.zeros((2, 3), dtype=float)
+    bad_ctrl_vals = wp.zeros((2, 4), dtype=float)
+    good_sensor_vals = wp.zeros((2, 3), dtype=float)
+    bad_sensor_vals = wp.zeros((2, 4), dtype=float)
+
+    # ctrlid out of range
+    with self.assertRaises(ValueError):
+      init_ctrl_history(m, d, ctrlid=-1, times=good_times, values=good_ctrl_vals)
+    with self.assertRaises(ValueError):
+      init_ctrl_history(m, d, ctrlid=2, times=good_times, values=good_ctrl_vals)
+
+    # ctrlid has no history buffer allocated (nsample == 0)
+    with self.assertRaises(ValueError):
+      init_ctrl_history(m, d, ctrlid=1, times=good_times, values=good_ctrl_vals)
+
+    # ctrl times shape mismatch
+    with self.assertRaises(ValueError):
+      init_ctrl_history(m, d, ctrlid=0, times=bad_times, values=good_ctrl_vals)
+
+    # ctrl values shape mismatch
+    with self.assertRaises(ValueError):
+      init_ctrl_history(m, d, ctrlid=0, times=good_times, values=bad_ctrl_vals)
+
+    # sensorid out of range
+    with self.assertRaises(ValueError):
+      init_sensor_history(m, d, sensorid=-1, times=good_times, values=good_sensor_vals)
+    with self.assertRaises(ValueError):
+      init_sensor_history(m, d, sensorid=2, times=good_times, values=good_sensor_vals)
+
+    # sensorid has no history buffer allocated (nsample == 0)
+    with self.assertRaises(ValueError):
+      init_sensor_history(m, d, sensorid=1, times=good_times, values=good_sensor_vals)
+
+    # sensor times shape mismatch
+    with self.assertRaises(ValueError):
+      init_sensor_history(m, d, sensorid=0, times=bad_times, values=good_sensor_vals)
+
+    # sensor values shape mismatch
+    with self.assertRaises(ValueError):
+      init_sensor_history(m, d, sensorid=0, times=good_times, values=bad_sensor_vals)
+
+    # sensor phase array shape mismatch
+    bad_phase = wp.array([0.0], dtype=float)
+    with self.assertRaises(ValueError):
+      init_sensor_history(m, d, sensorid=0, times=good_times, values=good_sensor_vals, phase=bad_phase)
+
+    # sensor scalar float phase succeeds
+    init_sensor_history(m, d, sensorid=0, times=good_times, values=good_sensor_vals, phase=0.05)
+    sens_adr = m.sensor_historyadr.numpy()[0, 0]
+    np.testing.assert_allclose(d.history.numpy()[:, sens_adr], [0.05, 0.05])
+
+
+class BatchedDelayTest(parameterized.TestCase):
+  """Tests for batched delay and history fields across worlds."""
+
+  @parameterized.parameters(1, 2)
+  def test_batched_delay(self, nworld):
+    """Test actuators and sensors with batched delays per world."""
+    batch_sizes = {
+      "actuator_delay": nworld,
+      "actuator_history": nworld,
+      "actuator_historyadr": nworld,
+      "sensor_delay": nworld,
+      "sensor_interval": nworld,
+      "sensor_history": nworld,
+      "sensor_historyadr": nworld,
+    }
+    _, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <motor joint="slide" delay="0.01" nsample="4"/>
+        </actuator>
+        <sensor>
+          <jointpos joint="slide" delay="0.01" interval="0.02 0" nsample="4"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+      batch_sizes=batch_sizes,
+    )
+
+    for field in batch_sizes:
+      self.assertEqual(getattr(m, field).shape[0], nworld)
+
+    if nworld == 1:
+      wp.copy(m.actuator_delay, wp.array2d([[0.02]], dtype=float))
+      wp.copy(m.sensor_delay, wp.array2d([[0.02]], dtype=float))
+      d.ctrl.fill_(10.0)
+      step(m, d)
+      self.assertEqual(d.actuator_force.numpy()[0, 0], 0.0)
+    else:
+      delays = np.array([[0.0], [0.02]], dtype=np.float32)
+      wp.copy(m.actuator_delay, wp.array2d(delays, dtype=float))
+      wp.copy(m.sensor_delay, wp.array2d(delays, dtype=float))
+
+      for t in range(5):
+        ctrl_val = float(t + 1) * 10.0
+        d.ctrl.fill_(ctrl_val)
+        step(m, d)
+
+      qpos = d.qpos.numpy()[:, 0]
+      sdata = d.sensordata.numpy()[:, 0]
+      self.assertGreater(qpos[0], qpos[1])
+      self.assertGreater(sdata[0], sdata[1])
+
+  @parameterized.parameters(1, 2)
+  def test_batched_delay_reset(self, nworld):
+    """Test reset_data parity and selective mask reset with per-world batched delay arrays."""
+    batch_sizes = {
+      "actuator_delay": nworld,
+      "actuator_history": nworld,
+      "actuator_historyadr": nworld,
+      "sensor_delay": nworld,
+      "sensor_interval": nworld,
+      "sensor_history": nworld,
+      "sensor_historyadr": nworld,
+    }
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <motor joint="slide" delay="0.02" nsample="3"/>
+        </actuator>
+        <sensor>
+          <jointpos joint="slide" delay="0.02" nsample="3"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=nworld,
+      batch_sizes=batch_sizes,
+    )
+
+    d.ctrl.fill_(10.0)
+    for _ in range(10):
+      step(m, d)
+
+    # Full reset
+    reset_data(m, d)
+    mujoco.mj_resetData(mjm, mjd)
+    for w in range(nworld):
+      np.testing.assert_allclose(d.history.numpy()[w], mjd.history, atol=1e-6)
+
+    # Selective reset with reverse mask
+    if nworld == 2:
+      for _ in range(10):
+        step(m, d)
+      hist_dirty = d.history.numpy().copy()
+      mask = wp.array([False, True], dtype=bool)
+      reset_data(m, d, reset=mask)
+      hist_after = d.history.numpy()
+      # World 0 preserved dirty, World 1 reset
+      np.testing.assert_allclose(hist_after[0], hist_dirty[0], atol=1e-6)
+      np.testing.assert_allclose(hist_after[1], mjd.history, atol=1e-6)
+
+  def test_reset_history_standalone(self):
+    """Test reset_history public function directly."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.01"/>
+        <worldbody>
+          <body>
+            <joint name="slide" type="slide"/>
+            <geom size="0.1" mass="1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <motor joint="slide" delay="0.02" nsample="3"/>
+        </actuator>
+        <sensor>
+          <jointpos joint="slide" delay="0.02" nsample="3"/>
+        </sensor>
+      </mujoco>
+      """,
+      nworld=1,
+    )
+    d.ctrl.fill_(10.0)
+    for _ in range(5):
+      step(m, d)
+    self.assertFalse(np.allclose(d.history.numpy()[0], mjd.history))
+
+    reset_history(m, d)
+    mujoco.mj_resetData(mjm, mjd)
+    np.testing.assert_allclose(d.history.numpy()[0], mjd.history, atol=1e-6)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from mujoco_warp import ConeType
 from mujoco_warp import DisableBit
 from mujoco_warp import test_data
 from mujoco_warp._src import types
+from mujoco_warp._src import util_pkg
 
 # tolerance for difference between MuJoCo and MJWarp smooth calculations - mostly
 # due to float precision
@@ -306,7 +307,8 @@ class SmoothTest(parameterized.TestCase):
     d.cfrc_ext.zero_()
     mjw.rne_postconstraint(m, d)
 
-    _assert_eq(d.cfrc_ext.numpy()[0], mjd.cfrc_ext, "cfrc_ext (equality)")
+    if util_pkg.check_version("mujoco>=3.13.1"):
+      _assert_eq(d.cfrc_ext.numpy()[0], mjd.cfrc_ext, "cfrc_ext (equality)")
 
     mjm, mjd, m, d = test_data.fixture("constraints.xml", keyframe=1, overrides={"opt.disableflags": DisableBit.EQUALITY})
 
@@ -317,6 +319,565 @@ class SmoothTest(parameterized.TestCase):
     mjw.rne_postconstraint(m, d)
 
     _assert_eq(d.cfrc_ext.numpy()[0], mjd.cfrc_ext, "cfrc_ext (contact)")
+
+  @parameterized.parameters(
+    (
+      """
+      <mujoco>
+        <option gravity="0 0 -1"/>
+        <worldbody>
+          <body name="body1">
+            <geom type="box" size="0.05 0.05 0.05"/>
+            <site name="sensor"/>
+          </body>
+          <body name="body2" pos="0 1 0">
+            <joint type="free"/>
+            <inertial pos="1 0 0" mass="1" diaginertia="1 1 1"/>
+            <geom type="box" size="0.05 0.05 0.05" pos="1 0 0"/>
+          </body>
+        </worldbody>
+        <equality>
+          <weld body1="body1" body2="body2" solimp="0.999 0.999 0.001" solref="0.005 1"/>
+        </equality>
+        <sensor>
+          <force site="sensor" user="0 0 2"/>
+          <torque site="sensor" user="1 -1 0"/>
+        </sensor>
+      </mujoco>
+      """,
+    ),
+    (
+      """
+      <mujoco>
+        <option gravity="0 0 -1"/>
+        <worldbody>
+          <body name="body1" euler="0 45 0">
+            <geom type="box" size="0.05 0.05 0.05"/>
+            <site name="sensor" euler="0 0 90"/>
+          </body>
+          <body name="body2" pos="0 1 0" euler="30 30 30">
+            <joint type="free"/>
+            <inertial pos="1 0 0" mass="1" diaginertia="1 1 1"/>
+            <geom type="box" size="0.05 0.05 0.05" pos="1 0 0"/>
+          </body>
+        </worldbody>
+        <equality>
+          <weld body1="body1" body2="body2" torquescale="4" solimp="0.999 0.999 0.001" solref="0.005 1"/>
+        </equality>
+        <sensor>
+          <force site="sensor" user="0 1.41421356237 1.41421356237"/>
+          <torque site="sensor" user="-0.75 -1.166386108 1.166386108"/>
+        </sensor>
+      </mujoco>
+      """,
+    ),
+  )
+  def test_rne_post_weld_force_torque_lever(self, xml):
+    """Tests force and torque sensor readings on weld lever models."""
+    mjm, _, m, d = test_data.fixture(xml=xml)
+
+    for _ in range(20):
+      mjw.step(m, d)
+
+    _assert_eq(d.sensordata.numpy()[0], mjm.sensor_user.flatten(), "weld force/torque sensor readings")
+
+  @parameterized.parameters(
+    "spring",
+    "limit",
+    "limit_lower",
+    "actuator",
+    "frictionloss",
+    "equality",
+    "pulley",
+    "wrap",
+    "fixed_slide",
+  )
+  def test_rne_postconstraint_tendon(self, name):
+    """Tests rne_postconstraint on models with spatial and fixed tendons."""
+    tendon_xmls = {
+      "spring": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend"><site name="fixedend"/></body>
+            </body>
+            <body name="mass" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <site name="mass"/>
+              <body name="massend"><site name="massend"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope" springlength="0.5" stiffness="100" damping="20">
+              <site site="fixedend"/>
+              <site site="massend"/>
+            </spatial>
+          </tendon>
+          <sensor>
+            <force site="fixedend" user="0 0 1"/>
+            <force site="massend" user="0 0 -1"/>
+            <force site="mass" user="0 0 0"/>
+          </sensor>
+        </mujoco>
+      """,
+      "limit": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend"><site name="fixedend"/></body>
+            </body>
+            <body name="mass" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <site name="mass"/>
+              <body name="massend"><site name="massend"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope" limited="true" range="0 0.5">
+              <site site="fixedend"/>
+              <site site="massend"/>
+            </spatial>
+          </tendon>
+          <sensor>
+            <force site="fixedend" user="0 0 1"/>
+            <force site="massend" user="0 0 -1"/>
+            <force site="mass" user="0 0 0"/>
+          </sensor>
+        </mujoco>
+      """,
+      "limit_lower": """
+        <mujoco>
+          <option gravity="0 0 1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend"><site name="fixedend"/></body>
+            </body>
+            <body name="mass" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <site name="mass"/>
+              <body name="massend"><site name="massend"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope" limited="true" range="0.6 1.0">
+              <site site="fixedend"/>
+              <site site="massend"/>
+            </spatial>
+          </tendon>
+          <sensor>
+            <force site="fixedend" user="0 0 -1"/>
+            <force site="massend" user="0 0 1"/>
+            <force site="mass" user="0 0 0"/>
+          </sensor>
+        </mujoco>
+      """,
+      "actuator": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend"><site name="fixedend"/></body>
+            </body>
+            <body name="mass" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <site name="mass"/>
+              <body name="massend"><site name="massend"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope">
+              <site site="fixedend"/>
+              <site site="massend"/>
+            </spatial>
+          </tendon>
+          <actuator>
+            <general tendon="rope" biastype="affine" biasprm="-1"/>
+          </actuator>
+          <sensor>
+            <force site="fixedend" user="0 0 1"/>
+            <force site="massend" user="0 0 -1"/>
+            <force site="mass" user="0 0 0"/>
+          </sensor>
+        </mujoco>
+      """,
+      "frictionloss": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend"><site name="fixedend"/></body>
+            </body>
+            <body name="mass" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <site name="mass"/>
+              <body name="massend"><site name="massend"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope" frictionloss="2">
+              <site site="fixedend"/>
+              <site site="massend"/>
+            </spatial>
+          </tendon>
+          <sensor>
+            <force site="fixedend" user="0 0 1"/>
+            <force site="massend" user="0 0 -1"/>
+            <force site="mass" user="0 0 0"/>
+          </sensor>
+        </mujoco>
+      """,
+      "equality": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend"><site name="fixedend"/></body>
+            </body>
+            <body name="mass" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <site name="mass"/>
+              <body name="massend"><site name="massend"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope">
+              <site site="fixedend"/>
+              <site site="massend"/>
+            </spatial>
+          </tendon>
+          <equality>
+            <tendon tendon1="rope"/>
+          </equality>
+          <sensor>
+            <force site="fixedend" user="0 0 1"/>
+            <force site="massend" user="0 0 -1"/>
+            <force site="mass" user="0 0 0"/>
+          </sensor>
+        </mujoco>
+      """,
+      "pulley": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="fixedend1"><site name="fixedend1"/></body>
+              <body name="fixedend2" pos="1 0 0"><site name="fixedend2"/></body>
+            </body>
+            <body name="mass1" pos="0 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <body name="massend1"><site name="massend1"/></body>
+            </body>
+            <body name="mass2" pos="1 0 -0.5">
+              <freejoint/>
+              <geom type="box" size="0.05 0.05 0.05" mass="0.5"/>
+              <body name="massend2"><site name="massend2"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope">
+              <site site="massend1"/>
+              <site site="fixedend1"/>
+              <pulley divisor="2"/>
+              <site site="fixedend2"/>
+              <site site="massend2"/>
+            </spatial>
+          </tendon>
+          <equality>
+            <tendon tendon1="rope"/>
+          </equality>
+          <sensor>
+            <force site="fixedend1" user="0 0 1"/>
+            <force site="fixedend2" user="0 0 0.5"/>
+            <force site="massend1" user="0 0 -1"/>
+            <force site="massend2" user="0 0 -0.5"/>
+          </sensor>
+        </mujoco>
+      """,
+      "wrap": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="pulley">
+              <geom name="cylinder" type="cylinder" size="0.1 0.05" euler="90 0 0" mass="0"/>
+              <site name="pulley"/>
+              <site name="side" pos="0 0 0.2"/>
+            </body>
+            <body name="mass1" pos="-0.1 0 -0.5">
+              <joint type="free" damping="1"/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <body name="massend1"><site name="massend1"/></body>
+            </body>
+            <body name="mass2" pos="0.1 0 -0.5">
+              <joint type="free" damping="1"/>
+              <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+              <body name="massend2"><site name="massend2"/></body>
+            </body>
+          </worldbody>
+          <tendon>
+            <spatial name="rope">
+              <site site="massend1"/>
+              <geom geom="cylinder" sidesite="side"/>
+              <site site="massend2"/>
+            </spatial>
+          </tendon>
+          <equality>
+            <tendon tendon1="rope"/>
+          </equality>
+          <sensor>
+            <force site="pulley" user="0 0 2"/>
+            <torque site="pulley" user="0 0 0"/>
+            <force site="massend1" user="0 0 -1"/>
+            <force site="massend2" user="0 0 -1"/>
+          </sensor>
+        </mujoco>
+      """,
+      "fixed_slide": """
+        <mujoco>
+          <option gravity="0 0 -1"/>
+          <worldbody>
+            <body name="fixed">
+              <body name="slider">
+                <joint name="slide" type="slide" axis="0 0 1"/>
+                <geom type="box" size="0.05 0.05 0.05" mass="1"/>
+                <site name="sensor"/>
+              </body>
+            </body>
+          </worldbody>
+          <tendon>
+            <fixed name="spring" stiffness="100" damping="20">
+              <joint joint="slide" coef="1"/>
+            </fixed>
+          </tendon>
+          <sensor>
+            <force site="sensor" user="0 0 1"/>
+          </sensor>
+        </mujoco>
+      """,
+    }
+
+    xml = tendon_xmls[name]
+    mjm, mjd, m, d = test_data.fixture(xml=xml, nworld=2)
+    while mjd.time < 10.0:
+      mujoco.mj_step(mjm, mjd)
+
+    d = mjw.put_data(mjm, mjd, nworld=2)
+    mjw.rne_postconstraint(m, d)
+    mjw.sensor_acc(m, d)
+
+    sdata = d.sensordata.numpy()
+    for w in range(d.nworld):
+      for i in range(mjm.nsensor):
+        adr = mjm.sensor_adr[i]
+        dim = mjm.sensor_dim[i]
+        expected = mjm.sensor_user[i, :dim]
+        actual = sdata[w, adr : adr + dim]
+        tol = 2e-3 if name == "wrap" else 1e-3
+        np.testing.assert_allclose(actual, expected, atol=tol, err_msg=f"{name} sensor {i} mismatch (world {w})")
+
+  @parameterized.parameters(DisableBit.SPRING, DisableBit.DAMPER)
+  def test_rne_postconstraint_tendon_disable(self, disablebit):
+    """Tests rne_postconstraint disables tendon spring or damper forces."""
+    xml = """
+    <mujoco>
+      <worldbody>
+        <body name="fixed"><site name="s1"/></body>
+        <body name="mass" pos="0 0 -0.6">
+          <freejoint/>
+          <geom type="sphere" size="0.1" mass="1"/>
+          <site name="s2"/>
+        </body>
+      </worldbody>
+      <tendon>
+        <spatial name="rope" springlength="0.5" stiffness="100" damping="20">
+          <site site="s1"/>
+          <site site="s2"/>
+        </spatial>
+      </tendon>
+    </mujoco>
+    """
+    mjm, mjd, m, d = test_data.fixture(xml=xml, nworld=2)
+    mjd.qvel[2] = -1.0
+    mujoco.mj_forward(mjm, mjd)
+    d = mjw.put_data(mjm, mjd, nworld=2)
+
+    # Base force with both spring (10 N) and damper (20 N) active = 30 N in +z
+    mjw.rne_postconstraint(m, d)
+    frc_all = d.cfrc_ext.numpy()[0, 2, 5]
+    np.testing.assert_allclose(frc_all, 30.0, atol=1e-4)
+
+    # Setting the disable flag eliminates the corresponding component
+    m.opt.disableflags = int(disablebit)
+    d.cfrc_ext.zero_()
+    mjw.rne_postconstraint(m, d)
+    frc_disabled = d.cfrc_ext.numpy()[0, 2, 5]
+    expected = 20.0 if disablebit == DisableBit.SPRING else 10.0
+    np.testing.assert_allclose(frc_disabled, expected, atol=1e-4)
+
+  def test_rne_postconstraint_external_forces(self):
+    """Tests that forces not transmitted through joints are external."""
+    xml = """
+    <mujoco>
+      <worldbody>
+        <geom type="plane" size="1 1 .1"/>
+        <site name="anchor" pos="-.3 0 1"/>
+        <site name="anchor2" pos=".3 .5 1"/>
+        <site name="anchor3" pos="-.5 .5 1"/>
+        <body pos="0 0 .5">
+          <joint type="hinge" axis="0 1 0"/>
+          <geom type="capsule" fromto="0 0 0 .3 0 0" size=".03"/>
+          <site name="link" pos=".1 0 0"/>
+          <body name="tip" pos=".3 0 0">
+            <joint type="ball"/>
+            <geom type="capsule" fromto="0 0 0 .2 0 0" size=".03"/>
+            <site name="tip" pos=".2 0 0"/>
+          </body>
+        </body>
+        <body name="box" pos=".5 0 .5" euler="0 0 20">
+          <freejoint/>
+          <geom type="box" size=".05 .05 .05"/>
+          <site name="box" pos="0 0 .05"/>
+        </body>
+        <body name="ball" pos="0 .3 .09">
+          <freejoint/>
+          <geom type="sphere" size=".1"/>
+          <site name="ball" pos="0 .1 0"/>
+          <site name="ballweld" pos=".1 -.3 .41"/>
+        </body>
+        <body name="post" pos=".25 .2 .32">
+          <geom name="wrap" type="sphere" size=".12" contype="0" conaffinity="0"/>
+          <site name="side" pos="0 0 .3"/>
+        </body>
+      </worldbody>
+      <tendon>
+        <spatial name="spring" stiffness="20" damping=".5" armature=".05" springlength="0 .2">
+          <site site="anchor"/>
+          <site site="box"/>
+        </spatial>
+        <spatial name="wrapped" stiffness="5" springlength="0 .3">
+          <site site="ball"/>
+          <geom geom="wrap" sidesite="side"/>
+          <site site="box"/>
+        </spatial>
+        <spatial name="pulley" limited="true" range="1.3 2" frictionloss=".2">
+          <site site="tip"/>
+          <site site="anchor2"/>
+          <pulley divisor="2"/>
+          <site site="anchor3"/>
+          <site site="ball"/>
+        </spatial>
+      </tendon>
+      <equality>
+        <connect body1="ball" body2="box" anchor="0 0 .1"/>
+        <tendon tendon1="spring" tendon2="pulley" polycoef="0 .5 .3 0 0"/>
+      </equality>
+      <actuator>
+        <motor tendon="wrapped" gear="2"/>
+        <general tendon="pulley" biastype="affine" biasprm="-.5"/>
+      </actuator>
+    </mujoco>
+    """
+    mjm, mjd, m, d = test_data.fixture(xml=xml, nworld=2)
+
+    box = mjm.body("box").id
+    for v in range(mjm.nv):
+      mjd.qvel[v] = (-1 if v % 2 else 1) * 0.1 * (v + 1)
+    for i in range(6):
+      mjd.xfrc_applied[box, i] = i + 1
+    mjd.ctrl[0] = 0.8
+    for _ in range(50):
+      mujoco.mj_step(mjm, mjd)
+    mujoco.mj_forward(mjm, mjd)
+
+    # Solve M * qacc = qfrc exactly
+    qfrc = np.zeros((1, mjm.nv))
+    mujoco.mju_add(qfrc[0], mjd.qfrc_smooth, mjd.qfrc_constraint)
+    qacc = np.zeros((1, mjm.nv))
+    mujoco.mj_solveM(mjm, mjd, qacc, qfrc)
+    mjd.qacc[:] = qacc[0]
+
+    d = mjw.put_data(mjm, mjd, nworld=2)
+    mjw.rne_postconstraint(m, d)
+
+    cfrc_int = d.cfrc_int.numpy()
+    cdof = d.cdof.numpy()
+    for w in range(d.nworld):
+      for v in range(mjm.nv):
+        b = mjm.dof_bodyid[v]
+        joint_frc = np.dot(cdof[w, v], cfrc_int[w, b])
+        np.testing.assert_allclose(joint_frc, 0.0, atol=2e-3, err_msg=f"world {w}, dof {v}")
+
+  def test_rne_postconstraint_internal_forces(self):
+    """Tests that forces transmitted through joints are internal."""
+    xml = """
+    <mujoco>
+      <worldbody>
+        <body pos="0 0 .5">
+          <joint name="hinge" type="hinge" axis="0 1 0" damping=".1" stiffness="2"
+                 armature=".3" range="-.5 .5"/>
+          <geom type="capsule" fromto="0 0 0 .3 0 0" size=".03"/>
+          <body pos=".3 0 0">
+            <joint name="slide" type="slide" axis="1 0 0" damping=".2" frictionloss=".1"/>
+            <geom type="box" size=".05 .05 .05"/>
+          </body>
+        </body>
+      </worldbody>
+      <tendon>
+        <fixed stiffness="3" damping=".1">
+          <joint joint="hinge" coef="1"/>
+          <joint joint="slide" coef="-.5"/>
+        </fixed>
+      </tendon>
+      <equality>
+        <joint joint1="hinge" joint2="slide" polycoef="0 .5 0 0 0"/>
+      </equality>
+      <actuator>
+        <motor joint="hinge"/>
+      </actuator>
+    </mujoco>
+    """
+    mjm, mjd, m, d = test_data.fixture(xml=xml, nworld=2)
+
+    mjd.qpos[0] = 0.6
+    mjd.qpos[1] = 0.1
+    mjd.qvel[0] = 0.3
+    mjd.qvel[1] = -0.2
+    mjd.ctrl[0] = 0.7
+    mjd.qfrc_applied[0] = 0.4
+    mjd.qfrc_applied[1] = -0.5
+    mujoco.mj_forward(mjm, mjd)
+
+    qfrc = np.zeros((1, mjm.nv))
+    mujoco.mju_add(qfrc[0], mjd.qfrc_smooth, mjd.qfrc_constraint)
+    qacc = np.zeros((1, mjm.nv))
+    mujoco.mj_solveM(mjm, mjd, qacc, qfrc)
+    mjd.qacc[:] = qacc[0]
+
+    d = mjw.put_data(mjm, mjd, nworld=2)
+    mjw.rne_postconstraint(m, d)
+
+    cfrc_int = d.cfrc_int.numpy()
+    cdof = d.cdof.numpy()
+    for w in range(d.nworld):
+      for v in range(mjm.nv):
+        b = mjm.dof_bodyid[v]
+        joint_frc = np.dot(cdof[w, v], cfrc_int[w, b])
+        expected = (
+          mjd.qfrc_passive[v]
+          + mjd.qfrc_actuator[v]
+          + mjd.qfrc_applied[v]
+          + mjd.qfrc_constraint[v]
+          - mjm.dof_armature[v] * mjd.qacc[v]
+        )
+        np.testing.assert_allclose(joint_frc, expected, atol=3e-4, err_msg=f"world {w}, dof {v}")
 
   def test_com_vel(self):
     """Tests com_vel."""

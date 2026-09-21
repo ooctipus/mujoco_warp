@@ -25,6 +25,7 @@ from mujoco_warp._src.types import Q_LD_BLOCK_COMPACT
 from mujoco_warp._src.types import Q_LD_BLOCK_SPARSE
 from mujoco_warp._src.types import CamLightType
 from mujoco_warp._src.types import ConeType
+from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import Data
 from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import EqType
@@ -1572,12 +1573,14 @@ def _cfrc_ext_equality(
   body_rootid: wp.array[int],
   site_bodyid: wp.array[int],
   site_pos: wp.array2d[wp.vec3],
+  site_quat: wp.array2d[wp.quat],
   eq_obj1id: wp.array[int],
   eq_obj2id: wp.array[int],
   eq_objtype: wp.array[int],
   eq_data: wp.array2d[vec11],
   # Data in:
   xpos_in: wp.array2d[wp.vec3],
+  xquat_in: wp.array2d[wp.quat],
   xmat_in: wp.array2d[wp.mat33],
   subtree_com_in: wp.array2d[wp.vec3],
   efc_id_in: wp.array2d[int],
@@ -1600,10 +1603,8 @@ def _cfrc_ext_equality(
   is_connect = eqid < num_connect
   if is_connect:
     efcid = 3 * eqid
-    cfrc_torque = wp.vec3(0.0, 0.0, 0.0)  # no torque from connect
   else:
     efcid = 6 * eqid - ne_connect
-    cfrc_torque = wp.vec3(efc_force_in[worldid, efcid + 3], efc_force_in[worldid, efcid + 4], efc_force_in[worldid, efcid + 5])
 
   cfrc_force = wp.vec3(
     efc_force_in[worldid, efcid + 0],
@@ -1624,6 +1625,26 @@ def _cfrc_ext_equality(
   else:
     bodyid1 = site_bodyid[obj1]
     bodyid2 = site_bodyid[obj2]
+
+  if is_connect:
+    cfrc_torque = wp.vec3(0.0, 0.0, 0.0)  # no torque from connect
+  else:
+    force_torque = wp.vec3(
+      efc_force_in[worldid, efcid + 3],
+      efc_force_in[worldid, efcid + 4],
+      efc_force_in[worldid, efcid + 5],
+    )
+    if body_semantic:
+      relpose = wp.quat(eq_data_[6], eq_data_[7], eq_data_[8], eq_data_[9])
+      q0 = math.mul_quat(xquat_in[worldid, bodyid1], relpose)
+      q1 = xquat_in[worldid, bodyid2]
+    else:
+      site_quat_id = worldid % site_quat.shape[0]
+      q0 = math.mul_quat(xquat_in[worldid, bodyid1], site_quat[site_quat_id, obj1])
+      q1 = math.mul_quat(xquat_in[worldid, bodyid2], site_quat[site_quat_id, obj2])
+
+    quat = math.mul_quat(math.quat_mul_axis(q1, force_torque), math.quat_inv(q0))
+    cfrc_torque = (0.5 * eq_data_[10]) * wp.vec3(quat[1], quat[2], quat[3])
 
   # body 1
   if bodyid1:
@@ -1740,12 +1761,233 @@ def _cfrc_ext_contact(
     wp.atomic_add(cfrc_ext_out[worldid], id2, support.transform_force(force, com2 - pos))
 
 
+@wp.kernel
+def _cfrc_ext_tendon_constraint(
+  # Model:
+  eq_type: wp.array[int],
+  eq_obj1id: wp.array[int],
+  eq_obj2id: wp.array[int],
+  eq_data: wp.array2d[vec11],
+  tendon_range: wp.array2d[wp.vec2],
+  tendon_length0: wp.array2d[float],
+  # Data in:
+  nefc_in: wp.array[int],
+  ten_length_in: wp.array2d[float],
+  efc_type_in: wp.array2d[int],
+  efc_id_in: wp.array2d[int],
+  efc_force_in: wp.array2d[float],
+  # Out:
+  ten_frc_out: wp.array2d[float],
+):
+  worldid, efcid = wp.tid()
+  if efcid >= nefc_in[worldid]:
+    return
+
+  efc_force = efc_force_in[worldid, efcid]
+  if efc_force == 0.0:
+    return
+
+  efc_type = efc_type_in[worldid, efcid]
+
+  if efc_type == ConstraintType.EQUALITY:
+    eqid = efc_id_in[worldid, efcid]
+    if eq_type[eqid] != EqType.TENDON:
+      return
+    obj1 = eq_obj1id[eqid]
+    obj2 = eq_obj2id[eqid]
+    wp.atomic_add(ten_frc_out[worldid], obj1, efc_force)
+    if obj2 >= 0:
+      dif = ten_length_in[worldid, obj2] - tendon_length0[worldid % tendon_length0.shape[0], obj2]
+      eq_data_ = eq_data[worldid % eq_data.shape[0], eqid]
+      deriv = eq_data_[1] + 2.0 * eq_data_[2] * dif + 3.0 * eq_data_[3] * dif * dif + 4.0 * eq_data_[4] * dif * dif * dif
+      wp.atomic_sub(ten_frc_out[worldid], obj2, deriv * efc_force)
+    return
+
+  if efc_type == ConstraintType.FRICTION_TENDON:
+    tenid = efc_id_in[worldid, efcid]
+    wp.atomic_add(ten_frc_out[worldid], tenid, efc_force)
+    return
+
+  if efc_type == ConstraintType.LIMIT_TENDON:
+    tenid = efc_id_in[worldid, efcid]
+    tenrange = tendon_range[worldid % tendon_range.shape[0], tenid]
+    length = ten_length_in[worldid, tenid]
+    dist_min = length - tenrange[0]
+    dist_max = tenrange[1] - length
+    scl = wp.where(dist_min < dist_max, 1.0, -1.0)
+    wp.atomic_add(ten_frc_out[worldid], tenid, scl * efc_force)
+
+
+@wp.kernel
+def _cfrc_ext_tendon_actuator(
+  # Model:
+  actuator_trntype: wp.array[int],
+  actuator_trnid: wp.array[wp.vec2i],
+  actuator_gear: wp.array2d[wp.spatial_vector],
+  # Data in:
+  actuator_force_in: wp.array2d[float],
+  # Out:
+  ten_frc_out: wp.array2d[float],
+):
+  worldid, actid = wp.tid()
+  if actuator_trntype[actid] != TrnType.TENDON:
+    return
+
+  force = actuator_force_in[worldid, actid]
+  if force == 0.0:
+    return
+
+  tenid = actuator_trnid[actid][0]
+  gear = actuator_gear[worldid % actuator_gear.shape[0], actid][0]
+  wp.atomic_add(ten_frc_out[worldid], tenid, force * gear)
+
+
+@wp.kernel
+def _cfrc_ext_spatial_tendon(
+  # Model:
+  body_rootid: wp.array[int],
+  geom_bodyid: wp.array[int],
+  site_bodyid: wp.array[int],
+  tendon_adr: wp.array[int],
+  tendon_num: wp.array[int],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  tendon_stiffness: wp.array2d[float],
+  tendon_stiffnesspoly: wp.array2d[wp.vec2],
+  tendon_damping: wp.array2d[float],
+  tendon_dampingpoly: wp.array2d[wp.vec2],
+  tendon_armature: wp.array2d[float],
+  tendon_lengthspring: wp.array2d[wp.vec2],
+  wrap_type: wp.array[int],
+  wrap_objid: wp.array[int],
+  wrap_prm: wp.array[float],
+  # Data in:
+  qacc_in: wp.array2d[float],
+  subtree_com_in: wp.array2d[wp.vec3],
+  ten_wrapadr_in: wp.array2d[int],
+  ten_wrapnum_in: wp.array2d[int],
+  ten_J_in: wp.array2d[float],
+  ten_length_in: wp.array2d[float],
+  wrap_obj_in: wp.array2d[wp.vec2i],
+  wrap_xpos_in: wp.array2d[wp.spatial_vector],
+  ten_velocity_in: wp.array2d[float],
+  # In:
+  ten_bias_coef_in: wp.array2d[float],
+  dsbl_spring: bool,
+  dsbl_damper: bool,
+  ten_frc_in: wp.array2d[float],
+  # Data out:
+  cfrc_ext_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, tenid = wp.tid()
+
+  # fixed tendon: acts through the joints
+  adr = tendon_adr[tenid]
+  if wrap_type[adr] == WrapType.JOINT:
+    return
+
+  frc = ten_frc_in[worldid, tenid]
+
+  # ten_frc += spring and damper
+  if not dsbl_spring:
+    stiffness = tendon_stiffness[worldid % tendon_stiffness.shape[0], tenid]
+    spoly = tendon_stiffnesspoly[worldid % tendon_stiffnesspoly.shape[0], tenid]
+    if stiffness != 0.0 or spoly[0] != 0.0 or spoly[1] != 0.0:
+      length = ten_length_in[worldid, tenid]
+      lengthspring = tendon_lengthspring[worldid % tendon_lengthspring.shape[0], tenid]
+      lower = lengthspring[0]
+      upper = lengthspring[1]
+      x = wp.where(length > upper, length - upper, wp.where(length < lower, length - lower, 0.0))
+      frc += -x * util_misc._poly_force(stiffness, spoly, x, 0)
+
+  if not dsbl_damper:
+    damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
+    dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
+    if damping != 0.0 or dpoly[0] != 0.0 or dpoly[1] != 0.0:
+      v = ten_velocity_in[worldid, tenid]
+      frc += -v * util_misc._poly_force(damping, dpoly, v, 1)
+
+  # ten_frc -= armature * tendon acceleration: reaction of the armature inertia
+  armature = tendon_armature[worldid % tendon_armature.shape[0], tenid]
+  if armature != 0.0:
+    acc = ten_bias_coef_in[worldid, tenid]
+    rownnz = ten_J_rownnz[tenid]
+    rowadr = ten_J_rowadr[tenid]
+    for i in range(rownnz):
+      sparseid = rowadr + i
+      acc += ten_J_in[worldid, sparseid] * qacc_in[worldid, ten_J_colind[sparseid]]
+    frc -= armature * acc
+
+  if frc == 0.0:
+    return
+
+  num = tendon_num[tenid]
+  p = ten_wrapadr_in[worldid, tenid]
+  pend = p + ten_wrapnum_in[worldid, tenid]
+  scaled_frc = frc
+  prevbody = int(-1)
+  prevpnt = wp.vec3(0.0)
+  prevcom = wp.vec3(0.0)
+
+  for j_offset in range(num):
+    j = adr + j_offset
+    wtype = wrap_type[j]
+    objid = wrap_objid[j]
+
+    # pulley: divides the force in the next branch, skip its marker in the path
+    if wtype == WrapType.PULLEY:
+      scaled_frc = frc / wrap_prm[j]
+      prevbody = -1
+      p += 1
+      continue
+
+    # site: one point; geom: two points if the tendon wraps around it
+    npnt = int(0)
+    body = int(0)
+    if wtype == WrapType.SITE:
+      npnt = 1
+      body = site_bodyid[objid]
+    else:
+      body = geom_bodyid[objid]
+      if p < pend and wrap_obj_in[worldid, p // 2][p % 2] == objid:
+        npnt = 2
+
+    com = wp.vec3(0.0)
+    if npnt > 0 and body != 0:
+      com = subtree_com_in[worldid, body_rootid[body]]
+
+    for k in range(2):
+      if k >= npnt:
+        continue
+
+      wrap_pos = wrap_xpos_in[worldid, p // 2]
+      pnt = wp.where(p % 2 == 0, wp.spatial_top(wrap_pos), wp.spatial_bottom(wrap_pos))
+      if prevbody >= 0 and body != prevbody:
+        diff = pnt - prevpnt
+        vec, norm = math.normalize_with_norm(diff)
+        if norm > 0.0:
+          force = vec * scaled_frc
+          if body != 0:
+            wp.atomic_add(cfrc_ext_out[worldid], body, wp.spatial_vector(-wp.cross(com - pnt, force), force))
+          if prevbody != 0:
+            wp.atomic_sub(
+              cfrc_ext_out[worldid],
+              prevbody,
+              wp.spatial_vector(-wp.cross(prevcom - prevpnt, force), force),
+            )
+      prevbody = body
+      prevpnt = pnt
+      prevcom = com
+      p += 1
+
+
 @event_scope
 def rne_postconstraint(m: Model, d: Data):
   """Computes the recursive Newton-Euler algorithm after constraints are applied.
 
   Computes `cacc`, `cfrc_ext`, and `cfrc_int`, including the effects of applied forces, equality
-  constraints, and contacts.
+  constraints, contacts, and spatial tendons.
   """
   # cfrc_ext = perturb
   wp.launch(
@@ -1775,11 +2017,13 @@ def rne_postconstraint(m: Model, d: Data):
         m.body_rootid,
         m.site_bodyid,
         m.site_pos,
+        m.site_quat,
         m.eq_obj1id,
         m.eq_obj2id,
         m.eq_objtype,
         m.eq_data,
         d.xpos,
+        d.xquat,
         d.xmat,
         d.subtree_com,
         d.efc.id,
@@ -1813,6 +2057,122 @@ def rne_postconstraint(m: Model, d: Data):
     ],
     outputs=[d.cfrc_ext],
   )
+
+  # cfrc_ext += spatial tendons
+  if m.ntendon > 0:
+    ten_frc = wp.zeros((d.nworld, m.ntendon), dtype=float)
+
+    wp.launch(
+      _cfrc_ext_tendon_constraint,
+      dim=(d.nworld, d.njmax),
+      inputs=[
+        m.eq_type,
+        m.eq_obj1id,
+        m.eq_obj2id,
+        m.eq_data,
+        m.tendon_range,
+        m.tendon_length0,
+        d.nefc,
+        d.ten_length,
+        d.efc.type,
+        d.efc.id,
+        d.efc.force,
+      ],
+      outputs=[ten_frc],
+    )
+
+    wp.launch(
+      _cfrc_ext_tendon_actuator,
+      dim=(d.nworld, m.nu),
+      inputs=[
+        m.actuator_trntype,
+        m.actuator_trnid,
+        m.actuator_gear,
+        d.actuator_force,
+      ],
+      outputs=[ten_frc],
+    )
+
+    ten_bias_coef = wp.zeros((d.nworld, m.ntendon), dtype=float)
+    if m.nJten > 0:
+      ten_Jdot = wp.zeros((d.nworld, m.nJten), dtype=float)
+      wp.launch(
+        _tendon_dot,
+        dim=(d.nworld, m.ntendon),
+        inputs=[
+          m.body_parentid,
+          m.body_rootid,
+          m.body_dofnum,
+          m.body_dofadr,
+          m.jnt_type,
+          m.jnt_dofadr,
+          m.dof_jntid,
+          m.site_bodyid,
+          m.tendon_adr,
+          m.tendon_num,
+          m.ten_J_rownnz,
+          m.ten_J_rowadr,
+          m.ten_J_colind,
+          m.tendon_armature,
+          m.wrap_type,
+          m.wrap_objid,
+          m.wrap_prm,
+          d.site_xpos,
+          d.subtree_com,
+          d.cdof,
+          d.cvel,
+          d.cdof_dot,
+        ],
+        outputs=[ten_Jdot],
+      )
+
+      wp.launch(
+        _tendon_bias_coef,
+        dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
+        inputs=[m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, m.tendon_armature, d.qvel, ten_Jdot],
+        outputs=[ten_bias_coef],
+      )
+
+    dsbl_spring = bool(m.opt.disableflags & DisableBit.SPRING)
+    dsbl_damper = bool(m.opt.disableflags & DisableBit.DAMPER)
+
+    wp.launch(
+      _cfrc_ext_spatial_tendon,
+      dim=(d.nworld, m.ntendon),
+      inputs=[
+        m.body_rootid,
+        m.geom_bodyid,
+        m.site_bodyid,
+        m.tendon_adr,
+        m.tendon_num,
+        m.ten_J_rownnz,
+        m.ten_J_rowadr,
+        m.ten_J_colind,
+        m.tendon_stiffness,
+        m.tendon_stiffnesspoly,
+        m.tendon_damping,
+        m.tendon_dampingpoly,
+        m.tendon_armature,
+        m.tendon_lengthspring,
+        m.wrap_type,
+        m.wrap_objid,
+        m.wrap_prm,
+        d.qacc,
+        d.subtree_com,
+        d.ten_wrapadr,
+        d.ten_wrapnum,
+        d.ten_J,
+        d.ten_length,
+        d.wrap_obj,
+        d.wrap_xpos,
+        d.ten_velocity,
+        ten_bias_coef,
+        dsbl_spring,
+        dsbl_damper,
+        ten_frc,
+      ],
+      outputs=[d.cfrc_ext],
+    )
 
   # forward pass over bodies: compute cacc, cfrc_int
   _rne_cacc_world(m, d)

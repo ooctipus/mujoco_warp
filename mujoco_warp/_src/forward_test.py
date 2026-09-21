@@ -316,6 +316,138 @@ class ForwardTest(parameterized.TestCase):
 
     np.testing.assert_allclose(d.qvel.numpy()[0], mjd.qvel, atol=1e-3, rtol=1e-3, err_msg="qvel")
 
+  def test_implicit_coriolis_two_hinge(self):
+    """Verify implicit integrator with non-planar multi-body Coriolis coupling tracks MuJoCo."""
+    mjm, mjd, m_warp, d_warp = test_data.fixture(
+      xml="""
+      <mujoco model="two_hinges">
+        <option timestep="0.001" integrator="implicit" gravity="0 0 0"/>
+        <worldbody>
+          <body name="body1" pos="0 0 0">
+            <joint name="joint1" type="hinge" pos="0 0 0" axis="0 1 0"/>
+            <geom type="cylinder" size="0.05 0.2" pos="0 0 0.2" mass="1"/>
+            <body name="body2" pos="0 0 0.4">
+              <joint name="joint2" type="hinge" pos="0 0 0" axis="1 0 0"/>
+              <geom type="cylinder" size="0.05 0.2" pos="0 0 0.2" mass="1"/>
+            </body>
+          </body>
+        </worldbody>
+        <keyframe>
+          <key qpos="0.5 0.5" qvel="30 -30"/>
+        </keyframe>
+      </mujoco>
+      """,
+      keyframe=0,
+    )
+
+    for i in range(20):
+      mjw.step(m_warp, d_warp)
+      mujoco.mj_step(mjm, mjd)
+
+      np.testing.assert_allclose(
+        d_warp.qvel.numpy()[0],
+        mjd.qvel,
+        atol=1e-3,
+        rtol=1e-3,
+        err_msg=f"step {i} qvel mismatch between implicit integrator and MuJoCo",
+      )
+
+  @parameterized.parameters(IntegratorType.IMPLICIT, IntegratorType.IMPLICITFAST)
+  def test_standalone_free_body_implicit_fluid(self, integrator):
+    """Verify IMPLICIT and IMPLICITFAST match MuJoCo for standalone free body in fluid."""
+    mjm, mjd, m_warp, d_warp = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.005" density="1.2" viscosity="0.002" wind="1 2 3"/>
+        <worldbody>
+          <body pos="0.1 -0.2 0.5" euler="20 -30 40">
+            <joint type="free"/>
+            <geom type="ellipsoid" size=".1 .2 .3" mass="2" pos=".04 -.02 .03"
+                  fluidshape="ellipsoid"/>
+          </body>
+        </worldbody>
+        <keyframe>
+          <key qpos="0.1 -0.2 0.5 1 0 0 0" qvel="1 -0.5 0.8 5 -3 2"/>
+        </keyframe>
+      </mujoco>
+      """,
+      keyframe=0,
+      overrides={"opt.integrator": integrator},
+    )
+
+    for i in range(10):
+      mjw.step(m_warp, d_warp)
+      mujoco.mj_step(mjm, mjd)
+
+      np.testing.assert_allclose(
+        d_warp.qvel.numpy()[0],
+        mjd.qvel,
+        atol=1e-3,
+        rtol=1e-3,
+        err_msg=f"step {i} qvel mismatch between {integrator} and MuJoCo",
+      )
+
+  @parameterized.parameters(IntegratorType.IMPLICIT, IntegratorType.IMPLICITFAST)
+  def test_free_root_massless_fluid_child(self, integrator):
+    """Verify free root with massless welded child carrying fluid geom matches MuJoCo."""
+    mjm, mjd, m_warp, d_warp = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option timestep="0.005" density="1.2" viscosity="0.002" wind="1 2 3"/>
+        <worldbody>
+          <body name="root" pos="0.1 -0.2 0.5" euler="20 -30 40">
+            <joint type="free"/>
+            <geom type="sphere" size=".1" mass="2"/>
+            <body name="child" pos="0 0 0.2">
+              <geom type="ellipsoid" size=".1 .2 .3" mass="0" fluidshape="ellipsoid"/>
+            </body>
+          </body>
+        </worldbody>
+        <keyframe>
+          <key qpos="0.1 -0.2 0.5 1 0 0 0" qvel="1 -0.5 0.8 5 -3 2"/>
+        </keyframe>
+      </mujoco>
+      """,
+      keyframe=0,
+      overrides={"opt.integrator": integrator},
+    )
+
+    # Free root with massless welded child is admitted as free body in MuJoCo C
+    self.assertTrue(bool(m_warp.body_is_free.numpy().any()))
+
+    inputs = {
+      "qpos",
+      "qvel",
+      "time",
+      "ctrl",
+      "qfrc_applied",
+      "xfrc_applied",
+      "mocap_pos",
+      "mocap_quat",
+      "userdata",
+      "eq_active",
+    }
+    for name, arr in vars(d_warp).items():
+      if name in inputs:
+        continue
+      if isinstance(arr, wp.array):
+        if arr.dtype == float:
+          arr.fill_(wp.inf)
+        elif arr.dtype in (int, wp.int32, wp.uint32):
+          arr.fill_(-1)
+
+    for i in range(10):
+      mjw.step(m_warp, d_warp)
+      mujoco.mj_step(mjm, mjd)
+
+      np.testing.assert_allclose(
+        d_warp.qvel.numpy()[0],
+        mjd.qvel,
+        atol=1e-3,
+        rtol=1e-3,
+        err_msg=f"step {i} qvel mismatch for free root + massless child ({integrator})",
+      )
+
   @parameterized.parameters(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE)
   def test_implicit_tendon_damping(self, jacobian):
     mjm, mjd, m, d = test_data.fixture(
@@ -2052,6 +2184,53 @@ class DCMotorTest(parameterized.TestCase):
       mjw.step(m, d)
 
     np.testing.assert_allclose(d.qvel.numpy()[0], mjd.qvel, atol=1e-3, rtol=1e-3)
+
+  def test_run_rne_postconstraint(self):
+    """Tests run_rne_postconstraint option in forward and step2."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <worldbody>
+          <body name="body0" pos="0 0 1">
+            <freejoint/>
+            <geom type="sphere" size=".1" mass="1"/>
+            <site name="site0"/>
+          </body>
+        </worldbody>
+        <sensor>
+          <accelerometer site="site0"/>
+        </sensor>
+      </mujoco>
+      """,
+      overrides={"opt.disableflags": DisableBit.SENSOR, "opt.run_rne_postconstraint": True},
+    )
+    self.assertTrue(m.opt.run_rne_postconstraint)
+    mujoco.mj_forward(mjm, mjd)
+    mujoco.mj_rnePostConstraint(mjm, mjd)
+
+    # 1. run_rne_postconstraint=True: RNE runs in forward and step2, sensors skipped
+    d.cacc.fill_(wp.inf)
+    d.cfrc_int.fill_(wp.inf)
+    d.cfrc_ext.fill_(wp.inf)
+    mjw.forward(m, d)
+
+    _assert_eq(d.cacc.numpy()[0], mjd.cacc, "cacc")
+    _assert_eq(d.cfrc_int.numpy()[0], mjd.cfrc_int, "cfrc_int")
+    _assert_eq(d.cfrc_ext.numpy()[0], mjd.cfrc_ext, "cfrc_ext")
+    self.assertFalse(d.sensordata.numpy().any(), "Sensors should not be computed when disabled")
+
+    # Verify step2 also runs RNE
+    d.cacc.fill_(wp.inf)
+    mjw.step2(m, d)
+    _assert_eq(d.cacc.numpy()[0], mjd.cacc, "step2 cacc")
+
+    # 2. run_rne_postconstraint=False: RNE skipped when sensors disabled
+    m.opt.run_rne_postconstraint = False
+    d.cfrc_ext.fill_(wp.inf)
+    mjw.forward(m, d)
+    self.assertTrue(
+      np.isinf(d.cfrc_ext.numpy()[0]).all(), "cfrc_ext should remain inf when RNE is not requested and sensors disabled"
+    )
 
 
 if __name__ == "__main__":

@@ -48,7 +48,8 @@ def _geom_dist(
   overflow_out: wp.array | None = None,
 ):
   # we run multiccd on static scenes so these need to be initialized
-  npolygonmax = 10 if multiccd else 0
+  has_cylinder = GeomType.CYLINDER in (m.geom_type.numpy()[gid1], m.geom_type.numpy()[gid2])
+  npolygonmax = (16 if has_cylinder else 10) if multiccd else 0
   nmeshdegmax = 10 if multiccd else 0
   epa_vert = wp.empty(10 + 2 * m.opt.ccd_iterations, dtype=wp.vec3)
   epa_vert_index = wp.empty(10 + 2 * m.opt.ccd_iterations, dtype=int)
@@ -524,6 +525,25 @@ class GJKTest(parameterized.TestCase):
     )
     _, ncon, _, _ = _geom_dist(m, d, 0, 1, multiccd=True)
     self.assertEqual(ncon, 4)
+
+  @parameterized.named_parameters(
+    ("vertical", 1.9, "", 4),
+    ("horizontal", 1.4, ' euler="90 0 0"', 2),
+  )
+  def test_cylinder_box_ccd(self, pos_z: float, euler: str, expected_ncon: int):
+    """Test cylinder-box multiccd."""
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+       <mujoco>
+         <worldbody>
+           <geom name="geom1" type="box" pos="0 0 0" size="10 10 1"/>
+           <geom name="geom2" type="cylinder" pos="0 0 {pos_z}"{euler} size="0.5 1"/>
+         </worldbody>
+       </mujoco>
+       """
+    )
+    _, ncon, _, _ = _geom_dist(m, d, 0, 1, multiccd=True)
+    self.assertEqual(ncon, expected_ncon)
 
   def test_mesh_mesh_ccd(self):
     """Test mesh-mesh multiccd."""

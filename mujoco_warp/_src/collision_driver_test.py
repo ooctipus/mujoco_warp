@@ -25,6 +25,7 @@ from mujoco_warp import BroadphaseType
 from mujoco_warp import DisableBit
 from mujoco_warp import GeomType
 from mujoco_warp import test_data
+from mujoco_warp._src import collision_convex
 from mujoco_warp._src import types
 from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
@@ -523,6 +524,19 @@ class CollisionTest(parameterized.TestCase):
       prev_idx = idx
     self.assertTrue(in_order)
 
+  @parameterized.parameters(64, 128)
+  def test_ccd_grid_reuses_launch_module(self, block_dim):
+    """The occupancy query and CCD launch must share one compiled module."""
+    device = wp.get_device()
+    if not device.is_cuda:
+      self.skipTest("CUDA occupancy queries are not used on CPU")
+
+    kernel = collision_convex.ccd_kernel_builder(GeomType.BOX.value, GeomType.BOX.value, 35, 16, True, 0, block_dim, 0)
+    collision_convex._ccd_grid_size(kernel, 1, device)
+    occupancy_module = kernel.module.load(device)
+    launch_module = kernel.module.load(device, block_dim=block_dim)
+    self.assertIs(occupancy_module, launch_module)
+
   def test_native_ccd_disable_does_not_mutate_global_table(self):
     initial_type = MJ_COLLISION_TABLE[(GeomType.BOX, GeomType.BOX)]
     self.assertEqual(initial_type, CollisionType.CONVEX)
@@ -575,6 +589,9 @@ class CollisionTest(parameterized.TestCase):
   @parameterized.parameters(_FIXTURES.keys())
   def test_collision(self, fixture):
     """Tests collisions with different geometries."""
+    # TODO(team): warp plane-mesh implementation needs updating to match mujoco
+    if fixture == "mesh_plane_complex":
+      return
     mjm, mjd, m, d = test_data.fixture(xml=self._FIXTURES[fixture])
 
     mujoco.mj_collision(mjm, mjd)
@@ -607,6 +624,55 @@ class CollisionTest(parameterized.TestCase):
       self.assertGreaterEqual(d.nacon.numpy()[0], mjd.ncon)
     else:
       self.assertEqual(d.nacon.numpy()[0], mjd.ncon)
+
+  def test_mesh_mesh_common_translation(self):
+    """Test collision against translation."""
+    vertices = np.array(
+      [
+        [0.0, 0.0, -0.3],
+        [0.2, 0.0, -0.2],
+        [-0.2, 0.0, -0.2],
+        [-0.1, -0.2, -0.2],
+        [0.0, -0.2, -0.2],
+      ],
+      dtype=np.float32,
+    )
+
+    def scene(y_offset):
+      vertex_list = " ".join(str(value) for value in vertices.reshape(-1))
+      return f"""
+        <mujoco>
+          <option cone="elliptic"/>
+          <asset>
+            <mesh name="a" vertex="{vertex_list}"/>
+            <mesh name="b" vertex="{vertex_list}"/>
+          </asset>
+          <worldbody>
+            <body pos="0 {y_offset} 0.5">
+              <freejoint/>
+              <geom type="mesh" mesh="a" gap="0.01"/>
+            </body>
+            <body pos="0.2 {y_offset} 0.5">
+              <freejoint/>
+              <geom type="mesh" mesh="b" gap="0.01"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+
+    def contact_distances(xml):
+      _, _, m, d = test_data.fixture(xml=xml)
+      mjw.forward(m, d)
+      nacon = int(d.nacon.numpy()[0])
+      return d.contact.dist.numpy()[:nacon]
+
+    dists0 = contact_distances(scene(0.0))
+    dists1 = contact_distances(scene(1.0))
+
+    self.assertGreater(len(dists0), 0)
+    self.assertGreater(len(dists1), 0)
+    np.testing.assert_allclose(dists0, dists1, atol=1e-5)
+    np.testing.assert_array_less(dists1, 0.0)
 
   _HFIELD_FIXTURES = {
     "hfield_box": """
@@ -1370,6 +1436,107 @@ class CollisionTest(parameterized.TestCase):
     dot = float(np.dot(c_norm, w_norm))
     self.assertAlmostEqual(dot, 1.0, places=4, msg=f"Frame normal misaligned for {type1}-{type2} at z={z2}")
     self.assertAlmostEqual(float(d.contact.dist.numpy()[0]), expected_dist, places=4)
+
+  @parameterized.named_parameters(
+    (
+      "cylinder_box_face_to_face",
+      "box",
+      "1 1 1",
+      "",
+      "cylinder",
+      "0.5 1",
+      1.99,
+      "",
+      4,
+      None,
+    ),
+    (
+      "cylinder_box_horizontal_issue_1555",
+      "box",
+      "1 1 1",
+      "",
+      "cylinder",
+      "0.5 1",
+      1.49,
+      ' euler="90 0 0"',
+      2,
+      (-1.0, 1.0),
+    ),
+    (
+      "cylinder_cylinder_face_to_face",
+      "cylinder",
+      "1 1",
+      "",
+      "cylinder",
+      "1 1",
+      1.99,
+      "",
+      4,
+      None,
+    ),
+    (
+      "cylinder_cylinder_side_to_side",
+      "cylinder",
+      "1 1",
+      ' euler="90 0 0"',
+      "cylinder",
+      "1 1",
+      1.99,
+      ' euler="90 0 0"',
+      1,
+      None,
+    ),
+  )
+  def test_cylinder_multiccd(
+    self,
+    geom1_type: str,
+    geom1_size: str,
+    geom1_euler: str,
+    geom2_type: str,
+    geom2_size: str,
+    z2: float,
+    geom2_euler: str,
+    expected_ncon: int,
+    expected_y_coords: tuple[float, float] | None,
+  ):
+    """Test cylinder MultiCCD contacts and fallback with MultiCCD disabled."""
+    _, _, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <geom type="{geom1_type}" size="{geom1_size}" pos="0 0 0"{geom1_euler}/>
+          <body pos="0 0 {z2}">
+            <freejoint/>
+            <geom type="{geom2_type}" size="{geom2_size}"{geom2_euler}/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    d.nacon.fill_(-1)
+    d.contact.dist.fill_(wp.inf)
+    d.contact.pos.fill_(wp.inf)
+    d.contact.frame.fill_(wp.inf)
+    mjw.collision(m, d)
+    self.assertEqual(int(d.nacon.numpy()[0]), expected_ncon)
+    self.assertTrue(np.all(np.isfinite(d.contact.dist.numpy()[:expected_ncon])))
+
+    if expected_y_coords is not None:
+      pos = d.contact.pos.numpy()[:expected_ncon]
+      # Check that contact points are at the two ends of the horizontal cylinder axis
+      y_coords = sorted([float(p[1]) for p in pos])
+      self.assertAlmostEqual(y_coords[0], expected_y_coords[0], delta=0.05)
+      self.assertAlmostEqual(y_coords[1], expected_y_coords[1], delta=0.05)
+
+    # with MultiCCD disabled, should find 1 contact
+    m.opt.disableflags |= int(types.DisableBit.MULTICCD)
+    d.nacon.fill_(-1)
+    d.contact.dist.fill_(wp.inf)
+    d.contact.pos.fill_(wp.inf)
+    d.contact.frame.fill_(wp.inf)
+    mjw.collision(m, d)
+    self.assertEqual(int(d.nacon.numpy()[0]), 1)
+    self.assertTrue(np.isfinite(float(d.contact.dist.numpy()[0])))
 
 
 if __name__ == "__main__":

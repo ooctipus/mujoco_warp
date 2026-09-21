@@ -702,7 +702,7 @@ wheels = [
 
 [[package]]
 name = "mujoco"
-version = "3.12.1.dev968306640"
+version = "3.12.1.dev974703000"
 source = { registry = "https://py.mujoco.org/" }
 dependencies = [
     { name = "absl-py" },
@@ -713,35 +713,35 @@ dependencies = [
     { name = "pyopengl" },
 ]
 wheels = [
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp310-cp310-macosx_11_0_universal2.whl", hash = "sha256:f3b7169c3a625004aa1018c0830eef429415a48c9f6df1dfa0d12184ef96c6d3" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f8795d70e6371f21f85ecccf08f51b0f03710dbe4e903d7d581bcc10ac099a32" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7b3c6770ef2de46bfc383dc56ae270c412955dffcff9899955aeeaec8809353f" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp310-cp310-win_amd64.whl", hash = "sha256:a3c9914e8e0b8bb3470ea024e9781b5d97c3183246136532484a6f4fdff89165" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:bd170e6aa1838b6a3254717ddf2516d139252406433f7a9b2c34880d7376c13e" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:330409c2e158fad2e7d5fc1009329c56a27aa3effaa23e94450f2fbb2565a13c" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:00bdef07ab43e1c4b2301be2a0cc4891508718f2ee3ebe661e77a74390b2229e" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp311-cp311-win_amd64.whl", hash = "sha256:2e2fe3dce7feb3af5026076ef1851b8879ac0cf3392eaa6ea912fb486c93f3f3" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp312-cp312-macosx_11_0_universal2.whl", hash = "sha256:e90e16ddcc735dcbccc5aa1a5d48528984c237950189a43680a31b4cc9059551" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d561924b67f91b1cd8c59698c0140f88c5f9f5f6059641af61d8855b560a1d78" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cd9c5ed8faee0a15f92cfb1ea5b44ec27a06c3d03d7b86a86d3f6f309c95e9a6" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp312-cp312-win_amd64.whl", hash = "sha256:a969bb786bb3e31781fe53a63f69d7041007ed6b1fb75e4095559d055e1462f4" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp313-cp313-macosx_11_0_universal2.whl", hash = "sha256:0763df98f4a91187026b0643d8259302e30aa047ccc6ab51441f8a2c9b07bfc7" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:41740cd7306f28fc9f4747a68809839abd38a61914b7ed20eacb810f7dc60f6c" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d5a791b4a799980a3d0ade6e6c23b46f3c92704a75bee017de713d0fc6de4fa7" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp313-cp313-win_amd64.whl", hash = "sha256:471c32d2752971e77e0be5834ec8e3c7de619b209277700c9a66fdd9a70fa2d3" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314-macosx_11_0_universal2.whl", hash = "sha256:b5e9e02389d912c5143c71486ea531f5daaf9f97dcf0fbbe175490fda104f94c" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3d765361a800caf23d13d8430d33fe7e09628f7cb79fce7415006144f63967e3" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c092e6e8fc33255c47730e8329c29bb82753cd4741916150f004eb798f2dd0c2" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314-win_amd64.whl", hash = "sha256:37228def07c423cb020d000ffb2c50b276cb0059017cdebad0848c737f48e71d" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314t-macosx_11_0_universal2.whl", hash = "sha256:a515fc3b616472afde276f7e61f2c91c19742c384f0c4e05e1afc5fd009405d1" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2fc1ce3929f38e2743e7615997eec4c71f9a469eb0ae966a6e5dc8d46806e155" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6f225993034bf3205065fb2f308a89eb0478ec6f05e7bff9ce617de91ab136c0" },
-    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev968306640-cp314-cp314t-win_amd64.whl", hash = "sha256:ea5e1eb03b277b24990d3832496fffd3653a4cb39483ac9c9c12b8a6d32a1812" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp310-cp310-macosx_11_0_universal2.whl", hash = "sha256:8af266edba1d35f5d839ede24bb66c5866fd9a595f6d67ce9092d6c1ef0442c8" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d269e74cdd957fc3e89a94a8a4851af13c6d8b5a74078ec35bd9e812db8b7bb7" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:810049308f5fce73107e2a7ae8dbe3391af477fd5d7de0b3728121ec884823b9" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp310-cp310-win_amd64.whl", hash = "sha256:76a4ee0212b9e175363792dc9c8857eee070f2df49f46601cb81c30cfa793db3" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp311-cp311-macosx_11_0_universal2.whl", hash = "sha256:34bd8ca9a3af324b5d4964c4fe783ba5ba5accbc55556f55786198e83ab5fcf2" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0b227c125de6524fcfe2141cfa22a3b2868b9d3a1079191d1a34139490e506ef" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6ede6aa478c834880afdf7b239a703ee71914e00c13a700cdb630f36274184b6" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp311-cp311-win_amd64.whl", hash = "sha256:1429ae23da30a0db4de416d0fed3e5917f18d84b0ae3d69048b5f1d4380f5e3e" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp312-cp312-macosx_11_0_universal2.whl", hash = "sha256:d85162085663bf47a4119e08a74f520d39244efff3069148fb370a701283b04a" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8f9b51e580c61fbb2092b7bad4a5c2b674a255c2a1a3b1ff2586e4312875fefd" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2a2ad304d312636ee6cdb1aa8b0c2c0fb3b39839fa489f1e8233c8efa4edb93c" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp312-cp312-win_amd64.whl", hash = "sha256:32b33e74477041478fb4a330f8003700bfe167d7dd3c0101dded2580a88a5dcd" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp313-cp313-macosx_11_0_universal2.whl", hash = "sha256:35eb1756863b9a62213532d810506ac4cea2eb0a5ec999e625e18ea00bb07e3a" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:48b5d029b582a7b974c8b691668ac6f39ef787783e5877bf74bc18d69d706b88" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5c762842cb088cd36032893f1d5429ea2347bca10b25f06a08a8bc39bb0eb962" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp313-cp313-win_amd64.whl", hash = "sha256:2ff5bb8771172b6b2e369938ae0ddfb2cb96fa559d50e1d74e8907ed050da9ba" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314-macosx_11_0_universal2.whl", hash = "sha256:2b04138f3f481b86a660bee122ac3026823c1550d67878e9d194609ccdce808b" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4bbfff72fb37918d807e8635f84f2b43f77bc38912612d399ac28ddf3411a917" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ae61738cf20a60c8ed4558e5bd37ac2ee8d449c4d8031748eef137828d1b0205" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314-win_amd64.whl", hash = "sha256:b6ebb7a8ed6c0ccf3ff98013c6aadd464d85b0c523704c52abffe1ea02c2880d" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314t-macosx_11_0_universal2.whl", hash = "sha256:d5982abe9a81c7c5681e311d741917c8b42720c4e8da2a501d0a6b18e35cd61c" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a86c2e06990d70dc61a13280adf2e461f31dad463acd7531bbb9e6f4e6685553" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:da5ef571553222af695bbada67362341d1ee2aca799d06b267bf12dd92582975" },
+    { url = "https://py.mujoco.org/mujoco/mujoco-3.12.1.dev974703000-cp314-cp314t-win_amd64.whl", hash = "sha256:82e8aec14bd78e2451a64874e38d47d6474ed297d1c53718242961c1a24ca764" },
 ]
 
 [[package]]
 name = "mujoco-warp"
-version = "3.12.0"
+version = "3.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "absl-py" },

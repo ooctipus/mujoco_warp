@@ -34,8 +34,11 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+from common import clone_if_needed
+from common import ensure_pinned_clone
+from common import uv_run
 
 _ARGS = None  # module level variable that gets populated with argparse results
 
@@ -46,26 +49,6 @@ if _venv_bin not in os.environ.get("PATH", ""):
 
 logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
 log = logging.getLogger(__name__)
-
-
-# external commands
-
-
-def _git(*args, cwd: Path | None = None, check: bool = True):
-  """Run a git command, returning CompletedProcess."""
-  env = os.environ.copy()
-  env["TZ"] = "UTC"
-  ssh_key = Path.home() / ".ssh" / "id_ed25519_mujoco_warp_nightly"
-  if ssh_key.exists():
-    env["GIT_SSH_COMMAND"] = f'ssh -i "{ssh_key}" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
-  log.info("Command: git %s", " ".join(args))
-  return subprocess.run(("git",) + args, cwd=cwd, env=env, check=check, capture_output=True, text=True)
-
-
-def _uv_run(*args, cwd: Path | None = None):
-  """Run a uv command, returning CompletedProcess."""
-  log.info("Command: uv run %s", " ".join(args))
-  return subprocess.run(("uv", "run") + args, cwd=cwd, check=True, capture_output=True, text=True)
 
 
 # benchmark discovery, assembly, and execution
@@ -105,9 +88,7 @@ def _assemble_benchmark(bm: dict):
 
     # repo clones are stored in the format: <assets_root>/_git/<repo_source>/<repo_ref>
     repo_dir = Path(_ARGS.assets_root) / "_git" / Path(repo["source"]).stem / repo["ref"]
-    if not repo_dir.exists():
-      repo_dir.mkdir(parents=True, exist_ok=True)
-      _git("clone", repo["source"], repo_dir.as_posix(), "--depth", "1", "--revision", repo["ref"])
+    ensure_pinned_clone(repo["source"], repo["ref"], repo_dir)
 
     if "*" in repo_path:
       parts = Path(repo_path).parts
@@ -125,6 +106,23 @@ def _assemble_benchmark(bm: dict):
   shutil.copytree(bm["_dir"], benchmark_dir, dirs_exist_ok=True)
 
 
+def _bm_flags(bm: dict, benchmark_root: Path, exclude: tuple = ()) -> list:
+  """Build --flag=value CLI args from a benchmark dict, shared by testspeed and viewer."""
+  skip = ("name", "assets", "mjcf", "_dir", *exclude)
+  cmd = []
+  for field, value in bm.items():
+    if field in skip:
+      continue
+    if field == "replay":
+      cmd.append(f"--replay={(benchmark_root / value)}")
+    elif isinstance(value, (list, tuple)):
+      for item in value:
+        cmd.append(f"--{field}={item}")
+    else:
+      cmd.append(f"--{field}={value}")
+  return cmd
+
+
 def _run_benchmark(bm: dict, input_dir: Path) -> dict:
   """Run a single benchmark via uv, returning parsed JSON."""
   benchmark_root = Path(_ARGS.assets_root) / bm["name"]
@@ -138,17 +136,9 @@ def _run_benchmark(bm: dict, input_dir: Path) -> dict:
     "--measure_solver=true",
     "--measure_alloc=true",
   ]
-  for field, value in bm.items():
-    if field == "replay":
-      cmd.append(f"--replay={(benchmark_root / value)}")
-    elif field not in ("name", "assets", "mjcf", "_dir"):
-      if isinstance(value, (list, tuple)):
-        for item in value:
-          cmd.append(f"--{field}={item}")
-      else:
-        cmd.append(f"--{field}={value}")
+  cmd += _bm_flags(bm, benchmark_root)
 
-  result = _uv_run(*cmd, cwd=input_dir)
+  result = uv_run(*cmd, cwd=input_dir)
 
   # parse short-format output into a dict
   data = {}
@@ -169,11 +159,9 @@ def _view_benchmark(bm: dict, input_dir: Path):
     (benchmark_root / bm["mjcf"]).as_posix(),
     "--nworld=1",
   ]
-  for field in ("nconmax", "nccdmax", "njmax"):
-    if field in bm:
-      cmd.append(f"--{field}={bm[field]}")
-  if "replay" in bm:
-    cmd.append(f"--replay={(benchmark_root / bm['replay'])}")
+  # nworld is forced to 1 above for interactive viewing; function selects an
+  # alternate benchmark entry point (e.g. render) that mjwarp-viewer doesn't support.
+  cmd += _bm_flags(bm, benchmark_root, exclude=("nworld", "function"))
 
   log.info("Command: uv run %s", " ".join(cmd))
   subprocess.run(("uv", "run") + tuple(cmd), cwd=input_dir, check=True)
@@ -195,18 +183,7 @@ def main():
 
   _ARGS = parser.parse_args()
 
-  def clone_if_needed(uri):
-    if ":" not in uri:
-      return uri
-    path = tempfile.mkdtemp(prefix="mjwarp-run-")
-    spec = uri.rsplit("#", 1)
-    if len(spec) < 2:
-      _git("clone", spec[0], path)
-    else:
-      _git("clone", spec[0], path, "--branch", spec[1])
-    return path
-
-  input_dir = clone_if_needed(_ARGS.input)
+  input_dir = clone_if_needed(_ARGS.input, "mjwarp-run-")
   benchmarks = list(_discover_benchmarks(input_dir))
 
   if _ARGS.view:
