@@ -33,6 +33,85 @@ wp.set_module_options({"enable_backward": False})
 
 
 class SleepTest(parameterized.TestCase):
+  def test_policy_change_breaks_old_cycles_and_reset_skips_disabled_members(self):
+    """Keep valid enabled cycles when a saved island contains permanently disabled members."""
+    _, _, m, d = test_data.fixture(
+      xml="""<mujoco><option gravity="0 0 0"><flag sleep="enable"/></option><worldbody>
+        <body><joint type="slide"/><geom size=".1"/></body>
+        <body pos="1 0 0"><joint type="slide"/><geom size=".1"/></body>
+        <body pos="2 0 0"><joint type="slide"/><geom size=".1"/></body>
+      </worldbody></mujoco>""",
+      nworld=2,
+    )
+    m.tree_sleep_policy = wp.array([[2, 2, 2], [2, 2, 2]], dtype=int)
+    initial = wp.array([[1, 2, 0]], dtype=int)
+    mjwarp.reset_sleep(m, d, initial_tree_asleep=initial)
+    selected = wp.array([[0, 1, 0], [0, 0, 0]], dtype=int)
+    with wp.ScopedCapture() as capture:
+      mjwarp.set_sleep_policy(m, d, selected, types.SleepPolicy.ALWAYS)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(d.tree_awake.numpy(), [[1, 0, 1], [0, 0, 0]])
+    mjwarp.reset_sleep(m, d, initial_tree_asleep=initial)
+    np.testing.assert_array_equal(d.tree_asleep.numpy(), [[2, 1, 0], [1, 2, 0]])
+    mjwarp.wake_trees(m, d, wp.array([[1, 0, 0], [0, 0, 0]], dtype=int))
+    np.testing.assert_array_equal(d.tree_awake.numpy(), [[1, 0, 1], [0, 0, 0]])
+    d.qvel.assign([[0, 9, 0], [0, 0, 0]])
+    mjwarp.step(m, d)
+    self.assertEqual(d.qvel.numpy()[0, 1], 0)
+    mjwarp.set_sleep_policy(m, d, selected, types.SleepPolicy.AUTO_NEVER)
+    mjwarp.reset_sleep(m, d, initial_tree_asleep=initial)
+    self.assertEqual(d.tree_awake.numpy()[0, 1], 1)
+
+  def test_selected_reset_and_wake_preserve_permanent_policy(self):
+    """Reset selected worlds and reject wake requests for permanently disabled trees."""
+    _, _, m, d = test_data.fixture(
+      xml="""<mujoco><option gravity="0 0 0"><flag sleep="enable"/></option><worldbody>
+        <body><joint type="slide"/><geom size=".1"/></body>
+        <body pos="1 0 0"><joint type="slide"/><geom size=".1"/></body>
+      </worldbody></mujoco>""",
+      nworld=2,
+    )
+    m.tree_sleep_policy = wp.array([[types.SleepPolicy.ALWAYS, 0], [0, 0]], dtype=int)
+    d.tree_asleep.assign([[0, 1], [0, 1]])
+    sleep.update_sleep(m, d)
+    d.qvel.assign([[7.0, 0.0], [0.0, 0.0]])
+    selected = wp.array([True, False], dtype=bool)
+    mjwarp.reset_sleep(m, d, world_mask=selected)
+    np.testing.assert_array_equal(d.tree_awake.numpy(), [[0, 1], [0, 0]])
+    np.testing.assert_array_equal(d.qvel.numpy(), 0)
+    requests = wp.array([[1, 1], [0, 0]], dtype=int)
+    mjwarp.wake_trees(m, d, requests)
+    np.testing.assert_array_equal(d.tree_awake.numpy(), [[0, 1], [0, 0]])
+    # Re-enabling requires an explicit reset: stale disabled velocities must not return.
+    m.tree_sleep_policy.assign([[0, 0], [0, 0]])
+    with wp.ScopedCapture() as capture:
+      mjwarp.reset_sleep(m, d, world_mask=selected)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(d.tree_awake.numpy(), [[1, 1], [0, 0]])
+    np.testing.assert_array_equal(d.qvel.numpy(), 0)
+
+  def test_external_collision_provider_uses_shared_wake_pass(self):
+    """Wake from externally supplied contacts and request the incremental support pass."""
+    _, _, m, d = test_data.fixture(
+      xml="""<mujoco><option gravity="0 0 0"><flag sleep="enable"/></option><worldbody>
+        <body><freejoint/><geom size=".1"/></body>
+        <body pos=".19 0 0"><freejoint/><geom size=".1"/></body>
+      </worldbody></mujoco>""",
+    )
+    calls = []
+
+    def external_collision(model, data, awake_prev=None):
+      calls.append(awake_prev is not None)
+      mjwarp.collision(model, data, awake_prev=awake_prev)
+
+    m.opt.run_collision_detection = False
+    m.callback.collision = external_collision
+    d.tree_asleep.assign([[0, sleep.K_AWAKE_VAL]])
+    sleep.update_sleep(m, d)
+    mjwarp.step(m, d)
+    self.assertEqual(calls, [False, True])
+    np.testing.assert_array_equal(d.tree_awake.numpy(), [[1, 1]])
+
   @parameterized.parameters(1, 2)
   def test_sleep_initiation(self, nworld):
     """Verify that a stationary body on a flat plane goes to sleep."""
