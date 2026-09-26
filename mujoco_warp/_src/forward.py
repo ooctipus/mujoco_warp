@@ -1074,21 +1074,18 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   smooth.tendon_armature(m, d)
   if factorize:
     smooth.factor_m(m, d)
-  if m.opt.run_collision_detection:
-    if sleep_enabled:
-      # pass 1
-      collision_driver.collision(m, d)
-      # wake any sleeping tree touched by an awake one
-      sleep.wake_collision(m, d)
-      # snapshot the awake state pass 1 used, before update_sleep overwrites it. a body is "newly
-      # awakened" if it was asleep here but awake after update_sleep below.
-      awake_prev = wp.clone(d.body_awake)
-      sleep.update_sleep(m, d)
-      # pass 2: passing awake_prev runs the incremental pass, emitting only pairs involving a
-      # newly-awakened body and appending them to the pass-1 buffer.
-      collision_driver.collision(m, d, awake_prev=awake_prev)
-    else:
-      collision_driver.collision(m, d)
+  if m.callback.collision is not None and m.opt.run_collision_detection:
+    raise ValueError("An external collision provider requires run_collision_detection=False.")
+  collision = collision_driver.collision if m.opt.run_collision_detection else m.callback.collision
+  if collision is not None:
+    collision(m, d)
+  if sleep_enabled:
+    # Contact provenance does not change wake policy or the timing of the support pass.
+    sleep.wake_collision(m, d)
+    awake_prev = wp.clone(d.body_awake) if collision is not None else None
+    sleep.update_sleep(m, d)
+    if collision is not None:
+      collision(m, d, awake_prev=awake_prev)
 
   constraint.make_constraint(m, d)
 

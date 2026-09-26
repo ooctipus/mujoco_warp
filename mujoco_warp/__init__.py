@@ -80,6 +80,9 @@ from mujoco_warp._src.set_const import set_const_0 as set_const_0
 from mujoco_warp._src.set_const import set_const_fixed as set_const_fixed
 from mujoco_warp._src.set_const import set_const_spring as set_const_spring
 from mujoco_warp._src.set_const import set_length_range as set_length_range
+from mujoco_warp._src.sleep import reset_sleep as reset_sleep
+from mujoco_warp._src.sleep import set_sleep_policy as set_sleep_policy
+from mujoco_warp._src.sleep import wake_trees as wake_trees
 from mujoco_warp._src.smooth import camlight as camlight
 from mujoco_warp._src.smooth import com_pos as com_pos
 from mujoco_warp._src.smooth import com_vel as com_vel

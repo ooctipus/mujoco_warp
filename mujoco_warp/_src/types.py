@@ -1041,6 +1041,9 @@ class Callback:
     act_bias: custom actuator biases, writes to ``Data.actuator_force``
     sensor: custom sensors, writes to ``Data.sensordata``
     contactfilter: custom contact filtering, writes to ``Data.contact``
+    collision: external collision provider ``(model, data, awake_prev=None)``. Requires
+      ``run_collision_detection=False``. Replaces contacts on the first pass; appends only
+      newly awakened pairs on the second pass. Runs after kinematics, before constraints.
   """
 
   passive: Callable | None = None
@@ -1050,6 +1053,7 @@ class Callback:
   act_bias: Callable | None = None
   sensor: Callable | None = None
   contactfilter: Callable | None = None
+  collision: Callable | None = None
 
 
 @dataclasses.dataclass

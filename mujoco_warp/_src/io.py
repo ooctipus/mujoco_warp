@@ -2456,7 +2456,6 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
     ValueError: If reset is specified but its shape is not (d.nworld,) or its
       dtype is not bool or integer.
   """
-  sleep_enabled = bool(m.opt.enableflags & types.EnableBit.SLEEP)
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def reset_xfrc_applied(reset_in: wp.array[bool], xfrc_applied_out: wp.array2d[wp.spatial_vector]):
@@ -2645,58 +2644,6 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
     contact_geomcollisionid_out[conid] = 0
     contact_adhesion_out[conid] = 0.0
 
-  @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
-  def reset_sleep(
-    # Model:
-    nv: int,
-    nbody: int,
-    ntree: int,
-    body_mocapid: wp.array[int],
-    body_treeid: wp.array[int],
-    tree_sleep_policy: wp.array2d[int],
-    # In:
-    mj_minawake: int,
-    reset_in: wp.array[bool],
-    # Data out:
-    tree_asleep_out: wp.array2d[int],
-    tree_awake_out: wp.array2d[int],
-    body_awake_out: wp.array2d[int],
-    body_awake_ind_out: wp.array2d[int],
-    dof_awake_ind_out: wp.array2d[int],
-  ):
-    worldid, elemid = wp.tid()
-
-    if wp.static(reset is not None):
-      if not reset_in[worldid]:
-        return
-
-    if elemid < ntree:
-      policy = tree_sleep_policy[worldid % tree_sleep_policy.shape[0], elemid]
-      if policy == types.SleepPolicy.ALWAYS:
-        tree_asleep_out[worldid, elemid] = elemid
-        tree_awake_out[worldid, elemid] = 0
-      else:
-        tree_asleep_out[worldid, elemid] = -(1 + mj_minawake)
-        tree_awake_out[worldid, elemid] = 1
-
-    if elemid < nbody:
-      tree = body_treeid[elemid]
-      if tree < 0:
-        if body_mocapid[elemid] >= 0:
-          body_awake_out[worldid, elemid] = int(types.SleepState.AWAKE)
-        else:
-          body_awake_out[worldid, elemid] = int(types.SleepState.STATIC)
-      else:
-        policy = tree_sleep_policy[worldid % tree_sleep_policy.shape[0], tree]
-        if policy == types.SleepPolicy.ALWAYS:
-          body_awake_out[worldid, elemid] = int(types.SleepState.ASLEEP)
-        else:
-          body_awake_out[worldid, elemid] = int(types.SleepState.AWAKE)
-      body_awake_ind_out[worldid, elemid] = elemid
-
-    if elemid < nv:
-      dof_awake_ind_out[worldid, elemid] = elemid
-
   if reset is None:
     reset_input = wp.ones(d.nworld, dtype=bool)
   elif isinstance(reset, wp.array):
@@ -2756,19 +2703,6 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
   )
 
   wp.launch(
-    reset_sleep,
-    dim=(d.nworld, max(m.ntree, m.nbody, m.nv)),
-    inputs=[m.nv, m.nbody, m.ntree, m.body_mocapid, m.body_treeid, m.tree_sleep_policy, types.MJ_MINAWAKE, reset_input],
-    outputs=[
-      d.tree_asleep,
-      d.tree_awake,
-      d.body_awake,
-      d.body_awake_ind,
-      d.dof_awake_ind,
-    ],
-  )
-
-  wp.launch(
     reset_nworld,
     dim=d.nworld,
     inputs=[
@@ -2816,8 +2750,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
   if m.nhistory > 0:
     history.reset_history(m, d, reset=reset_input)
 
-  if sleep_enabled:
-    sleep.update_sleep(m, d)
+  sleep.reset_sleep(m, d, world_mask=reset_input)
 
 
 def reset_data_keyframe(m: types.Model, d: types.Data, key: int | wp.array):
