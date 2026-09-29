@@ -280,7 +280,13 @@ def _obb_filter(
   return True
 
 
-def _broadphase_filter(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound: int, ngeom_margin: int, ngeom_gap: int):
+def _broadphase_filter(
+  opt_broadphase_filter: int,
+  batched_geom_aabb: bool,
+  batched_geom_rbound: bool,
+  batched_geom_margin: bool,
+  batched_geom_gap: bool,
+):
   @wp.func
   def func(
     # Model:
@@ -301,15 +307,33 @@ def _broadphase_filter(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound
     # 4: aabb
     # 8: obb
 
-    aabb_id = worldid % ngeom_aabb if wp.static(ngeom_aabb > 1) else 0
+    # Specialize on layout, not population size, so resizing reuses compiled kernels.
+    # Full-world batches avoid a runtime integer division; smaller batches remain cyclic.
+    aabb_id = (
+      (worldid if geom_aabb.shape[0] == geom_xpos_in.shape[0] else worldid % geom_aabb.shape[0])
+      if wp.static(batched_geom_aabb)
+      else 0
+    )
     center1, center2 = geom_aabb[aabb_id, geom1, 0], geom_aabb[aabb_id, geom2, 0]  # kernel_analyzer: ignore
     size1, size2 = geom_aabb[aabb_id, geom1, 1], geom_aabb[aabb_id, geom2, 1]  # kernel_analyzer: ignore
 
-    rbound_id = worldid % ngeom_rbound if wp.static(ngeom_rbound > 1) else 0
+    rbound_id = (
+      (worldid if geom_rbound.shape[0] == geom_xpos_in.shape[0] else worldid % geom_rbound.shape[0])
+      if wp.static(batched_geom_rbound)
+      else 0
+    )
     rbound1, rbound2 = geom_rbound[rbound_id, geom1], geom_rbound[rbound_id, geom2]  # kernel_analyzer: ignore
-    margin_id = worldid % ngeom_margin if wp.static(ngeom_margin > 1) else 0
+    margin_id = (
+      (worldid if geom_margin.shape[0] == geom_xpos_in.shape[0] else worldid % geom_margin.shape[0])
+      if wp.static(batched_geom_margin)
+      else 0
+    )
     margin1, margin2 = geom_margin[margin_id, geom1], geom_margin[margin_id, geom2]  # kernel_analyzer: ignore
-    gap_id = worldid % ngeom_gap if wp.static(ngeom_gap > 1) else 0
+    gap_id = (
+      (worldid if geom_gap.shape[0] == geom_xpos_in.shape[0] else worldid % geom_gap.shape[0])
+      if wp.static(batched_geom_gap)
+      else 0
+    )
     gap1, gap2 = geom_gap[gap_id, geom1], geom_gap[gap_id, geom2]  # kernel_analyzer: ignore
     effective_margin1 = margin1 + gap1
     effective_margin2 = margin2 + gap2
@@ -382,7 +406,7 @@ def _add_geom_pair(
 
 
 @cache_kernel
-def _sap_project(opt_broadphase: int, ngeom_dataid: int):
+def _sap_project(opt_broadphase: int, batched_geom_dataid: bool):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def sap_project(
     # Model:
@@ -412,9 +436,9 @@ def _sap_project(opt_broadphase: int, ngeom_dataid: int):
         if worldid == nworld_in - 1:
           segmented_index_out[nworld_in] = nworld_in * ngeom
 
-    if wp.static(ngeom_dataid > 1):
+    if wp.static(batched_geom_dataid):
       # an inverted interval at the end of the axis: no bounded geom sweeps over a missing mesh
-      if _mesh_missing(geom_dataid, geomid, geom_type[geomid], worldid % ngeom_dataid):
+      if _mesh_missing(geom_dataid, geomid, geom_type[geomid], worldid % geom_dataid.shape[0]):
         projection_lower_out[worldid, geomid] = MJ_MAXVAL
         projection_upper_out[worldid, geomid] = -MJ_MAXVAL
         return
@@ -442,11 +466,11 @@ def _sap_project(opt_broadphase: int, ngeom_dataid: int):
 @cache_kernel
 def _sap_broadphase(
   opt_broadphase_filter: int,
-  ngeom_aabb: int,
-  ngeom_rbound: int,
-  ngeom_margin: int,
-  ngeom_gap: int,
-  ngeom_dataid: int,
+  batched_geom_aabb: bool,
+  batched_geom_rbound: bool,
+  batched_geom_margin: bool,
+  batched_geom_gap: bool,
+  batched_geom_dataid: bool,
   enable_sleep: bool = False,
   incremental: bool = False,
 ):
@@ -517,8 +541,8 @@ def _sap_broadphase(
       type1 = geom_type[geom1]
       type2 = geom_type[geom2]
 
-      if wp.static(ngeom_dataid > 1):
-        dataid_id = worldid % ngeom_dataid
+      if wp.static(batched_geom_dataid):
+        dataid_id = worldid if geom_dataid.shape[0] == geom_xpos_in.shape[0] else worldid % geom_dataid.shape[0]
         if _mesh_missing(geom_dataid, geom1, type1, dataid_id) or _mesh_missing(geom_dataid, geom2, type2, dataid_id):
           continue
 
@@ -554,9 +578,11 @@ def _sap_broadphase(
             continue
 
       if (
-        wp.static(_broadphase_filter(opt_broadphase_filter, ngeom_aabb, ngeom_rbound, ngeom_margin, ngeom_gap))(
-          geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid
-        )
+        wp.static(
+          _broadphase_filter(
+            opt_broadphase_filter, batched_geom_aabb, batched_geom_rbound, batched_geom_margin, batched_geom_gap
+          )
+        )(geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid)
         or pairid[1] >= 0
       ):
         _add_geom_pair(
@@ -650,7 +676,7 @@ def sap_broadphase(
   segmented_index = wp.empty(d.nworld + 1 if m.opt.broadphase == BroadphaseType.SAP_SEGMENTED else 0, dtype=int)
 
   wp.launch(
-    kernel=_sap_project(m.opt.broadphase, m.geom_dataid.shape[0]),
+    kernel=_sap_project(m.opt.broadphase, m.geom_dataid.shape[0] > 1),
     dim=(d.nworld, m.ngeom),
     inputs=[m.ngeom, m.geom_type, m.geom_dataid, m.geom_rbound, m.geom_margin, m.geom_gap, d.geom_xpos, d.nworld, direction],
     outputs=[
@@ -690,11 +716,11 @@ def sap_broadphase(
   wp.launch(
     kernel=_sap_broadphase(
       m.opt.broadphase_filter,
-      m.geom_aabb.shape[0],
-      m.geom_rbound.shape[0],
-      m.geom_margin.shape[0],
-      m.geom_gap.shape[0],
-      m.geom_dataid.shape[0],
+      m.geom_aabb.shape[0] > 1,
+      m.geom_rbound.shape[0] > 1,
+      m.geom_margin.shape[0] > 1,
+      m.geom_gap.shape[0] > 1,
+      m.geom_dataid.shape[0] > 1,
       enable_sleep,
       incremental,
     ),
@@ -728,11 +754,11 @@ def sap_broadphase(
 @cache_kernel
 def _nxn_broadphase(
   opt_broadphase_filter: int,
-  ngeom_aabb: int,
-  ngeom_rbound: int,
-  ngeom_margin: int,
-  ngeom_gap: int,
-  ngeom_dataid: int,
+  batched_geom_aabb: bool,
+  batched_geom_rbound: bool,
+  batched_geom_margin: bool,
+  batched_geom_gap: bool,
+  batched_geom_dataid: bool,
   enable_sleep: bool = False,
   incremental: bool = False,
 ):
@@ -772,8 +798,8 @@ def _nxn_broadphase(
     type1 = geom_type[geom1]
     type2 = geom_type[geom2]
 
-    if wp.static(ngeom_dataid > 1):
-      dataid_id = worldid % ngeom_dataid
+    if wp.static(batched_geom_dataid):
+      dataid_id = worldid if geom_dataid.shape[0] == geom_xpos_in.shape[0] else worldid % geom_dataid.shape[0]
       if _mesh_missing(geom_dataid, geom1, type1, dataid_id) or _mesh_missing(geom_dataid, geom2, type2, dataid_id):
         return
 
@@ -813,9 +839,9 @@ def _nxn_broadphase(
 
     pairid = nxn_pairid[elementid]
     if (
-      wp.static(_broadphase_filter(opt_broadphase_filter, ngeom_aabb, ngeom_rbound, ngeom_margin, ngeom_gap))(
-        geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid
-      )
+      wp.static(
+        _broadphase_filter(opt_broadphase_filter, batched_geom_aabb, batched_geom_rbound, batched_geom_margin, batched_geom_gap)
+      )(geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid)
       or pairid[1] >= 0
     ):
       _add_geom_pair(
@@ -891,11 +917,11 @@ def nxn_broadphase(
     wp.launch(
       _nxn_broadphase(
         m.opt.broadphase_filter,
-        m.geom_aabb.shape[0],
-        m.geom_rbound.shape[0],
-        m.geom_margin.shape[0],
-        m.geom_gap.shape[0],
-        m.geom_dataid.shape[0],
+        m.geom_aabb.shape[0] > 1,
+        m.geom_rbound.shape[0] > 1,
+        m.geom_margin.shape[0] > 1,
+        m.geom_gap.shape[0] > 1,
+        m.geom_dataid.shape[0] > 1,
         enable_sleep,
         incremental,
       ),

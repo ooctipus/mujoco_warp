@@ -14,6 +14,9 @@
 # ==============================================================================
 """Tests the collision driver."""
 
+import dataclasses
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -26,8 +29,10 @@ from mujoco_warp import DisableBit
 from mujoco_warp import GeomType
 from mujoco_warp import test_data
 from mujoco_warp._src import collision_convex
+from mujoco_warp._src import collision_driver
 from mujoco_warp._src import types
 from mujoco_warp._src.collision_core import Geom
+from mujoco_warp._src.collision_core import create_collision_context
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
 from mujoco_warp._src.collision_primitive import plane_convex
 from mujoco_warp._src.collision_sdf import MeshData
@@ -72,6 +77,75 @@ def _assert_eq(a, b, name):
 
 class CollisionTest(parameterized.TestCase):
   """Tests the collision contact functions."""
+
+  @parameterized.product(broadphase=list(BroadphaseType), batch_rows=(1, 2, 5))
+  def test_broadphase_batch_layout(self, broadphase, batch_rows):
+    """Broadcast, cyclic, and full batches agree, including world-specific absent meshes."""
+    fields = ("geom_aabb", "geom_rbound", "geom_margin", "geom_gap", "geom_dataid")
+    _, _, m, d = test_data.fixture(
+      xml="""<mujoco><asset><mesh name="cube" vertex="-.1 -.1 -.1 .1 -.1 -.1 -.1 .1 -.1 .1 .1 -.1
+        -.1 -.1 .1 .1 -.1 .1 -.1 .1 .1 .1 .1 .1"/></asset><worldbody>
+        <geom type="plane" size="2 2 .1"/>
+        <body pos="0 0 .09"><freejoint/><geom type="mesh" mesh="cube"/></body>
+        <body pos=".18 0 .09"><freejoint/><geom type="mesh" mesh="cube"/></body>
+      </worldbody></mujoco>""",
+      nworld=5,
+      batch_sizes=dict.fromkeys(fields, batch_rows),
+      overrides={"opt.broadphase": broadphase},
+    )
+    if batch_rows > 1:
+      missing = m.geom_dataid.numpy()
+      missing[1, 1] = -1
+      m.geom_dataid.assign(missing)
+      for name in ("geom_margin", "geom_gap"):
+        values = getattr(m, name).numpy()
+        values += 0.01 * np.arange(batch_rows)[:, None]
+        getattr(m, name).assign(values)
+    expanded = dataclasses.replace(
+      m,
+      **{
+        name: wp.array(getattr(m, name).numpy()[np.arange(d.nworld) % batch_rows], dtype=getattr(m, name).dtype)
+        for name in fields
+      },
+    )
+    broadphase_fn = collision_driver.nxn_broadphase if broadphase == BroadphaseType.NXN else collision_driver.sap_broadphase
+    results = []
+    for model in (m, expanded):
+      ctx = create_collision_context(d.naconmax)
+      d.ncollision.zero_()
+      broadphase_fn(model, d, ctx)
+      count = int(d.ncollision.numpy()[0])
+      self.assertLessEqual(count, d.naconmax)
+      pairs = np.column_stack((ctx.collision_worldid.numpy()[:count], ctx.collision_pair.numpy()[:count]))
+      results.append(pairs[np.lexsort((pairs[:, 2], pairs[:, 1], pairs[:, 0]))])
+    np.testing.assert_array_equal(*results)
+    self.assertGreater(len(results[0]), 0)
+    if batch_rows > 1:
+      missing_worlds = results[0][:, 0] % batch_rows == 1
+      self.assertFalse(np.any(results[0][missing_worlds, 1:] == 1))
+
+  @parameterized.parameters(list(BroadphaseType))
+  def test_broadphase_resize_reuses_kernel_specialization(self, broadphase):
+    """Changing only the number of worlds must not create count-specific GPU kernels."""
+    factory_name = "_nxn_broadphase" if broadphase == BroadphaseType.NXN else "_sap_broadphase"
+    broadphase_fn = collision_driver.nxn_broadphase if broadphase == BroadphaseType.NXN else collision_driver.sap_broadphase
+    with mock.patch.object(collision_driver, factory_name, wraps=getattr(collision_driver, factory_name)) as factory:
+      for count in (2, 5):
+        _, _, m, d = test_data.fixture(
+          xml="""<mujoco><worldbody>
+            <body><freejoint/><geom type="sphere" size=".1"/></body>
+            <body pos=".19 0 0"><freejoint/><geom type="sphere" size=".1"/></body>
+          </worldbody></mujoco>""",
+          nworld=count,
+          batch_sizes=dict.fromkeys(("geom_aabb", "geom_rbound", "geom_margin", "geom_gap", "geom_dataid"), count),
+          overrides={"opt.broadphase": broadphase},
+        )
+        ctx = create_collision_context(d.naconmax)
+        d.ncollision.zero_()
+        broadphase_fn(m, d, ctx)
+        self.assertEqual(int(d.ncollision.numpy()[0]), count)
+      self.assertEqual(factory.call_count, 2)
+      self.assertEqual(factory.call_args_list[0], factory.call_args_list[1])
 
   _SDF_SDF = {
     "_NUT_NUT": """
