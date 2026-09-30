@@ -266,6 +266,84 @@ class WorkspaceTest(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, "scalar metadata"):
         workspace.validate(workspace.model, workspace.data)
 
+  def test_blocked_scratch_alignment_rejects_base_and_world_stride(self):
+    """Reject misaligned blocked matrices without restricting dense scalar counters."""
+    specs = (
+      WorkspaceField("collision_pair", (2,), wp.vec2i, "candidate"),
+      WorkspaceField("collision_pairid", (2,), wp.vec2i, "candidate"),
+      WorkspaceField("collision_worldid", (2,), wp.int32, "candidate"),
+      WorkspaceField("solver.h", (2, 64, 64), wp.float32, "world"),
+      WorkspaceField("solver.hfactor", (2, 64, 64), wp.float32, "world"),
+      WorkspaceField("moment_nnz", (2,), wp.int32, "world"),
+    )
+    owner = wp.empty(65536, dtype=wp.uint8, device="cpu")
+    baseline = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
+    data, model = SimpleNamespace(qpos=baseline["moment_nnz"]), Metadata(nv=64)
+    for name in ("solver.h", "solver.hfactor"):
+      for base, stride in ((4, 16384), (0, 16388)):
+        arrays = dict(baseline)
+        arrays[name] = wp.array(
+          ptr=owner.ptr + base, shape=(2, 64, 64), strides=(stride, 256, 4), dtype=wp.float32, device="cpu"
+        )
+        with (
+          self.subTest(name=name, base=base, stride=stride),
+          patch.object(solver, "_solver_context_layout", return_value=()),
+          patch.object(types, "SolverContext", return_value=SimpleNamespace()),
+          self.assertRaisesRegex(ValueError, "16-byte"),
+        ):
+          StepWorkspace(model, data, None, specs, model, None, arrays=arrays)
+    with (
+      patch.object(solver, "_solver_context_layout", return_value=()),
+      patch.object(types, "SolverContext", return_value=SimpleNamespace()),
+      patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")),
+    ):
+      workspace = StepWorkspace(model, data, None, specs, model, None, arrays=baseline)
+    self.assertEqual(workspace.arrays["moment_nnz"].strides, (4,))
+    # The nonblocked path does not request aligned=True; an absent hfactor is valid.
+    small = (
+      *specs[:3],
+      WorkspaceField("solver.h", (2, 2, 2), wp.float32, "world"),
+      WorkspaceField("solver.hfactor", (2, 0, 0), wp.float32, "world"),
+      specs[-1],
+    )
+    arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in small}
+    arrays["solver.h"] = wp.array(ptr=owner.ptr + 4, shape=(2, 2, 2), strides=(20, 8, 4), dtype=wp.float32, device="cpu")
+    with (
+      patch.object(solver, "_solver_context_layout", return_value=()),
+      patch.object(types, "SolverContext", return_value=SimpleNamespace()),
+    ):
+      StepWorkspace(Metadata(nv=2), data, None, small, Metadata(nv=2), None, arrays=arrays)
+
+  def test_compact_data_matrix_alignment_rejects_each_address_axis(self):
+    """Reject misaligned compact matrix bases/strides before scratch binding."""
+    owner = wp.empty(65536, dtype=wp.uint8, device="cpu")
+    valid = wp.array(ptr=owner.ptr, shape=(2, 64, 64), strides=(16384, 256, 4), dtype=wp.float32, device="cpu")
+    data = SimpleNamespace(qpos=SimpleNamespace(device=SimpleNamespace(is_cuda=True)), cM=valid, cqLD=valid)
+    with (
+      patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
+      patch("mujoco_warp._src.workspace.step_workspace_layout", return_value=()),
+      patch.object(solver, "_compact_solver_views", return_value=(None, None)),
+      patch("mujoco_warp._src.workspace.StepWorkspace", return_value="bound") as bind,
+    ):
+      for name in ("cM", "cqLD"):
+        for base, world_stride, row_stride in ((4, 16384, 256), (0, 16388, 256), (0, 16640, 260)):
+          setattr(
+            data,
+            name,
+            wp.array(
+              ptr=owner.ptr + base, shape=(2, 64, 64), strides=(world_stride, row_stride, 4), dtype=wp.float32, device="cpu"
+            ),
+          )
+          with self.subTest(name=name, base=base, stride=world_stride):
+            with self.assertRaisesRegex(ValueError, "16-byte"):
+              make_step_workspace(None, data)
+            bind.assert_not_called()
+          bind.reset_mock()
+          setattr(data, name, valid)
+      self.assertEqual(make_step_workspace(None, data), "bound")
+      data.cM = data.cqLD = wp.empty((2, 0, 0), dtype=wp.float32, device="cpu")
+      self.assertEqual(make_step_workspace(None, data), "bound")
+
   def test_unsupported_features_rejected_before_allocating(self):
     opt = SimpleNamespace(
       solver=types.SolverType.NEWTON,

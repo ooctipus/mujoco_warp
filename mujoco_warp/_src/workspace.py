@@ -88,6 +88,10 @@ class StepWorkspace:
         alignment = wp.types.type_size_in_bytes(getattr(array.dtype, "_wp_scalar_type_", array.dtype))
         if array.size and (not array.ptr or array.ptr % alignment or array.strides[0] < width or array.strides[0] % alignment):
           raise ValueError(f"Scratch rows must have a nonoverlapping aligned stride: {spec.name}")
+        if spec.name in ("solver.h", "solver.hfactor") and array.size and solver_model.nv > solver._BLOCK_CHOLESKY_DIM:
+          # Blocked Cholesky explicitly opts its matrix tiles into aligned=True.
+          if array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16:
+            raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: {spec.name}")
         self.arrays[spec.name] = array
         self._ledger[len(self.arrays) - 1]["offset"] = None
     self.collision = CollisionContext(
@@ -280,6 +284,9 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   owner. Fields must not overlap, and all required rows must be physically ready
   before step execution. The caller owns mapping and budget policy. Inner field
   dimensions stay contiguous; outer row strides may describe packed reservations.
+  Blocked Cholesky matrices (Data.cM/cqLD and solver.h/hfactor on the blocked
+  Newton path) require 16-byte-aligned bases and both world and matrix-row strides.
+  Scalar counters and nonblocked/empty matrices retain their natural alignment.
   A live_count is a CUDA int32 scalar in [0, data.nworld], enforced by admission.
   An optional observer implements observe_launch, fill and copy to prepare explicit
   launch-count bindings and bounded row operations in the caller's graph program.
@@ -292,6 +299,11 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("observe_launch", "fill", "copy")):
     raise TypeError("Prepared observer must implement observe_launch, fill and copy")
   specs = step_workspace_layout(model, data)
+  for name in ("cM", "cqLD"):
+    array = getattr(data, name)
+    # The compact smooth solve always uses explicitly aligned blocked matrices.
+    if array.size and (array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16):
+      raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: Data.{name}")
   if live_count is not None and (
     not isinstance(live_count, wp.array)
     or live_count.dtype != wp.int32
