@@ -3656,11 +3656,12 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data, *, workspace=None):
+def solve(m: types.Model, d: types.Data, *, workspace=None, rebuild_active_dofs: bool = True):
   if m.opt.enableflags & types.EnableBit.SLEEP:
-    # Self-contained like the island branch below: rebuild the active-DOF mapping from
-    # tree_awake so solve() works when called directly (not only via fwd_acceleration).
-    island.update_active_dofs(m, d)
+    # Standalone calls rebuild their maps. Full forward may reuse fwd_acceleration's
+    # mapping when tree_awake has not changed between the two stages.
+    if rebuild_active_dofs:
+      island.update_active_dofs(m, d)
     solve_compact(m, d, workspace=workspace)
     if m.ntree > 1:
       island.compute_island_mapping(m, d, efc_tree=None if workspace is None else workspace.arrays["efc_tree"])
