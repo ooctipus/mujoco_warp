@@ -15,6 +15,8 @@
 
 """Tests for support functions."""
 
+from types import SimpleNamespace
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -44,6 +46,27 @@ def _assert_eq(a, b, name):
   np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
 
 
+@wp.kernel
+def _contact_force_direct(
+  cone: int,
+  frames: wp.array[wp.mat33],
+  friction: wp.array[support.vec5],
+  dims: wp.array[int],
+  addresses: wp.array2d[int],
+  adhesion: wp.array[float],
+  force: wp.array2d[float],
+  njmax: int,
+  count: wp.array[int],
+  worldids: wp.array[int],
+  ids: wp.array[int],
+  out: wp.array[wp.spatial_vector],
+):
+  i = wp.tid()
+  out[i] = support.contact_force_fn(
+    cone, frames, friction, dims, addresses, adhesion, force, njmax, count, worldids[i], ids[i], True
+  )
+
+
 class SupportTest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
@@ -52,6 +75,60 @@ class SupportTest(parameterized.TestCase):
   def tearDown(self):
     io.ENABLE_ISLANDS = False
     super().tearDown()
+
+  @parameterized.parameters(
+    (-1, 2, 0, 0, 1),  # negative contact ID
+    (1, 1, 0, 0, 1),  # ID equal to raw live count
+    (2, 3, 0, 0, 1),  # overflowed raw count exceeds contact storage
+    (0, 2, -1, 0, 1),  # negative world
+    (0, 2, 1, 0, 1),  # world outside readable force rows
+    (0, 2, 0, -1, 1),  # excluded constraint
+    (0, 2, 0, 4, 1),  # address equal to force column capacity
+    (0, 2, 0, 0, 7),  # unsupported dimension must not index spatial-vector tail
+  )
+  def test_contact_force_invalid_indices_return_zero(self, contact_id, raw_count, world_id, address, dim):
+    frames = wp.array(np.tile(np.eye(3, dtype=np.float32), (2, 1, 1)), dtype=wp.mat33)
+    friction = wp.ones(2, dtype=support.vec5)
+    dims = wp.full(2, dim, dtype=int)
+    addresses = wp.full((2, 6), address, dtype=int)
+    adhesion = wp.zeros(2)
+    force = wp.full((1, 4), 5.0)
+    count = wp.array([raw_count], dtype=int)
+    ids, worldids = wp.array([contact_id], dtype=int), wp.array([world_id], dtype=int)
+    output = wp.full(1, wp.spatial_vector(99.0), dtype=wp.spatial_vector)
+    wp.launch(
+      _contact_force_direct,
+      dim=1,
+      inputs=[int(ConeType.PYRAMIDAL), frames, friction, dims, addresses, adhesion, force, 8, count, worldids, ids],
+      outputs=[output],
+    )
+    np.testing.assert_array_equal(output.numpy(), np.zeros((1, 6), np.float32))
+    output.fill_(wp.spatial_vector(99.0))
+    contact = SimpleNamespace(frame=frames, friction=friction, dim=dims, efc_address=addresses, adhesion=adhesion)
+    contact.worldid = wp.full(2, world_id, dtype=int)
+    data = SimpleNamespace(contact=contact, efc=SimpleNamespace(force=force), njmax=8, nacon=count)
+    mjwarp.contact_force(SimpleNamespace(opt=SimpleNamespace(cone=ConeType.PYRAMIDAL)), data, ids, True, output)
+    np.testing.assert_array_equal(output.numpy(), np.zeros((1, 6), np.float32))
+
+  @parameterized.parameters(
+    (ConeType.ELLIPTIC, [0, -1, 7], [5, 0, 0, 0, 0, 0]),
+    (ConeType.PYRAMIDAL, [3, 3, 3], [5, 5, 0, 0, 0, 0]),
+  )
+  def test_contact_force_bounds_each_constraint_direction(self, cone, addresses, expected):
+    contact = SimpleNamespace(
+      frame=wp.array(np.eye(3, dtype=np.float32)[None], dtype=wp.mat33),
+      friction=wp.ones(1, dtype=support.vec5),
+      dim=wp.full(1, 3, dtype=int),
+      efc_address=wp.array([addresses], dtype=int),
+      adhesion=wp.zeros(1),
+      worldid=wp.zeros(1, dtype=int),
+    )
+    data = SimpleNamespace(
+      contact=contact, efc=SimpleNamespace(force=wp.full((1, 4), 5.0)), njmax=8, nacon=wp.ones(1, dtype=int)
+    )
+    output = wp.empty(1, dtype=wp.spatial_vector)
+    mjwarp.contact_force(SimpleNamespace(opt=SimpleNamespace(cone=cone)), data, wp.zeros(1, dtype=int), True, output)
+    np.testing.assert_array_equal(output.numpy()[0], expected)
 
   @parameterized.parameters(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE)
   def test_mul_m(self, jacobian):

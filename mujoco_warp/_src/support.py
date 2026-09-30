@@ -375,27 +375,43 @@ def contact_force_fn(
   contact_id: int,
   to_world_frame: bool,
 ) -> wp.spatial_vector:
-  """Extract 6D force:torque for one contact, in contact frame by default."""
+  """Extract force:torque, or zero for an invalid contact/world/constraint index.
+
+  Array extents bound readable storage. Callers using partially backed reservations
+  must supply views trimmed to their readable contact and world prefixes.
+  """
   force = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  if (
+    contact_id < 0
+    or contact_id >= nacon_in[0]
+    or contact_id >= contact_frame_in.shape[0]
+    or contact_id >= contact_friction_in.shape[0]
+    or contact_id >= contact_dim_in.shape[0]
+    or contact_id >= contact_efc_address_in.shape[0]
+    or contact_id >= contact_adhesion_in.shape[0]
+    or contact_efc_address_in.shape[1] == 0
+    or worldid < 0
+    or worldid >= efc_force_in.shape[0]
+  ):
+    return force
+
+  njmax = wp.min(njmax_in, efc_force_in.shape[1])
   condim = contact_dim_in[contact_id]
   efc_address = contact_efc_address_in[contact_id, 0]
+  if (condim != 1 and condim != 3 and condim != 4 and condim != 6) or efc_address < 0 or efc_address >= njmax:
+    return force
 
-  if contact_id >= 0 and contact_id <= nacon_in[0] and efc_address >= 0:
-    if opt_cone == ConeType.PYRAMIDAL:
-      force = _decode_pyramid(
-        njmax_in,
-        efc_force_in[worldid],
-        efc_address,
-        contact_friction_in[contact_id],
-        condim,
-      )
-    else:
-      for i in range(condim):
-        if contact_efc_address_in[contact_id, i] < njmax_in:
-          force[i] = efc_force_in[worldid, contact_efc_address_in[contact_id, i]]
+  if opt_cone == ConeType.PYRAMIDAL:
+    force = _decode_pyramid(njmax, efc_force_in[worldid], efc_address, contact_friction_in[contact_id], condim)
+  else:
+    for i in range(condim):
+      if i < contact_efc_address_in.shape[1]:
+        address = contact_efc_address_in[contact_id, i]
+        if address >= 0 and address < njmax:
+          force[i] = efc_force_in[worldid, address]
 
-    # report net interface force: solver cone force minus adhesive pull
-    force[0] -= contact_adhesion_in[contact_id]
+  # report net interface force: solver cone force minus adhesive pull
+  force[0] -= contact_adhesion_in[contact_id]
 
   if to_world_frame:
     # Transform both top and bottom parts of spatial vector by the full contact frame matrix
@@ -430,7 +446,8 @@ def contact_force_kernel(
 
   contactid = contact_ids[tid]
 
-  if contactid >= nacon_in[0]:
+  out[tid] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  if contactid < 0 or contactid >= nacon_in[0] or contactid >= contact_worldid_in.shape[0]:
     return
 
   worldid = contact_worldid_in[contactid]
@@ -453,6 +470,9 @@ def contact_force_kernel(
 
 def contact_force(m: Model, d: Data, contact_ids: wp.array[int], to_world_frame: bool, force: wp.array[wp.spatial_vector]):
   """Compute forces for contacts in Data.
+
+  Invalid contact/world/constraint indices produce zero. Array descriptors must
+  cover readable storage; use live-prefix views for partially backed reservations.
 
   Args:
     m: The model containing kinematic and dynamic information (device).
