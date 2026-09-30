@@ -194,6 +194,7 @@ def step_workspace_layout(
     m.opt.cone == types.ConeType.PYRAMIDAL,
     m.opt.broadphase == types.BroadphaseType.NXN,
     bool(m.opt.enableflags & types.EnableBit.SLEEP),
+    not bool(m.opt.enableflags & types.EnableBit.ENERGY),
     not bool(m.opt.disableflags & types.DisableBit.ISLAND),
     bool(m.opt.disableflags & types.DisableBit.MULTICCD),
     m.opt.run_collision_detection,

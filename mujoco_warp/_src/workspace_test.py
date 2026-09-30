@@ -13,6 +13,8 @@ import numpy as np
 import warp as wp
 
 from mujoco_warp import test_data
+from mujoco_warp._src import forward
+from mujoco_warp._src import passive
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
@@ -34,6 +36,42 @@ class Metadata:
 
 
 class WorkspaceTest(unittest.TestCase):
+  def test_disabled_features_clear_only_live_rows_with_prepared_workspace(self):
+    cases = (
+      (forward.fwd_actuation, 0, 0, ("act_dot", "qfrc_actuator", "actuator_force")),
+      (forward.fwd_actuation, 3, types.DisableBit.ACTUATION, ("act_dot", "qfrc_actuator", "actuator_force")),
+      (
+        passive.passive,
+        0,
+        types.DisableBit.SPRING | types.DisableBit.DAMPER,
+        ("qfrc_spring", "qfrc_damper", "qfrc_gravcomp", "qfrc_fluid", "qfrc_passive"),
+      ),
+      (smooth._rne_cacc_world, 0, types.DisableBit.GRAVITY, ("cacc",)),
+    )
+    for operation, nactuator, disableflags, names in cases:
+      for live in (0, 2, 4):
+        for prepared in (False, True):
+          with self.subTest(operation=operation.__name__, live=live, prepared=prepared, nactuator=nactuator):
+            arrays = {name: wp.full((4, 3), 7.0, device="cpu") for name in names}
+            data = SimpleNamespace(**arrays)
+            model = SimpleNamespace(nactuator=nactuator, opt=SimpleNamespace(disableflags=disableflags))
+            touched = []
+
+            def fill(array, value, domain):
+              self.assertEqual(domain, "world")
+              touched.append(array)
+              array[:live].fill_(value)
+
+            workspace = SimpleNamespace(fill=fill) if prepared else None
+            with patch.object(wp, "launch", side_effect=AssertionError("Unexpected stage work")):
+              operation(model, data, workspace=workspace)
+            expected = np.full((4, 3), 7, np.float32)
+            expected[: live if prepared else 4] = 0
+            for array in arrays.values():
+              np.testing.assert_array_equal(array.numpy(), expected)
+            if prepared:
+              self.assertEqual([id(array) for array in touched], [id(array) for array in arrays.values()])
+
   def test_kinematics_declares_every_emitted_pose_launch(self):
     # Sites are allowed in prepared models, even though keyboard fixtures have none.
     model = Mock(nbranch=2, nbody=3, ngeom=4, nsite=2)
@@ -266,6 +304,7 @@ class WorkspaceTest(unittest.TestCase):
       (opt, "solver", types.SolverType.CG),
       (opt, "integrator", types.IntegratorType.RK4),
       (opt, "cone", types.ConeType.ELLIPTIC),
+      (opt, "enableflags", types.EnableBit.SLEEP | types.EnableBit.ENERGY),
       (opt, "graph_conditional", False),
       (opt, "disableflags", 0),
       (model.callback, "control", lambda *_: None),

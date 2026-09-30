@@ -1361,7 +1361,10 @@ def _cacc_world(
 
 def _rne_cacc_world(m: Model, d: Data, *, workspace=None):
   if m.opt.disableflags & DisableBit.GRAVITY:
-    d.cacc.zero_()
+    if workspace is None:
+      d.cacc.zero_()
+    else:
+      workspace.fill(d.cacc, 0, "world")
   else:
     wp.launch(_cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc])
     if workspace is not None:

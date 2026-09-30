@@ -1374,11 +1374,18 @@ def passive(m: Model, d: Data, *, workspace=None):
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
   if dsbl_spring and dsbl_damper:
-    d.qfrc_spring.zero_()
-    d.qfrc_damper.zero_()
-    d.qfrc_gravcomp.zero_()
-    d.qfrc_fluid.zero_()
-    d.qfrc_passive.zero_()
+    if workspace is None:
+      d.qfrc_spring.zero_()
+      d.qfrc_damper.zero_()
+      d.qfrc_gravcomp.zero_()
+      d.qfrc_fluid.zero_()
+      d.qfrc_passive.zero_()
+    else:
+      workspace.fill(d.qfrc_spring, 0, "world")
+      workspace.fill(d.qfrc_damper, 0, "world")
+      workspace.fill(d.qfrc_gravcomp, 0, "world")
+      workspace.fill(d.qfrc_fluid, 0, "world")
+      workspace.fill(d.qfrc_passive, 0, "world")
     return
 
   wp.launch(

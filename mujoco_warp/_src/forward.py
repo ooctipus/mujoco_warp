@@ -1638,9 +1638,14 @@ def _qfrc_actuator_gravcomp_limits(
 def fwd_actuation(m: Model, d: Data, *, workspace=None):
   """Actuation-dependent computations."""
   if not m.nactuator or (m.opt.disableflags & DisableBit.ACTUATION):
-    d.act_dot.zero_()
-    d.qfrc_actuator.zero_()
-    d.actuator_force.zero_()
+    if workspace is None:
+      d.act_dot.zero_()
+      d.qfrc_actuator.zero_()
+      d.actuator_force.zero_()
+    else:
+      workspace.fill(d.act_dot, 0, "world")
+      workspace.fill(d.qfrc_actuator, 0, "world")
+      workspace.fill(d.actuator_force, 0, "world")
     return
 
   # read delayed ctrl (or direct copy if no delay)
