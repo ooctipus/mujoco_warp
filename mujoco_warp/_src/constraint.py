@@ -4936,10 +4936,11 @@ def _add_surface_vel(is_pyramidal: bool):
 
 
 @event_scope
-def make_constraint(m: types.Model, d: types.Data):
+def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
   """Creates constraint jacobians and other supporting data."""
   newton = m.opt.solver == types.SolverType.NEWTON
-  efc_nnz = wp.empty((d.nworld,), dtype=int)
+  if efc_nnz is None:
+    efc_nnz = wp.empty((d.nworld,), dtype=int)
 
   wp.launch(
     _zero_constraint_counts,
@@ -5499,6 +5500,7 @@ def make_constraint(m: types.Model, d: types.Data):
         ptr=d.contact.frame.ptr,
         dtype=wp.vec3,
         shape=(d.naconmax, 3),
+        strides=(d.contact.frame.strides[0], 12),
         device=d.contact.frame.device,
         copy=False,
       )
@@ -5506,10 +5508,12 @@ def make_constraint(m: types.Model, d: types.Data):
         ptr=d.contact.friction.ptr,
         dtype=float,
         shape=(d.naconmax, 5),
+        strides=(d.contact.friction.strides[0], 4),
         device=d.contact.friction.device,
         copy=False,
       )
 
+      contact_frame_2d._ref, contact_friction_2d._ref = d.contact.frame, d.contact.friction
       has_flex = m.nflex > 0
       if has_flex:
         wp.launch(

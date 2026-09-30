@@ -291,7 +291,7 @@ def _next_time_builder(warn_overflow: int):
   return _next_time
 
 
-def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None):
+def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None, *, island_can_sleep=None):
   """Advance state and time given activation derivatives and acceleration."""
   # TODO(team): can we assume static timesteps?
 
@@ -362,7 +362,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
-    sleep.sleep(m, d)
+    sleep.sleep(m, d, island_can_sleep=island_can_sleep)
     fwd_velocity(m, d)
     sleep.update_sleep(m, d)
 
@@ -983,7 +983,7 @@ def _launch_implicit_free_body_solve(m: Model, d: Data, qacc: wp.array2d[float])
 
 
 @event_scope
-def implicit(m: Model, d: Data):
+def implicit(m: Model, d: Data, *, workspace=None):
   """Integrates fully implicit in velocity."""
   if m.opt.integrator == IntegratorType.IMPLICIT:
     # 1. Smooth velocity derivatives into M-structure
@@ -1012,10 +1012,10 @@ def implicit(m: Model, d: Data):
     DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
   ):
     # qDeriv is in M-structure; the scratch qLD matches d.qLD (per-block).
-    qDeriv = wp.empty((d.nworld, m.nC), dtype=float)
-    qLD = wp.empty_like(d.qLD)
-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
-    derivative.deriv_smooth_vel(m, d, qDeriv)
+    qDeriv = wp.empty((d.nworld, m.nC), dtype=float) if workspace is None else workspace.arrays["qDeriv"]
+    qLD = wp.empty_like(d.qLD) if workspace is None else workspace.arrays["qLD"]
+    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float) if workspace is None else workspace.arrays["qLDiagInv"]
+    derivative.deriv_smooth_vel(m, d, qDeriv, actuator_vel=None if workspace is None else workspace.arrays["actuator_vel"])
     if m.body_freeadr.size > 0:
       wp.launch(
         _implicit_free_body_reset_m,
@@ -1029,12 +1029,12 @@ def implicit(m: Model, d: Data):
         ],
         outputs=[qDeriv],
       )
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = wp.empty((d.nworld, m.nv), dtype=float) if workspace is None else workspace.arrays["qacc"]
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
-    _advance(m, d, qacc)
+    _advance(m, d, qacc, island_can_sleep=None if workspace is None else workspace.arrays["island_can_sleep"])
   else:
-    _advance(m, d, d.qacc)
+    _advance(m, d, d.qacc, island_can_sleep=None if workspace is None else workspace.arrays["island_can_sleep"])
 
 
 @event_scope
@@ -1058,13 +1058,14 @@ def fwd_kinematics(m: Model, d: Data):
 
 
 @event_scope
-def fwd_position(m: Model, d: Data, factorize: bool = True):
+def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
   """Position-dependent computations.
 
   Args:
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
+    workspace: Optional prepared step scratch.
   """
   fwd_kinematics(m, d)
 
@@ -1078,16 +1079,28 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
     raise ValueError("An external collision provider requires run_collision_detection=False.")
   collision = collision_driver.collision if m.opt.run_collision_detection else m.callback.collision
   if collision is not None:
-    collision(m, d)
+    if workspace is None:
+      collision(m, d)
+    else:
+      collision(m, d, workspace=workspace)
   if sleep_enabled:
     # Contact provenance does not change wake policy or the timing of the support pass.
     sleep.wake_collision(m, d)
-    awake_prev = wp.clone(d.body_awake) if collision is not None else None
+    awake_prev = None
+    if collision is not None:
+      if workspace is None:
+        awake_prev = wp.clone(d.body_awake)
+      else:
+        awake_prev = workspace.arrays["awake_prev"]
+        wp.copy(awake_prev, d.body_awake)
     sleep.update_sleep(m, d)
     if collision is not None:
-      collision(m, d, awake_prev=awake_prev)
+      if workspace is None:
+        collision(m, d, awake_prev=awake_prev)
+      else:
+        collision(m, d, awake_prev=awake_prev, workspace=workspace)
 
-  constraint.make_constraint(m, d)
+  constraint.make_constraint(m, d, efc_nnz=None if workspace is None else workspace.arrays["efc_nnz"])
 
   if sleep_enabled:
     if m.neq > 0:
@@ -1095,8 +1108,8 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
     sleep.update_sleep(m, d)
 
   if sleep_enabled:
-    island.island(m, d)
-  smooth.transmission(m, d)
+    island.island(m, d, parent=None if workspace is None else workspace.arrays["island_parent"])
+  smooth.transmission(m, d, moment_nnz=None if workspace is None else workspace.arrays["moment_nnz"])
 
 
 @wp.kernel
@@ -1788,14 +1801,14 @@ def _energy_vel(m: Model, d: Data):
 
 
 @event_scope
-def forward(m: Model, d: Data):
+def forward(m: Model, d: Data, *, workspace=None):
   """Forward dynamics."""
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
     sleep.wake(m, d)
     sleep.update_sleep(m, d)
 
-  fwd_position(m, d, factorize=False)
+  fwd_position(m, d, factorize=False, workspace=workspace)
   d.sensordata.zero_()
   sensor.sensor_pos(m, d)
   _energy_pos(m, d)
@@ -1810,23 +1823,25 @@ def forward(m: Model, d: Data):
   fwd_actuation(m, d)
   fwd_acceleration(m, d, factorize=True)
 
-  solver.solve(m, d)
+  solver.solve(m, d, workspace=workspace)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
     smooth.rne_postconstraint(m, d)
   sensor.sensor_acc(m, d, skip_rne_postconstraint=True)
 
 
 @event_scope
-def step(m: Model, d: Data):
+def step(m: Model, d: Data, *, workspace=None):
   """Advance simulation."""
-  forward(m, d)
+  if workspace is not None:
+    workspace.validate(m, d)
+  forward(m, d, workspace=workspace)
 
   if m.opt.integrator == IntegratorType.EULER:
     euler(m, d)
   elif m.opt.integrator == IntegratorType.RK4:
     rungekutta4(m, d)
   elif m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
-    implicit(m, d)
+    implicit(m, d, workspace=workspace)
   else:
     raise NotImplementedError(f"integrator {m.opt.integrator} not implemented.")
 

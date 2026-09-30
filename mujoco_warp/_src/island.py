@@ -358,7 +358,7 @@ def _zero_island_counts(
 
 
 @event_scope
-def island(m: types.Model, d: types.Data):
+def island(m: types.Model, d: types.Data, *, parent=None):
   """Discover constraint islands."""
   if m.ntree == 0:
     wp.launch(
@@ -368,7 +368,9 @@ def island(m: types.Model, d: types.Data):
     )
     return
 
-  direct_dsu(m, d, wp.empty((d.nworld, m.ntree), dtype=int))
+  if parent is None:
+    parent = wp.empty((d.nworld, m.ntree), dtype=int)
+  direct_dsu(m, d, parent)
 
 
 @wp.kernel
@@ -741,7 +743,7 @@ def _init_efc_arrays(
 
 
 @event_scope
-def compute_island_mapping(m: types.Model, d: types.Data):
+def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
   """Compute DOF/constraint island mappings after island discovery.
 
   Populates d.dof_island, d.efc.island, d.island_idofadr, d.island_dofadr,
@@ -752,6 +754,7 @@ def compute_island_mapping(m: types.Model, d: types.Data):
   Args:
     m: Model.
     d: Data.
+    efc_tree: Optional prepared constraint-to-tree scratch.
   """
   # Ensure dof_islandid / efc_islandid are allocated at the right shape
   if d.dof_islandid.shape[1] != m.nv:
@@ -773,7 +776,8 @@ def compute_island_mapping(m: types.Model, d: types.Data):
     inputs=[],
     outputs=[d.dof_island, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
   )
-  efc_tree = wp.empty((d.nworld, d.njmax), dtype=int)
+  if efc_tree is None:
+    efc_tree = wp.empty((d.nworld, d.njmax), dtype=int)
   wp.launch(
     _init_efc_arrays,
     dim=(d.nworld, d.njmax),

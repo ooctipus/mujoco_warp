@@ -1222,7 +1222,7 @@ def _build_cycles(  # kernel_analyzer: ignore
 
 
 @event_scope
-def sleep(m: types.Model, d: types.Data):
+def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None):
   """Puts trees to sleep according to velocity tolerance."""
   # 1. Sweep over awake trees and increment counter if they can sleep
   wp.launch(
@@ -1244,7 +1244,10 @@ def sleep(m: types.Model, d: types.Data):
   )
 
   # 2. Check which constraint islands can sleep (all trees in island must be asleep)
-  island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
+  if island_can_sleep is None:
+    island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
+  else:
+    island_can_sleep.fill_(1)
   wp.launch(
     _check_island_can_sleep,
     dim=(d.nworld, m.ntree),

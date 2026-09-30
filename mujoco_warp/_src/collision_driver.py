@@ -35,6 +35,7 @@ from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import EnableBit
 from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import Model
+from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.types import SleepPolicy
 from mujoco_warp._src.types import SleepState
 from mujoco_warp._src.types import mat23
@@ -389,10 +390,12 @@ def _add_geom_pair(
   collision_pair_out: wp.array[wp.vec2i],
   collision_pairid_out: wp.array[wp.vec2i],
   collision_worldid_out: wp.array[int],
+  overflow_out: wp.array[int],
 ):
   cid = wp.atomic_add(ncollision_out, 0, 1)
 
   if cid >= naconmax_in:
+    wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.BROADPHASE))
     return
 
   if type1 > type2:
@@ -505,6 +508,7 @@ def _sap_broadphase(
     collision_pair_out: wp.array[wp.vec2i],
     collision_pairid_out: wp.array[wp.vec2i],
     collision_worldid_out: wp.array[int],
+    overflow_out: wp.array[int],
   ):
     worldgeomid = wp.tid()
 
@@ -597,6 +601,7 @@ def _sap_broadphase(
           collision_pair_out,
           collision_pairid_out,
           collision_worldid_out,
+          overflow_out,
         )
 
   return kernel
@@ -747,7 +752,7 @@ def sap_broadphase(
       nsweep,
       awake_prev_in,
     ],
-    outputs=[d.ncollision, ctx.collision_pair, ctx.collision_pairid, ctx.collision_worldid],
+    outputs=[d.ncollision, ctx.collision_pair, ctx.collision_pairid, ctx.collision_worldid, d.overflow],
   )
 
 
@@ -789,6 +794,7 @@ def _nxn_broadphase(
     collision_pair_out: wp.array[wp.vec2i],
     collision_pairid_out: wp.array[wp.vec2i],
     collision_worldid_out: wp.array[int],
+    overflow_out: wp.array[int],
   ):
     worldid, elementid = wp.tid()
 
@@ -856,6 +862,7 @@ def _nxn_broadphase(
         collision_pair_out,
         collision_pairid_out,
         collision_worldid_out,
+        overflow_out,
       )
 
   return kernel
@@ -882,6 +889,8 @@ def nxn_broadphase(
   d: Data,
   ctx: CollisionContext,
   awake_prev: Optional[wp.array] = None,
+  *,
+  workspace=None,
 ):
   """Runs broadphase collision detection using a brute-force N-squared approach.
 
@@ -910,7 +919,11 @@ def nxn_broadphase(
   # (nothing sleeps between the passes), so the condition is derived here rather than threaded in.
   cond = None
   if incremental and m.opt.graph_conditional:
-    cond = wp.zeros(1, dtype=int)
+    if workspace is None:
+      cond = wp.zeros(1, dtype=int)
+    else:
+      cond = workspace.arrays["awake_changed"]
+      cond.zero_()
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
 
   def _launch():
@@ -949,6 +962,7 @@ def nxn_broadphase(
         ctx.collision_pair,
         ctx.collision_pairid,
         ctx.collision_worldid,
+        d.overflow,
       ],
     )
 
@@ -958,7 +972,7 @@ def nxn_broadphase(
     _launch()
 
 
-def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
+def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
   collision_table = MJ_COLLISION_TABLE
   if m.opt.disableflags & DisableBit.NATIVECCD:
     collision_table = collision_table.copy()
@@ -969,7 +983,7 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
 
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
-  convex_narrowphase(m, d, ctx, convex_pairs)
+  convex_narrowphase(m, d, ctx, convex_pairs, workspace=workspace)
   primitive_narrowphase(m, d, ctx, primitive_pairs)
 
   if m.has_sdf_geom:
@@ -981,6 +995,8 @@ def collision(
   m: Model,
   d: Data,
   awake_prev: Optional[wp.array] = None,
+  *,
+  workspace=None,
 ):
   """Runs the full collision detection pipeline.
 
@@ -1007,7 +1023,7 @@ def collision(
     return
 
   # TODO(team): create context outside collision?
-  ctx = create_collision_context(d.naconmax)
+  ctx = create_collision_context(d.naconmax) if workspace is None else workspace.collision
 
   incremental = awake_prev is not None
 
@@ -1021,11 +1037,11 @@ def collision(
     d.nacon.zero_()
 
   if m.opt.broadphase == BroadphaseType.NXN:
-    nxn_broadphase(m, d, ctx, awake_prev)
+    nxn_broadphase(m, d, ctx, awake_prev, workspace=workspace)
   else:
     sap_broadphase(m, d, ctx, awake_prev)
 
-  _narrowphase(m, d, ctx)
+  _narrowphase(m, d, ctx, workspace=workspace)
 
   # Flex collision is not sleeping-aware: pass 1 emits every flex contact regardless of awake state,
   # so the incremental pass has nothing to add (and re-running it would duplicate those contacts).

@@ -78,6 +78,34 @@ def _assert_eq(a, b, name):
 class CollisionTest(parameterized.TestCase):
   """Tests the collision contact functions."""
 
+  @parameterized.parameters(list(BroadphaseType))
+  def test_broadphase_overflow_survives_later_empty_pass(self, broadphase):
+    """A later counter reset must not hide a previously truncated candidate queue."""
+    _, _, m, d = test_data.fixture(
+      xml="""<mujoco><worldbody>
+        <body><freejoint/><geom type="sphere" size=".1"/></body>
+        <body pos=".19 0 0"><freejoint/><geom type="sphere" size=".1"/></body>
+      </worldbody></mujoco>""",
+      nworld=3,
+      overrides={"opt.broadphase": broadphase},
+    )
+    d.naconmax = 1
+    ctx = create_collision_context(1)
+    broadphase_fn = collision_driver.nxn_broadphase if broadphase == BroadphaseType.NXN else collision_driver.sap_broadphase
+    d.ncollision.zero_()
+    d.overflow.zero_()
+    broadphase_fn(m, d, ctx)
+    self.assertEqual(int(d.ncollision.numpy()[0]), 3)
+    overflow = d.overflow.numpy()
+    self.assertEqual(int(np.count_nonzero(overflow & types.OverflowType.BROADPHASE)), 2)
+    positions = d.geom_xpos.numpy()
+    positions[:, 1, 0] = 100
+    d.geom_xpos.assign(positions)
+    d.ncollision.zero_()
+    broadphase_fn(m, d, ctx)
+    self.assertEqual(int(d.ncollision.numpy()[0]), 0)
+    np.testing.assert_array_equal(d.overflow.numpy(), overflow)
+
   @parameterized.product(broadphase=list(BroadphaseType), batch_rows=(1, 2, 5))
   def test_broadphase_batch_layout(self, broadphase, batch_rows):
     """Broadcast, cyclic, and full batches agree, including world-specific absent meshes."""

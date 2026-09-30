@@ -3215,14 +3215,17 @@ def _transmission_body_moment_scale(
 
 
 @event_scope
-def transmission(m: Model, d: Data):
+def transmission(m: Model, d: Data, *, moment_nnz=None):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  moment_nnz = wp.zeros((d.nworld,), dtype=int)
+  if moment_nnz is None:
+    moment_nnz = wp.zeros((d.nworld,), dtype=int)
+  else:
+    moment_nnz.zero_()
 
   wp.launch(
     _transmission,
