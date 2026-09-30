@@ -200,7 +200,9 @@ def _update_sleep_dofs(
 
 
 @event_scope
-def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0, *, world_mask: wp.array | None = None):
+def update_sleep(
+  m: types.Model, d: types.Data, flg_staticawake: int = 0, *, world_mask: wp.array | None = None, workspace=None
+):
   """Computes sleeping arrays from tree_asleep."""
   compact = bool(m.opt.enableflags & types.EnableBit.SLEEP) and not bool(m.opt.disableflags & types.DisableBit.ISLAND)
   wp.launch(
@@ -209,6 +211,8 @@ def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0, *, wor
     inputs=[world_mask],
     outputs=[d.ntree_awake, d.nbody_awake, d.nv_awake],
   )
+  if workspace is not None:
+    workspace.observe_launch(_zero_sleep_counters, d.nworld, "world")
 
   wp.launch(
     _update_sleep_trees,
@@ -216,6 +220,8 @@ def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0, *, wor
     inputs=[m.tree_sleep_policy, d.tree_asleep, world_mask],
     outputs=[d.ntree_awake, d.tree_awake],
   )
+  if workspace is not None:
+    workspace.observe_launch(_update_sleep_trees, (d.nworld, m.ntree), "world")
 
   wp.launch(
     _update_sleep_bodies,
@@ -237,6 +243,8 @@ def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0, *, wor
       d.body_awake_ind,
     ],
   )
+  if workspace is not None:
+    workspace.observe_launch(_update_sleep_bodies, (d.nworld, m.nbody), "world")
 
   wp.launch(
     _update_sleep_dofs,
@@ -250,6 +258,8 @@ def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0, *, wor
     ],
     outputs=[d.nv_awake, d.dof_awake_ind],
   )
+  if workspace is not None:
+    workspace.observe_launch(_update_sleep_dofs, (d.nworld, m.nv), "world")
 
 
 @event_scope
@@ -780,7 +790,7 @@ def _wake_equality_kernel(
 
 
 @event_scope
-def wake(m: types.Model, d: types.Data):
+def wake(m: types.Model, d: types.Data, *, workspace=None):
   """Wakes sleeping trees due to user changes/perturbations."""
   wp.launch(
     _clear_disabled_dofs,
@@ -788,6 +798,8 @@ def wake(m: types.Model, d: types.Data):
     inputs=[m.dof_treeid, m.tree_sleep_policy, None, None],
     outputs=[d.qvel, d.qacc_warmstart, d.qfrc_applied, d.qacc],
   )
+  if workspace is not None:
+    workspace.observe_launch(_clear_disabled_dofs, (d.nworld, m.nv), "world")
   wp.launch(
     _wake_kernel,
     dim=(d.nworld, m.ntree),
@@ -806,10 +818,12 @@ def wake(m: types.Model, d: types.Data):
     ],
     outputs=[d.tree_asleep],
   )
+  if workspace is not None:
+    workspace.observe_launch(_wake_kernel, (d.nworld, m.ntree), "world")
 
 
 @event_scope
-def wake_collision(m: types.Model, d: types.Data):
+def wake_collision(m: types.Model, d: types.Data, *, workspace=None):
   """Wakes sleeping trees that touch awake trees."""
   wp.launch(
     _wake_collision_kernel,
@@ -826,6 +840,8 @@ def wake_collision(m: types.Model, d: types.Data):
     ],
     outputs=[d.tree_asleep],
   )
+  if workspace is not None:
+    workspace.observe_launch(_wake_collision_kernel, d.naconmax, "candidate")
 
 
 @wp.kernel
@@ -1222,7 +1238,7 @@ def _build_cycles(  # kernel_analyzer: ignore
 
 
 @event_scope
-def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None):
+def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=None):
   """Puts trees to sleep according to velocity tolerance."""
   # 1. Sweep over awake trees and increment counter if they can sleep
   wp.launch(
@@ -1242,12 +1258,17 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None):
     ],
     outputs=[d.tree_asleep],
   )
+  if workspace is not None:
+    workspace.observe_launch(_sweep_awake_trees, (d.nworld, m.ntree), "world")
 
   # 2. Check which constraint islands can sleep (all trees in island must be asleep)
   if island_can_sleep is None:
     island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
   else:
-    island_can_sleep.fill_(1)
+    if workspace is None:
+      island_can_sleep.fill_(1)
+    else:
+      workspace.fill(island_can_sleep, 1, "world")
   wp.launch(
     _check_island_can_sleep,
     dim=(d.nworld, m.ntree),
@@ -1259,6 +1280,8 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None):
     ],
     outputs=[island_can_sleep],
   )
+  if workspace is not None:
+    workspace.observe_launch(_check_island_can_sleep, (d.nworld, m.ntree), "world")
 
   # 3. Build sleep cycles for sleeping islands and sleep unconstrained trees
   wp.launch(
@@ -1278,3 +1301,5 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None):
       d.qacc,
     ],
   )
+  if workspace is not None:
+    workspace.observe_launch(_build_cycles, d.nworld, "world")

@@ -1553,3 +1553,7 @@ def convex_narrowphase(
         ],
         outputs=contact_outputs + [d.overflow],
       )
+      if workspace is not None:
+        workspace.observe_launch(
+          ccd_k, ccd_grid, None, extent_axis=None, parameters={"naconmax_in": "candidate", "naccdmax_in": "ccd"}
+        )

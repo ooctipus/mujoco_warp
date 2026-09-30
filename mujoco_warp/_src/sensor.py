@@ -808,7 +808,7 @@ def _sensor_collision(
 
 
 @event_scope
-def sensor_pos(m: Model, d: Data):
+def sensor_pos(m: Model, d: Data, *, workspace=None):
   """Compute position-dependent sensor values."""
   if m.opt.disableflags & DisableBit.SENSOR:
     return
@@ -847,7 +847,7 @@ def sensor_pos(m: Model, d: Data):
     energy_pos(m, d)
 
   if m.sensor_e_kinetic:
-    energy_vel(m, d)
+    energy_vel(m, d, workspace=workspace)
 
   # collision sensors (distance, normal, fromto)
   sensor_collision = wp.full((d.nworld, m.nsensorcollision, 8, 7), 1.0e32, dtype=float)
@@ -2577,7 +2577,7 @@ def _contact_sort(maxmatch: int):
 
 
 @event_scope
-def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False):
+def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False, *, workspace=None):
   """Compute acceleration-dependent sensor values."""
   if m.opt.disableflags & DisableBit.SENSOR:
     return
@@ -2734,7 +2734,7 @@ def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False):
     )
 
   if not skip_rne_postconstraint and m.sensor_rne_postconstraint:
-    smooth.rne_postconstraint(m, d)
+    smooth.rne_postconstraint(m, d, workspace=workspace)
 
   wp.launch(
     _sensor_acc,
@@ -3125,13 +3125,13 @@ def _energy_vel_kinetic(nv: int):
   return energy_vel_kinetic
 
 
-def energy_vel(m: Model, d: Data):
+def energy_vel(m: Model, d: Data, *, workspace=None):
   """Velocity-dependent energy (kinetic)."""
   # kinetic energy: 0.5 * qvel.T @ M @ qvel
 
   # M @ qvel
   mv = wp.zeros((d.nworld, m.nv), dtype=float)
-  support.mul_m(m, d, mv, d.qvel)
+  support.mul_m(m, d, mv, d.qvel, workspace=workspace)
 
   wp.launch_tiled(
     _energy_vel_kinetic(m.nv),

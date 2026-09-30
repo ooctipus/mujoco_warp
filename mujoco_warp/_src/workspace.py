@@ -46,8 +46,9 @@ class StepWorkspace:
   Data storage must remain unchanged. Captured steps retain this owner on the graph.
   """
 
-  def __init__(self, model, data, live_count, specs, solver_model, solver_data, arrays=None):
+  def __init__(self, model, data, live_count, specs, solver_model, solver_data, arrays=None, observer=None):
     self.model, self.data, self.live_count = model, data, live_count
+    self.observer = observer
     self.device = data.qpos.device
     self.solver_model, self.solver_data = solver_model, solver_data
     self.arrays, self._ledger = {}, []
@@ -130,6 +131,37 @@ class StepWorkspace:
   def world_arrays(self):
     """Return declared nonempty world scratch; no numerical extent inference."""
     return {field["name"]: self.arrays[field["name"]] for field in self._ledger if field["world_axis"] == 0 and field["bytes"]}
+
+  def observe_launch(self, kernel, dim, extent_domain, *, extent_axis=0, parameters=None):
+    """Publish explicit count semantics after a native launch, during preparation.
+
+    Dim only distinguishes an emitted launch from a zero-sized operation; it does
+    not identify a population domain. The observer owns CUDA node bindings. Model,
+    Data and this workspace already retain all allocation owners of the step.
+    """
+    if self.observer is None:
+      return
+    dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
+    if any(size == 0 for size in dimensions):
+      return
+    self.observer.observe_launch(kernel, dim, extent_domain, extent_axis=extent_axis, parameters=parameters or {})
+
+  def fill(self, array, value, domain):
+    """Fill an explicitly declared row domain, bounded by the observer's count."""
+    if array.size:
+      if self.observer is None:
+        array.fill_(value)
+      else:
+        self.observer.fill(array, value, domain)
+    return array
+
+  def copy(self, destination, source, domain):
+    """Copy an explicitly declared row domain without touching inactive rows."""
+    if destination.size:
+      if self.observer is None:
+        wp.copy(destination, source)
+      else:
+        self.observer.copy(destination, source, domain)
 
   def memory_report(self):
     return {
@@ -239,7 +271,7 @@ def step_workspace_layout(
   return tuple(fields)
 
 
-def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None, arrays=None) -> StepWorkspace:
+def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None, arrays=None, observer=None) -> StepWorkspace:
   """Bind complete caller-owned typed scratch, or allocate fixed scratch by default.
 
   Supplied arrays must cover step_workspace_layout exactly and retain their backing
@@ -247,12 +279,16 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   before step execution. The caller owns mapping and budget policy. Inner field
   dimensions stay contiguous; outer row strides may describe packed reservations.
   A live_count is a CUDA int32 scalar in [0, data.nworld], enforced by admission.
-  Kernel launch bounds and bounded bulk operations remain the caller's program.
+  An optional observer implements observe_launch, fill and copy to prepare explicit
+  launch-count bindings and bounded row operations in the caller's graph program.
+  It is invoked only at declared stage sites; no global Warp dispatch is replaced.
   """
   if not data.qpos.device.is_cuda:
     raise ValueError("Prepared step workspace currently requires CUDA")
   if wp.get_stream(data.qpos.device).is_capturing:
     raise RuntimeError("Prepare native step workspace before graph capture")
+  if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("observe_launch", "fill", "copy")):
+    raise TypeError("Prepared observer must implement observe_launch, fill and copy")
   specs = step_workspace_layout(model, data)
   if live_count is not None and (
     not isinstance(live_count, wp.array)
@@ -263,4 +299,4 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   ):
     raise ValueError("Live count must be one contiguous int32 scalar on the Data device")
   m2, d2 = solver._compact_solver_views(model, data)
-  return StepWorkspace(model, data, live_count, specs, m2, d2, arrays=arrays)
+  return StepWorkspace(model, data, live_count, specs, m2, d2, arrays=arrays, observer=observer)

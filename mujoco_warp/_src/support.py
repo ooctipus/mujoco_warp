@@ -222,10 +222,13 @@ def mul_m(
   vec: wp.array2d[float],
   skip: Optional[wp.array] = None,
   M: Optional[wp.array] = None,
+  *,
+  workspace=None,
 ):
   """Multiply vectors by inertia matrix; optionally skip per world.
 
   Args:
+    workspace: Optional prepared step scratch and launch observer.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     res: Result: M @ vec.
@@ -248,12 +251,15 @@ def mul_m(
       outputs=[res],
     )
   else:
+    launch_kernel = mul_m_kernel(check_skip)
     wp.launch(
-      mul_m_kernel(check_skip),
+      launch_kernel,
       dim=(d.nworld, m.nv),
       inputs=[m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, M, vec, skip],
       outputs=[res],
     )
+    if workspace is not None:
+      workspace.observe_launch(launch_kernel, (d.nworld, m.nv), "world")
 
 
 @wp.kernel
@@ -301,25 +307,28 @@ def _apply_ft(
     qfrc_out[worldid, dofid] = accumul
 
 
-def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool):
+def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool, *, workspace=None):
   wp.launch(
     kernel=_apply_ft,
     dim=(d.nworld, m.nv),
     inputs=[m.nbody, m.body_parentid, m.body_rootid, m.dof_bodyid, d.xipos, d.subtree_com, d.cdof, ft, flg_add],
     outputs=[qfrc],
   )
+  if workspace is not None:
+    workspace.observe_launch(_apply_ft, (d.nworld, m.nv), "world")
 
 
 @event_scope
-def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float]):
+def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float], *, workspace=None):
   """Map applied forces at each body via Jacobians to dof space and accumulate.
 
   Args:
+    workspace: Optional prepared step scratch and launch observer.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     qfrc: Total applied force mapped to dof space.
   """
-  apply_ft(m, d, d.xfrc_applied, qfrc, True)
+  apply_ft(m, d, d.xfrc_applied, qfrc, True, workspace=workspace)
 
 
 @wp.func

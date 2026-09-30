@@ -925,19 +925,22 @@ def nxn_broadphase(
       cond = workspace.arrays["awake_changed"]
       cond.zero_()
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
+    if workspace is not None:
+      workspace.observe_launch(_any_awake_changed, (d.nworld, m.nbody), "world")
 
   def _launch():
+    launch_kernel = _nxn_broadphase(
+      m.opt.broadphase_filter,
+      m.geom_aabb.shape[0] > 1,
+      m.geom_rbound.shape[0] > 1,
+      m.geom_margin.shape[0] > 1,
+      m.geom_gap.shape[0] > 1,
+      m.geom_dataid.shape[0] > 1,
+      enable_sleep,
+      incremental,
+    )
     wp.launch(
-      _nxn_broadphase(
-        m.opt.broadphase_filter,
-        m.geom_aabb.shape[0] > 1,
-        m.geom_rbound.shape[0] > 1,
-        m.geom_margin.shape[0] > 1,
-        m.geom_gap.shape[0] > 1,
-        m.geom_dataid.shape[0] > 1,
-        enable_sleep,
-        incremental,
-      ),
+      launch_kernel,
       dim=(d.nworld, m.nxn_geom_pair_filtered.shape[0]),
       inputs=[
         m.body_treeid,
@@ -965,6 +968,13 @@ def nxn_broadphase(
         d.overflow,
       ],
     )
+    if workspace is not None:
+      workspace.observe_launch(
+        launch_kernel,
+        (d.nworld, m.nxn_geom_pair_filtered.shape[0]),
+        "world",
+        parameters={"naconmax_in": "candidate"},
+      )
 
   if cond is not None:
     wp.capture_if(cond, on_true=_launch)
@@ -984,7 +994,7 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
   convex_narrowphase(m, d, ctx, convex_pairs, workspace=workspace)
-  primitive_narrowphase(m, d, ctx, primitive_pairs)
+  primitive_narrowphase(m, d, ctx, primitive_pairs, workspace=workspace)
 
   if m.has_sdf_geom:
     sdf_narrowphase(m, d, ctx)

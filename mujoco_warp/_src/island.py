@@ -283,7 +283,7 @@ _DSU_TARGET_BLOCKS = 2048
 
 
 @event_scope
-def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
+def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int], *, workspace=None):
   """Discover islands with EFC-parallel atomic minimum-root hooks.
 
   `island_parent` is the (nworld, ntree) disjoint-set workspace, owned by the caller.
@@ -299,6 +299,8 @@ def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
     dim=(d.nworld, m.ntree),
     inputs=[d.nisland, d.tree_island, island_parent],
   )
+  if workspace is not None:
+    workspace.observe_launch(_reset_dsu, (d.nworld, m.ntree), "world")
   wp.launch_tiled(
     _island_dsu,
     dim=(d.nworld, nchunk),
@@ -329,21 +331,29 @@ def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
     ],
     block_dim=types.BlockDim.island_dsu,
   )
+  if workspace is not None:
+    workspace.observe_launch(_island_dsu, (d.nworld, nchunk), "world")
   wp.launch(
     _compress_roots,
     dim=(d.nworld, m.ntree),
     inputs=[d.tree_island, island_parent],
   )
+  if workspace is not None:
+    workspace.observe_launch(_compress_roots, (d.nworld, m.ntree), "world")
   wp.launch(
     _label_roots,
     dim=d.nworld,
     inputs=[m.ntree, island_parent, d.nisland, d.tree_island],
   )
+  if workspace is not None:
+    workspace.observe_launch(_label_roots, d.nworld, "world")
   wp.launch(
     _propagate_labels,
     dim=(d.nworld, m.ntree),
     inputs=[island_parent, d.tree_island],
   )
+  if workspace is not None:
+    workspace.observe_launch(_propagate_labels, (d.nworld, m.ntree), "world")
 
 
 @wp.kernel
@@ -358,7 +368,7 @@ def _zero_island_counts(
 
 
 @event_scope
-def island(m: types.Model, d: types.Data, *, parent=None):
+def island(m: types.Model, d: types.Data, *, parent=None, workspace=None):
   """Discover constraint islands."""
   if m.ntree == 0:
     wp.launch(
@@ -370,7 +380,7 @@ def island(m: types.Model, d: types.Data, *, parent=None):
 
   if parent is None:
     parent = wp.empty((d.nworld, m.ntree), dtype=int)
-  direct_dsu(m, d, parent)
+  direct_dsu(m, d, parent, workspace=workspace)
 
 
 @wp.kernel
@@ -743,7 +753,7 @@ def _init_efc_arrays(
 
 
 @event_scope
-def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
+def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, workspace=None):
   """Compute DOF/constraint island mappings after island discovery.
 
   Populates d.dof_island, d.efc.island, d.island_idofadr, d.island_dofadr,
@@ -752,6 +762,7 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
   d.map_iefc2efc, d.efc_islandid.
 
   Args:
+    workspace: Optional prepared step scratch and launch observer.
     m: Model.
     d: Data.
     efc_tree: Optional prepared constraint-to-tree scratch.
@@ -770,12 +781,16 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     inputs=[],
     outputs=[d.nidof, d.island_idofadr, d.island_nv, d.island_nefc, d.island_ne, d.island_nf, d.island_iefcadr],
   )
+  if workspace is not None:
+    workspace.observe_launch(_init_island_arrays, (d.nworld, m.ntree), "world")
   wp.launch(
     _init_dof_arrays,
     dim=(d.nworld, m.nv),
     inputs=[],
     outputs=[d.dof_island, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
   )
+  if workspace is not None:
+    workspace.observe_launch(_init_dof_arrays, (d.nworld, m.nv), "world")
   if efc_tree is None:
     efc_tree = wp.empty((d.nworld, d.njmax), dtype=int)
   wp.launch(
@@ -784,6 +799,8 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     inputs=[],
     outputs=[d.efc.island, d.map_efc2iefc, d.map_iefc2efc, d.efc_islandid, efc_tree],
   )
+  if workspace is not None:
+    workspace.observe_launch(_init_efc_arrays, (d.nworld, d.njmax), "world")
 
   wp.launch(
     _compute_efc_tree,
@@ -812,6 +829,8 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     ],
     outputs=[efc_tree],
   )
+  if workspace is not None:
+    workspace.observe_launch(_compute_efc_tree, (d.nworld, d.njmax), "world")
 
   # 1. Count DOFs per island
   wp.launch(
@@ -820,6 +839,8 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     inputs=[m.dof_treeid, d.tree_island],
     outputs=[d.dof_island, d.island_nv],
   )
+  if workspace is not None:
+    workspace.observe_launch(_island_count_dofs, (d.nworld, m.nv), "world")
 
   # 2. Count Constraints per island
   wp.launch(
@@ -828,6 +849,8 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     inputs=[d.nefc, d.efc.type, d.tree_island, d.njmax, efc_tree],
     outputs=[d.efc.island, d.island_nefc, d.island_ne, d.island_nf],
   )
+  if workspace is not None:
+    workspace.observe_launch(_island_count_constraints, (d.nworld, d.njmax), "world")
 
   # 3. Scan sizes and reset counters for mapping
   wp.launch(
@@ -836,15 +859,22 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     inputs=[d.nisland, d.island_nv],
     outputs=[d.nidof, d.island_idofadr, d.island_nefc, d.island_iefcadr],
   )
+  if workspace is not None:
+    workspace.observe_launch(_island_scan_sizes, d.nworld, "world")
 
   # 4. Map DOFs
-  d.island_dofadr.fill_(m.nv)
+  if workspace is None:
+    d.island_dofadr.fill_(m.nv)
+  else:
+    workspace.fill(d.island_dofadr, m.nv, "world")
   wp.launch(
     _island_map_dofs,
     dim=(d.nworld, m.nv),
     inputs=[m.dof_treeid, m.tree_dofadr, m.tree_dofnum, d.nidof, d.tree_island, d.island_idofadr],
     outputs=[d.island_dofadr, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
   )
+  if workspace is not None:
+    workspace.observe_launch(_island_map_dofs, (d.nworld, m.nv), "world")
 
   # 5. Map Constraints
   wp.launch(
@@ -853,6 +883,8 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
     inputs=[d.nefc, d.nisland, d.efc.type, d.efc.island, d.island_ne, d.island_nf, d.island_iefcadr, d.njmax],
     outputs=[d.island_nefc, d.map_efc2iefc, d.map_iefc2efc, d.efc_islandid],
   )
+  if workspace is not None:
+    workspace.observe_launch(_island_map_constraints, (d.nworld, m.ntree), "world")
 
 
 # Active-DOF compaction (nvmax < nv).
@@ -930,7 +962,7 @@ def _compact_dofs_builder(warn_overflow: int):
 
 
 @event_scope
-def update_active_dofs(m: types.Model, d: types.Data):
+def update_active_dofs(m: types.Model, d: types.Data, *, workspace=None):
   """Rebuild the compaction maps (dof_cdof / cdof_dof) from tree_awake."""
   wp.launch(
     _reset_compact_maps,
@@ -938,9 +970,14 @@ def update_active_dofs(m: types.Model, d: types.Data):
     inputs=[m.nv, d.nvmax_pad],
     outputs=[d.dof_cdof, d.cdof_dof],
   )
+  if workspace is not None:
+    workspace.observe_launch(_reset_compact_maps, (d.nworld, max(m.nv, d.nvmax_pad)), "world")
+  launch_kernel = _compact_dofs_builder(int(m.opt.warn_overflow))
   wp.launch(
-    _compact_dofs_builder(int(m.opt.warn_overflow)),
+    launch_kernel,
     dim=(d.nworld,),
     inputs=[m.ntree, m.tree_dofadr, m.tree_dofnum, d.tree_awake, d.nvmax],
     outputs=[d.ncdof, d.dof_cdof, d.cdof_dof, d.overflow],
   )
+  if workspace is not None:
+    workspace.observe_launch(launch_kernel, (d.nworld,), "world")

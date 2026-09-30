@@ -1,11 +1,14 @@
 """CPU preparation gates for immutable metadata and unsupported native features."""
 
+import ast
 import dataclasses
+import inspect
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import warp as wp
 
 from mujoco_warp import test_data
@@ -29,6 +32,66 @@ class Metadata:
 
 
 class WorkspaceTest(unittest.TestCase):
+  def test_solver_conditional_forwards_prepared_owner_to_iteration(self):
+    tree = ast.parse(inspect.getsource(solver._solve))
+    calls = [
+      node
+      for node in ast.walk(tree)
+      if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "capture_while"
+    ]
+    self.assertEqual(len(calls), 1)
+    arguments = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
+    self.assertEqual(arguments["while_body"], "_solver_iteration")
+    self.assertEqual(arguments.get("workspace"), "workspace", "Unbound WHILE nodes can over-decrement live nsolving")
+
+  def test_launch_observer_receives_declared_domains_and_skips_empty_launches(self):
+    calls = []
+    workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.observer = SimpleNamespace(observe_launch=lambda *args, **kwargs: calls.append((args, kwargs)))
+    kernel = object()
+    workspace.observe_launch(kernel, (31, 4), "world")
+    workspace.observe_launch(kernel, (31, 4), "candidate")
+    workspace.observe_launch(kernel, 256, None, extent_axis=None, parameters={"naccdmax_in": "ccd"})
+    workspace.observe_launch(kernel, (31, 0), "world")
+    self.assertEqual([args[2] for args, _ in calls], ["world", "candidate", None])
+    self.assertEqual(calls[2], ((kernel, 256, None), {"extent_axis": None, "parameters": {"naccdmax_in": "ccd"}}))
+
+  def test_explicit_memory_operations_preserve_eager_behavior_without_observer(self):
+    workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.observer = None
+    source = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), device="cpu")
+    destination = wp.zeros((3, 4), dtype=wp.float32, device="cpu")
+    workspace.copy(destination, source, "world")
+    np.testing.assert_array_equal(destination.numpy(), source.numpy())
+    self.assertIs(workspace.fill(destination, 7, "world"), destination)
+    np.testing.assert_array_equal(destination.numpy(), np.full((3, 4), 7, np.float32))
+
+  def test_observer_memory_failure_propagates_without_dense_fallback(self):
+    workspace = StepWorkspace.__new__(StepWorkspace)
+    array = SimpleNamespace(size=12, fill_=lambda *_: self.fail("Unexpected dense fill"))
+
+    def fail(*args):
+      self.assertEqual(args[-1], "world")
+      raise ArithmeticError("Bounded operation failed")
+
+    workspace.observer = SimpleNamespace(fill=fail, copy=fail)
+    with patch.object(wp, "copy", side_effect=AssertionError("Unexpected dense copy")):
+      for operation in (lambda: workspace.fill(array, 0, "world"), lambda: workspace.copy(array, array, "world")):
+        with self.assertRaisesRegex(ArithmeticError, "Bounded operation failed"):
+          operation()
+      empty = SimpleNamespace(size=0)
+      workspace.fill(empty, 0, "world")
+      workspace.copy(empty, empty, "world")
+
+  def test_incomplete_observer_rejected_before_scratch_planning(self):
+    data = SimpleNamespace(qpos=SimpleNamespace(device=SimpleNamespace(is_cuda=True)))
+    with (
+      patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
+      patch("mujoco_warp._src.workspace.step_workspace_layout", side_effect=AssertionError("Unexpected scratch planning")),
+    ):
+      with self.assertRaisesRegex(TypeError, "observe_launch, fill and copy"):
+        make_step_workspace(None, data, observer=SimpleNamespace(observe_launch=lambda *_: None))
+
   def test_cpu_template_plans_capacity_without_allocating_or_mutating(self):
     instances = []
     for count in (1, 3):

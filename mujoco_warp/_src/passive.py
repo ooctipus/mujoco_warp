@@ -597,7 +597,7 @@ def _fluid_force(
   fluid_applied_out[worldid, bodyid] = wp.spatial_vector(force_global, torque_global)
 
 
-def _fluid(m: Model, d: Data):
+def _fluid(m: Model, d: Data, *, workspace=None):
   fluid_applied = wp.empty((d.nworld, m.nbody), dtype=wp.spatial_vector)
 
   wp.launch(
@@ -626,7 +626,7 @@ def _fluid(m: Model, d: Data):
     outputs=[fluid_applied],
   )
 
-  support.apply_ft(m, d, fluid_applied, d.qfrc_fluid, False)
+  support.apply_ft(m, d, fluid_applied, d.qfrc_fluid, False, workspace=workspace)
 
 
 @wp.kernel
@@ -1368,7 +1368,7 @@ def _flex_passive_bend_interp(
 
 
 @event_scope
-def passive(m: Model, d: Data):
+def passive(m: Model, d: Data, *, workspace=None):
   """Adds all passive forces."""
   dsbl_spring = m.opt.disableflags & DisableBit.SPRING
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
@@ -1399,6 +1399,8 @@ def passive(m: Model, d: Data):
     ],
     outputs=[d.qfrc_spring, d.qfrc_damper],
   )
+  if workspace is not None:
+    workspace.observe_launch(_spring_damper_dof_passive, (d.nworld, m.njnt), "world")
 
   if m.ntendon:
     wp.launch(
@@ -1547,7 +1549,10 @@ def passive(m: Model, d: Data):
     )
 
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-  d.qfrc_gravcomp.zero_()
+  if workspace is None:
+    d.qfrc_gravcomp.zero_()
+  else:
+    workspace.fill(d.qfrc_gravcomp, 0, "world")
   if gravity_enabled:
     wp.launch(
       _gravity_force,
@@ -1566,6 +1571,8 @@ def passive(m: Model, d: Data):
       ],
       outputs=[d.qfrc_gravcomp],
     )
+    if workspace is not None:
+      workspace.observe_launch(_gravity_force, (d.nworld, m.nbody - 1, m.nv), "world")
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
   if m.nflex and m.nflexintcell > 0:
@@ -1606,14 +1613,17 @@ def passive(m: Model, d: Data):
 
   if m.nflex > 0:
     if not dsbl_spring:
-      support.apply_ft(m, d, flex_spring_body_force, d.qfrc_spring, True)
+      support.apply_ft(m, d, flex_spring_body_force, d.qfrc_spring, True, workspace=workspace)
     if not dsbl_damper:
-      support.apply_ft(m, d, flex_damper_body_force, d.qfrc_damper, True)
+      support.apply_ft(m, d, flex_damper_body_force, d.qfrc_damper, True, workspace=workspace)
 
   if m.has_fluid:
-    _fluid(m, d)
+    _fluid(m, d, workspace=workspace)
 
-  d.qfrc_adhesion.zero_()
+  if workspace is None:
+    d.qfrc_adhesion.zero_()
+  else:
+    workspace.fill(d.qfrc_adhesion, 0, "world")
   if m.flg_adhesion and (not (m.opt.disableflags & DisableBit.CONTACT)) and m.nv > 0:
     wp.launch(
       _qfrc_adhesion,
@@ -1641,8 +1651,9 @@ def passive(m: Model, d: Data):
       ],
     )
 
+  launch_kernel = _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled)
   wp.launch(
-    _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled),
+    launch_kernel,
     dim=(d.nworld, m.nv),
     inputs=[
       m.jnt_actgravcomp,
@@ -1657,6 +1668,8 @@ def passive(m: Model, d: Data):
       d.qfrc_passive,
     ],
   )
+  if workspace is not None:
+    workspace.observe_launch(launch_kernel, (d.nworld, m.nv), "world")
 
   if m.callback.passive:
     m.callback.passive(m, d)

@@ -4936,7 +4936,7 @@ def _add_surface_vel(is_pyramidal: bool):
 
 
 @event_scope
-def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
+def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=None):
   """Creates constraint jacobians and other supporting data."""
   newton = m.opt.solver == types.SolverType.NEWTON
   if efc_nnz is None:
@@ -4947,6 +4947,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
     dim=d.nworld,
     inputs=[d.ne, d.nf, d.nl, d.nefc, d.efc.jtdaj_nblock, efc_nnz],
   )
+  if workspace is not None:
+    workspace.observe_launch(_zero_constraint_counts, d.nworld, "world")
 
   if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
     if not (m.opt.disableflags & types.DisableBit.EQUALITY):
@@ -5283,8 +5285,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
           )
 
     if not (m.opt.disableflags & types.DisableBit.FRICTIONLOSS):
+      launch_kernel = _friction_dof(m.is_sparse, newton)
       wp.launch(
-        _friction_dof(m.is_sparse, newton),
+        launch_kernel,
         dim=(d.nworld, m.nv),
         inputs=[
           m.nv,
@@ -5319,6 +5322,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
           efc_nnz,
         ],
       )
+      if workspace is not None:
+        workspace.observe_launch(launch_kernel, (d.nworld, m.nv), "world")
 
       wp.launch(
         _friction_tendon(m.is_sparse, newton),
@@ -5405,8 +5410,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
         ],
       )
 
+      launch_kernel = _limit_slide_hinge(m.is_sparse, newton)
       wp.launch(
-        _limit_slide_hinge(m.is_sparse, newton),
+        launch_kernel,
         dim=(d.nworld, m.jnt_limited_slide_hinge_adr.size),
         inputs=[
           m.nv,
@@ -5446,6 +5452,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
           efc_nnz,
         ],
       )
+      if workspace is not None:
+        workspace.observe_launch(launch_kernel, (d.nworld, m.jnt_limited_slide_hinge_adr.size), "world")
 
       wp.launch(
         _limit_tendon(m.is_sparse, newton),
@@ -5567,8 +5575,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
           ],
         )
       else:
+        launch_kernel = _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion)
         wp.launch(
-          _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion),
+          launch_kernel,
           dim=d.naconmax,
           inputs=[
             m.body_weldid,
@@ -5599,6 +5608,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
             efc_nnz,
           ],
         )
+        if workspace is not None:
+          workspace.observe_launch(launch_kernel, d.naconmax, "candidate")
 
       if m.is_sparse:
         if has_flex:
@@ -5652,8 +5663,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
             ],
           )
         else:
+          launch_kernel = _efc_contact_jac_sparse(m.opt.cone)
           wp.launch(
-            _efc_contact_jac_sparse(m.opt.cone),
+            launch_kernel,
             dim=(d.naconmax, nmaxdim),
             inputs=[
               m.body_parentid,
@@ -5685,8 +5697,13 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
               d.efc.Jqvel,
             ],
           )
+          if workspace is not None:
+            workspace.observe_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
       else:
-        d.efc.Jqvel.zero_()
+        if workspace is None:
+          d.efc.Jqvel.zero_()
+        else:
+          workspace.fill(d.efc.Jqvel, 0, "world")
         tile_size = m.block_dim.contact_jac_tiled
         n_dof_blocks = (m.nv_pad + tile_size - 1) // tile_size
 
@@ -5737,8 +5754,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
             block_dim=tile_size,
           )
         else:
+          launch_kernel = _efc_contact_jac_dense(tile_size, m.opt.cone)
           wp.launch_tiled(
-            _efc_contact_jac_dense(tile_size, m.opt.cone),
+            launch_kernel,
             dim=(d.nworld, n_dof_blocks),
             inputs=[
               m.body_rootid,
@@ -5767,6 +5785,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
             ],
             block_dim=tile_size,
           )
+          if workspace is not None:
+            workspace.observe_launch(launch_kernel, (d.nworld, n_dof_blocks), "world")
 
       if m.flg_surfacevel:
         wp.launch(
@@ -5845,8 +5865,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
           ],
         )
       else:
+        launch_kernel = _efc_contact_update(m.opt.cone, m.flg_adhesion)
         wp.launch(
-          _efc_contact_update(m.opt.cone, m.flg_adhesion),
+          launch_kernel,
           dim=(d.naconmax, nmaxdim),
           inputs=[
             m.opt.timestep,
@@ -5880,3 +5901,5 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
             d.efc.frictionloss,
           ],
         )
+        if workspace is not None:
+          workspace.observe_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")

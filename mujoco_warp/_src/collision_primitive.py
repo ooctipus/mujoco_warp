@@ -1518,7 +1518,9 @@ _PRIMITIVE_COLLISION_FUNC = []
 
 
 @event_scope
-def primitive_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]]):
+def primitive_narrowphase(
+  m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]], *, workspace=None
+):
   """Runs collision detection on primitive geom pairs discovered during broadphase.
 
   This function processes collision pairs involving primitive shapes that were
@@ -1544,8 +1546,9 @@ def primitive_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_ta
       _PRIMITIVE_COLLISION_TYPES.append(types)
       _PRIMITIVE_COLLISION_FUNC.append(func)
 
+  launch_kernel = _primitive_narrowphase(_PRIMITIVE_COLLISION_TYPES, _PRIMITIVE_COLLISION_FUNC)
   wp.launch(
-    _primitive_narrowphase(_PRIMITIVE_COLLISION_TYPES, _PRIMITIVE_COLLISION_FUNC),
+    launch_kernel,
     dim=d.naconmax,
     inputs=[
       m.geom_type,
@@ -1609,3 +1612,10 @@ def primitive_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_ta
       d.nacon,
     ],
   )
+  if workspace is not None:
+    workspace.observe_launch(
+      launch_kernel,
+      d.naconmax,
+      "candidate",
+      parameters={"naconmax_in": "candidate"},
+    )
