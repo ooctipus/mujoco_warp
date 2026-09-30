@@ -6,12 +6,14 @@ import inspect
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import numpy as np
 import warp as wp
 
 from mujoco_warp import test_data
+from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
 from mujoco_warp._src.workspace import StepWorkspace
@@ -32,6 +34,17 @@ class Metadata:
 
 
 class WorkspaceTest(unittest.TestCase):
+  def test_kinematics_declares_every_emitted_pose_launch(self):
+    # Sites are allowed in prepared models, even though keyboard fixtures have none.
+    model = Mock(nbranch=2, nbody=3, ngeom=4, nsite=2)
+    data = Mock(nworld=7)
+    emitted, observed = [], []
+    workspace = SimpleNamespace(observe_launch=lambda *args: observed.append(args))
+    with patch.object(wp, "launch", side_effect=lambda kernel, dim, **_: emitted.append((kernel, dim, "world"))):
+      smooth.kinematics(model, data, workspace=workspace)
+    self.assertEqual(observed, emitted)
+    self.assertEqual(observed[-1], (smooth._site_local_to_global, (7, 2), "world"))
+
   def test_solver_conditional_forwards_prepared_owner_to_iteration(self):
     tree = ast.parse(inspect.getsource(solver._solve))
     calls = [
@@ -234,6 +247,8 @@ class WorkspaceTest(unittest.TestCase):
       nflex=0,
       ntendon=0,
       nsensor=0,
+      ncam=0,
+      nlight=0,
       neq=0,
       nacttrnbody=0,
       nhfield=0,
@@ -241,7 +256,10 @@ class WorkspaceTest(unittest.TestCase):
       nhistory=0,
     )
     data = SimpleNamespace(qpos=SimpleNamespace(device=SimpleNamespace(is_cuda=True)))
-    cases = [(model, name, 1) for name in ("nflex", "ntendon", "nsensor", "neq", "nacttrnbody", "nhfield", "na", "nhistory")]
+    cases = [
+      (model, name, 1)
+      for name in ("nflex", "ntendon", "nsensor", "ncam", "nlight", "neq", "nacttrnbody", "nhfield", "na", "nhistory")
+    ]
     cases += [
       (model, "has_sdf_geom", True),
       (model, "has_fluid", True),

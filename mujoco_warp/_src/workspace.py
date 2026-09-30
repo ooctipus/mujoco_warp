@@ -179,7 +179,8 @@ def step_workspace_layout(
   """Describe scratch before allocation for Newton/implicit-fast keyboard execution.
 
   Admits native NxN contacts, sleeping, pyramidal Newton and no optional callbacks,
-  sensors, flex, tendons, fluid or SDF. Unsupported features fail before allocation.
+  sensors, cameras, lights, flex, tendons, fluid or SDF. Unsupported features fail
+  before allocation.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
@@ -200,7 +201,7 @@ def step_workspace_layout(
     not m.has_sdf_geom,
     not m.has_fluid,
   )
-  absent = (m.nflex, m.ntendon, m.nsensor, m.neq, m.nacttrnbody, m.nhfield, m.na, m.nhistory)
+  absent = (m.nflex, m.ntendon, m.nsensor, m.ncam, m.nlight, m.neq, m.nacttrnbody, m.nhfield, m.na, m.nhistory)
   if not all(required) or any(absent) or any(getattr(m.callback, f.name) is not None for f in dataclasses.fields(m.callback)):
     raise NotImplementedError("Prepared workspace supports native NxN sleeping Newton/implicit-fast keyboard features only")
   if d.nworld < 1 or d.nvmax != m.nv:

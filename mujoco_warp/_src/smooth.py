@@ -481,6 +481,8 @@ def kinematics(m: Model, d: Data, *, workspace=None):
     inputs=[m.site_bodyid, m.site_pos, m.site_quat, d.xpos, d.xquat],
     outputs=[d.site_xpos, d.site_xmat],
   )
+  if workspace is not None:
+    workspace.observe_launch(_site_local_to_global, (d.nworld, m.nsite), "world")
 
 
 @wp.kernel
