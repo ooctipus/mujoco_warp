@@ -78,6 +78,7 @@ from mujoco_warp._src.sensor import energy_vel as energy_vel
 from mujoco_warp._src.sensor import sensor_acc as sensor_acc
 from mujoco_warp._src.sensor import sensor_pos as sensor_pos
 from mujoco_warp._src.sensor import sensor_vel as sensor_vel
+from mujoco_warp._src.set_const import restore_const_state as restore_const_state
 from mujoco_warp._src.set_const import set_const as set_const
 from mujoco_warp._src.set_const import set_const_0 as set_const_0
 from mujoco_warp._src.set_const import set_const_fixed as set_const_fixed
