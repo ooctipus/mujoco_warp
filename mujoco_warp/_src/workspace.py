@@ -184,7 +184,8 @@ def step_workspace_layout(
 
   Admits native NxN contacts, sleeping, pyramidal Newton and no optional callbacks,
   sensors, cameras, lights, flex, tendons, fluid or SDF. Unsupported features fail
-  before allocation.
+  before allocation. Specialized free-body implicit solves are unsupported unless
+  actuation, springs and dampers are all disabled, so that solve is not executed.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
@@ -209,6 +210,10 @@ def step_workspace_layout(
   absent = (m.nflex, m.ntendon, m.nsensor, m.ncam, m.nlight, m.neq, m.nacttrnbody, m.nhfield, m.na, m.nhistory)
   if not all(required) or any(absent) or any(getattr(m.callback, f.name) is not None for f in dataclasses.fields(m.callback)):
     raise NotImplementedError("Prepared workspace supports native NxN sleeping Newton/implicit-fast keyboard features only")
+  # The specialized free-body implicit solve has no prepared count bindings.
+  derivative_flags = types.DisableBit.ACTUATION | types.DisableBit.SPRING | types.DisableBit.DAMPER
+  if m.body_freeadr.size and (m.opt.disableflags & derivative_flags) != derivative_flags:
+    raise NotImplementedError("Prepared workspace does not support implicit-fast free-body solves")
   if d.nworld < 1 or d.nvmax != m.nv:
     raise ValueError("Prepared workspace requires positive capacity and complete compact-DOF storage")
   if (

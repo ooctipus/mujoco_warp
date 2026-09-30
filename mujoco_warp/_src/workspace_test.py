@@ -344,6 +344,36 @@ class WorkspaceTest(unittest.TestCase):
       data.cM = data.cqLD = wp.empty((2, 0, 0), dtype=wp.float32, device="cpu")
       self.assertEqual(make_step_workspace(None, data), "bound")
 
+  def test_implicit_fast_free_body_path_rejected_before_planning(self):
+    """Reject the actual unbound free-body path before scratch planning or allocation."""
+    with wp.ScopedDevice("cpu"):
+      _, _, model, data = test_data.fixture(
+        xml="""<mujoco><option integrator="implicitfast" solver="Newton" cone="pyramidal">
+          <flag sleep="enable" island="enable"/></option><worldbody>
+          <body><freejoint/><geom type="sphere" size=".1"/></body>
+        </worldbody></mujoco>""",
+        nworld=1,
+        nconmax=16,
+        njmax=16,
+      )
+    np.testing.assert_array_equal(model.body_freeadr.numpy(), [1])
+    model.opt.broadphase = types.BroadphaseType.NXN
+    model.opt.disableflags |= types.DisableBit.MULTICCD
+    model.opt.graph_conditional = True
+    base = model.opt.disableflags
+    flags = (types.DisableBit.ACTUATION, types.DisableBit.SPRING, types.DisableBit.DAMPER)
+    with (
+      patch.object(wp, "empty", side_effect=AssertionError("Unexpected scratch allocation")),
+      patch.object(solver, "_compact_solver_views", side_effect=AssertionError("Unexpected scratch planning")),
+    ):
+      for mask in range(7):
+        model.opt.disableflags = base | sum(int(flag) for bit, flag in enumerate(flags) if mask & (1 << bit))
+        with self.subTest(disabled=mask), self.assertRaisesRegex(NotImplementedError, "free-body solves"):
+          step_workspace_layout(model, data, world_capacity=31)
+    # This exact mask bypasses both specialized launches in forward.implicit.
+    model.opt.disableflags = base | flags[0] | flags[1] | flags[2]
+    self.assertTrue(step_workspace_layout(model, data, world_capacity=31))
+
   def test_unsupported_features_rejected_before_allocating(self):
     opt = SimpleNamespace(
       solver=types.SolverType.NEWTON,
