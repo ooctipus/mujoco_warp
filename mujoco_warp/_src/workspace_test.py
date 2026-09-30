@@ -2,16 +2,19 @@
 
 import dataclasses
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import warp as wp
 
+from mujoco_warp import test_data
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
 from mujoco_warp._src.workspace import StepWorkspace
 from mujoco_warp._src.workspace import WorkspaceField
 from mujoco_warp._src.workspace import make_step_workspace
+from mujoco_warp._src.workspace import step_workspace_layout
 
 
 @dataclasses.dataclass
@@ -26,6 +29,60 @@ class Metadata:
 
 
 class WorkspaceTest(unittest.TestCase):
+  def test_cpu_template_plans_capacity_without_allocating_or_mutating(self):
+    instances = []
+    for count in (1, 3):
+      with wp.ScopedDevice("cpu"):
+        _, _, model, data = test_data.fixture(
+          xml="""<mujoco><option integrator="implicitfast" solver="Newton" cone="pyramidal">
+            <flag sleep="enable" island="enable"/></option><worldbody>
+            <body><joint type="slide"/><geom type="sphere" size=".1"/></body>
+          </worldbody></mujoco>""",
+          nworld=count,
+          nconmax=16,
+          njmax=16,
+        )
+      model.opt.broadphase = types.BroadphaseType.NXN
+      model.opt.disableflags |= types.DisableBit.MULTICCD
+      model.opt.graph_conditional = True
+      instances.append((model, data))
+    model, template = instances[0]
+    real_model, real_data = instances[1]
+    before = StepWorkspace._layout(model), StepWorkspace._layout(template)
+    with ExitStack() as stack:
+      for name in (
+        "empty",
+        "empty_like",
+        "zeros",
+        "ones",
+        "full",
+        "clone",
+        "array",
+        "copy",
+        "launch",
+        "get_stream",
+        "get_device",
+      ):
+        stack.enter_context(patch.object(wp, name, side_effect=AssertionError("Planning must only read metadata")))
+      planned = step_workspace_layout(
+        model, template, world_capacity=3, contact_capacity=real_data.naconmax, ccd_capacity=real_data.naccdmax
+      )
+      self.assertEqual(planned, step_workspace_layout(real_model, real_data))
+      large = step_workspace_layout(model, template, world_capacity=4096, contact_capacity=8192, ccd_capacity=2048)
+      self.assertEqual({spec.shape[0] for spec in large if spec.domain == "world" and spec.shape[0]}, {4096})
+      self.assertEqual({spec.shape[0] for spec in large if spec.domain == "candidate"}, {8192})
+      self.assertEqual({spec.shape[0] for spec in large if spec.domain == "ccd"}, {2048})
+      for name, value in (
+        ("world_capacity", 0),
+        ("world_capacity", 2**31),
+        ("world_capacity", True),
+        ("contact_capacity", -1),
+        ("ccd_capacity", 1.5),
+      ):
+        with self.assertRaises(ValueError):
+          step_workspace_layout(model, template, **{name: value})
+    self.assertEqual(before, (StepWorkspace._layout(model), StepWorkspace._layout(template)))
+
   def test_caller_scratch_binding_owns_no_allocation(self):
     specs = (
       WorkspaceField("collision_pair", (2,), wp.vec2i, "candidate"),

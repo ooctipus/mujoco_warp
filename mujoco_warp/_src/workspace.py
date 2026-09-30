@@ -141,19 +141,20 @@ class StepWorkspace:
     }
 
 
-def step_workspace_layout(model: types.Model, data: types.Data) -> tuple[WorkspaceField, ...]:
+def step_workspace_layout(
+  model: types.Model, data: types.Data, *, world_capacity=None, contact_capacity=None, ccd_capacity=None
+) -> tuple[WorkspaceField, ...]:
   """Describe scratch before allocation for Newton/implicit-fast keyboard execution.
 
   Admits native NxN contacts, sleeping, pyramidal Newton and no optional callbacks,
   sensors, flex, tendons, fluid or SDF. Unsupported features fail before allocation.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
-  This operation allocates no device storage and returns immutable specifications.
+  A real one-world CPU or GPU Data template supplies topology/solver dimensions.
+  Capacity overrides plan larger reservations without cloning Data or allocating
+  storage. Omitted capacities use Data's current values. All capacities are positive
+  int32 counts. This operation performs no stream or device-context operation.
   """
   m, d = model, data
-  if not d.qpos.device.is_cuda:
-    raise ValueError("Prepared step workspace currently requires CUDA")
-  if wp.get_stream(d.qpos.device).is_capturing:
-    raise RuntimeError("Prepare native step workspace before graph capture")
   required = (
     m.opt.solver == types.SolverType.NEWTON,
     m.opt.integrator == types.IntegratorType.IMPLICITFAST,
@@ -188,11 +189,15 @@ def step_workspace_layout(model: types.Model, data: types.Data) -> tuple[Workspa
   boxes = pair_count(box) if box in pairs else 0
   iterations = 16 if boxes == sum(pair_count(pair) for pair in pairs) else m.opt.ccd_iterations
   polygon, degree = (4, 3) if boxes > 0 else (0, 0)
-  nw, nc = d.nworld, d.naccdmax
+  nw = d.nworld if world_capacity is None else world_capacity
+  candidates = d.naconmax if contact_capacity is None else contact_capacity
+  nc = d.naccdmax if ccd_capacity is None else ccd_capacity
+  if any(type(value) is not int or not 1 <= value < 2**31 for value in (nw, candidates, nc)):
+    raise ValueError("World, contact and CCD capacities must be positive int32 counts")
   specs = [
-    ("collision_pair", (d.naconmax,), wp.vec2i, "candidate"),
-    ("collision_pairid", (d.naconmax,), wp.vec2i, "candidate"),
-    ("collision_worldid", (d.naconmax,), int, "candidate"),
+    ("collision_pair", (candidates,), wp.vec2i, "candidate"),
+    ("collision_pairid", (candidates,), wp.vec2i, "candidate"),
+    ("collision_worldid", (candidates,), int, "candidate"),
     ("nccd", (len(types.GeomType) * (len(types.GeomType) + 1) // 2,), int, "global_counter"),
     ("epa_vert", (nc, 10 + 2 * iterations), wp.vec3, "ccd"),
     ("epa_vert_index", (nc, 10 + 2 * iterations), int, "ccd"),
@@ -226,10 +231,12 @@ def step_workspace_layout(model: types.Model, data: types.Data) -> tuple[Workspa
     ("actuator_vel", (nw, m.nactuator), float, "world"),
   ]
   specs.extend(("solver." + name, shape, dtype, "world") for name, shape, dtype, _ in solver._solver_context_layout(m2, d2))
-  return tuple(
-    WorkspaceField(name, shape, {int: wp.int32, float: wp.float32, bool: wp.bool}.get(dtype, dtype), domain)
-    for name, shape, dtype, domain in specs
-  )
+  fields = []
+  for name, shape, dtype, domain in specs:
+    if domain == "world" and shape[0]:
+      shape = (nw, *shape[1:])
+    fields.append(WorkspaceField(name, shape, {int: wp.int32, float: wp.float32, bool: wp.bool}.get(dtype, dtype), domain))
+  return tuple(fields)
 
 
 def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None, arrays=None) -> StepWorkspace:
@@ -242,6 +249,10 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   A live_count is a CUDA int32 scalar in [0, data.nworld], enforced by admission.
   Kernel launch bounds and bounded bulk operations remain the caller's program.
   """
+  if not data.qpos.device.is_cuda:
+    raise ValueError("Prepared step workspace currently requires CUDA")
+  if wp.get_stream(data.qpos.device).is_capturing:
+    raise RuntimeError("Prepare native step workspace before graph capture")
   specs = step_workspace_layout(model, data)
   if live_count is not None and (
     not isinstance(live_count, wp.array)

@@ -4019,7 +4019,7 @@ def _compact_solver_views(m: types.Model, d: types.Data):
   # Keep graph-conditional early-exit on CUDA (matches baseline: stops at convergence
   # instead of running all iterations); fall back to the plain loop on CPU.
   nvp = d.nvmax_pad
-  gc = m.opt.graph_conditional and wp.get_device().is_cuda
+  gc = m.opt.graph_conditional and d.qpos.device.is_cuda
   opt2 = dataclasses.replace(m.opt, graph_conditional=gc, tolerance=d.ctol, ls_tolerance=d.cls_tol)
   m2 = dataclasses.replace(
     m, opt=opt2, nv=nvp, nv_pad=nvp, is_sparse=False, dof_tri_row=d.cdof_tri_row, dof_tri_col=d.cdof_tri_col
