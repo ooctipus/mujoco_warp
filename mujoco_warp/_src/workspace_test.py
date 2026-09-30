@@ -13,6 +13,7 @@ import numpy as np
 import warp as wp
 
 from mujoco_warp import test_data
+from mujoco_warp._src import derivative
 from mujoco_warp._src import forward
 from mujoco_warp._src import passive
 from mujoco_warp._src import smooth
@@ -36,6 +37,38 @@ class Metadata:
 
 
 class WorkspaceTest(unittest.TestCase):
+  def test_disabled_derivative_copy_preserves_inactive_rows(self):
+    """Route derivative fallback through the same bounded native row-copy owner."""
+    model = SimpleNamespace(
+      M_fullm_i=None,
+      M_fullm_j=None,
+      opt=SimpleNamespace(disableflags=types.DisableBit.ACTUATION | types.DisableBit.DAMPER),
+      has_fluid=False,
+    )
+    data = SimpleNamespace(M=wp.array(np.arange(12, dtype=np.float32).reshape(4, 3), device="cpu"))
+    for prepared in (False, True):
+      for live in (0, 2, 4):
+        with self.subTest(prepared=prepared, live=live):
+          out = wp.full((4, 3), -7.0, device="cpu")
+          calls = []
+
+          def copy(destination, source, domain):
+            calls.append((destination, source, domain))
+            wp.copy(destination[:live], source[:live])
+
+          workspace = SimpleNamespace(copy=copy) if prepared else None
+          with patch.object(wp, "launch", side_effect=AssertionError("Unexpected derivative kernel")):
+            derivative.deriv_smooth_vel(model, data, out, workspace=workspace)
+          expected = np.full((4, 3), -7.0, np.float32)
+          count = live if prepared else 4
+          expected[:count] = data.M.numpy()[:count]
+          np.testing.assert_array_equal(out.numpy(), expected)
+          self.assertEqual(len(calls), int(prepared))
+          if prepared:
+            self.assertIs(calls[0][0], out)
+            self.assertIs(calls[0][1], data.M)
+            self.assertEqual(calls[0][2], "world")
+
   def test_disabled_features_clear_only_live_rows_with_prepared_workspace(self):
     cases = (
       (forward.fwd_actuation, 0, 0, ("act_dot", "qfrc_actuator", "actuator_force")),
@@ -373,6 +406,74 @@ class WorkspaceTest(unittest.TestCase):
     # This exact mask bypasses both specialized launches in forward.implicit.
     model.opt.disableflags = base | flags[0] | flags[1] | flags[2]
     self.assertTrue(step_workspace_layout(model, data, world_capacity=31))
+
+  def test_unbound_optional_programs_rejected_with_real_cpu_metadata(self):
+    """Conservatively admit only optional branches with prepared count bindings."""
+    slide = '<body><joint type="slide"/><geom type="sphere" size=".1"/></body>'
+    ball = '<body><joint type="ball" limited="true" range="0 45"/><geom type="sphere" size=".1"/></body>'
+    chain = '<body><joint/><geom type="sphere" size=".1"/>'
+    cases = (
+      ("static", '<body><geom type="sphere" size=".1"/></body>', "dense", "dynamic tree"),
+      ("ball", ball, "dense", "ball-joint limits"),
+      ("surface", slide, "dense", "surface velocity"),
+      ("adhesion", slide, "dense", "passive adhesion"),
+      ("rne", slide, "dense", "postconstraint inverse dynamics"),
+      ("dense", slide * 60, "dense", "dense full Jacobians"),
+      ("gathered", chain * 10 + "</body>" * 10, "sparse", "inertia factorizations"),
+      ("ldl", chain * 80 + "</body>" * 80, "sparse", "inertia factorizations"),
+      ("sparse", slide * 108, "sparse", None),
+    )
+    for feature, body, jacobian, message in cases:
+      with self.subTest(feature=feature), wp.ScopedDevice("cpu"):
+        _, _, model, data = test_data.fixture(
+          xml=f"""<mujoco><default><geom contype="0" conaffinity="0"/></default>
+            <option integrator="implicitfast" solver="Newton" cone="pyramidal" jacobian="{jacobian}">
+            <flag sleep="enable" island="enable"/></option><worldbody>{body}</worldbody></mujoco>""",
+          nworld=1,
+          nconmax=16,
+          njmax=16,
+        )
+        model.opt.broadphase = types.BroadphaseType.NXN
+        model.opt.disableflags |= types.DisableBit.MULTICCD
+        model.opt.graph_conditional = True
+        if feature == "static":
+          self.assertEqual(model.ntree, 0)
+        elif feature == "ball":
+          np.testing.assert_array_equal(model.jnt_limited_ball_adr.numpy(), [0])
+        elif feature == "surface":
+          model.flg_surfacevel = True
+        elif feature == "adhesion":
+          model.flg_adhesion = True
+          self.assertEqual(model.nacttrnbody, 0)
+        elif feature == "rne":
+          model.opt.run_rne_postconstraint = True
+        elif feature == "dense":
+          self.assertFalse(model.is_sparse)
+          self.assertEqual(data.nvmax_pad, 64)
+        elif feature == "gathered":
+          self.assertTrue(any(tile.elemid.size for tile in model.M_tiles))
+        elif feature == "ldl":
+          self.assertGreater(data.qLD.shape[1], model.qLD_block_total)
+        if message is None:
+          self.assertTrue(step_workspace_layout(model, data, world_capacity=31))
+          continue
+        with (
+          patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")),
+          patch.object(solver, "_compact_solver_views", side_effect=AssertionError("Unexpected scratch planning")),
+          self.assertRaisesRegex(NotImplementedError, message),
+        ):
+          step_workspace_layout(model, data, world_capacity=31)
+        if feature in ("dense", "static"):
+          continue  # Sparse 108-DOF positive case is an independently authored model.
+        if feature == "ball":
+          model.opt.disableflags |= types.DisableBit.LIMIT
+        elif feature in ("surface", "adhesion"):
+          model.opt.disableflags |= types.DisableBit.CONTACT
+        elif feature == "rne":
+          model.opt.run_rne_postconstraint = False
+        else:
+          model.opt.disableflags |= types.DisableBit.ACTUATION | types.DisableBit.SPRING | types.DisableBit.DAMPER
+        self.assertTrue(step_workspace_layout(model, data, world_capacity=31))
 
   def test_unsupported_features_rejected_before_allocating(self):
     opt = SimpleNamespace(

@@ -186,7 +186,14 @@ def step_workspace_layout(
   sensors, cameras, lights, flex, tendons, fluid or SDF. Unsupported features fail
   before allocation. Specialized free-body implicit solves are unsupported unless
   actuation, springs and dampers are all disabled, so that solve is not executed.
+  Enabled ball limits, surface velocity, passive adhesion and postconstraint dynamics are
+  unsupported. Dense full Jacobians above 50 padded DOFs and derivative-enabled
+  gathered/sparse inertia factorizations also lack prepared count bindings.
+  At least one dynamic tree is required; the static-only island path is unbound.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
+  Every admitted runtime launch and world/candidate/CCD memory operation must
+  declare its observer domain. Route copies/fills through the workspace and reject
+  unsupported execution branches here before allocating any scratch.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
   storage. Omitted capacities use Data's current values. All capacities are positive
@@ -210,10 +217,33 @@ def step_workspace_layout(
   absent = (m.nflex, m.ntendon, m.nsensor, m.ncam, m.nlight, m.neq, m.nacttrnbody, m.nhfield, m.na, m.nhistory)
   if not all(required) or any(absent) or any(getattr(m.callback, f.name) is not None for f in dataclasses.fields(m.callback)):
     raise NotImplementedError("Prepared workspace supports native NxN sleeping Newton/implicit-fast keyboard features only")
+  if m.ntree == 0:
+    raise NotImplementedError("Prepared workspace requires at least one dynamic tree")
   # The specialized free-body implicit solve has no prepared count bindings.
   derivative_flags = types.DisableBit.ACTUATION | types.DisableBit.SPRING | types.DisableBit.DAMPER
   if m.body_freeadr.size and (m.opt.disableflags & derivative_flags) != derivative_flags:
     raise NotImplementedError("Prepared workspace does not support implicit-fast free-body solves")
+  if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
+    if m.jnt_limited_ball_adr.size and not (m.opt.disableflags & types.DisableBit.LIMIT):
+      raise NotImplementedError("Prepared workspace does not support enabled ball-joint limits")
+    if m.flg_surfacevel and not (m.opt.disableflags & types.DisableBit.CONTACT):
+      raise NotImplementedError("Prepared workspace does not support enabled contact surface velocity")
+  if m.opt.run_rne_postconstraint:
+    raise NotImplementedError("Prepared workspace does not support postconstraint inverse dynamics")
+  passive_flags = types.DisableBit.SPRING | types.DisableBit.DAMPER
+  if (
+    m.flg_adhesion
+    and m.nv > 0
+    and not (m.opt.disableflags & types.DisableBit.CONTACT)
+    and (m.opt.disableflags & passive_flags) != passive_flags
+  ):
+    raise NotImplementedError("Prepared workspace does not support enabled passive adhesion")
+  if not m.is_sparse and d.nvmax_pad > 50:
+    raise NotImplementedError("Prepared workspace does not support dense full Jacobians above 50 padded DOFs")
+  if (m.opt.disableflags & derivative_flags) != derivative_flags and (
+    any(tile.elemid.size for tile in m.M_tiles) or d.qLD.shape[1] > m.qLD_block_total
+  ):
+    raise NotImplementedError("Prepared workspace does not support gathered/sparse implicit inertia factorizations")
   if d.nworld < 1 or d.nvmax != m.nv:
     raise ValueError("Prepared workspace requires positive capacity and complete compact-DOF storage")
   if (

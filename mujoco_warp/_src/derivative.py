@@ -1239,7 +1239,10 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
       workspace.observe_launch(_qderiv_actuator_passive, (d.nworld, Mi.size), "world")
   else:
     # TODO(team): directly utilize M for these settings
-    wp.copy(out, d.M)
+    if workspace is None:
+      wp.copy(out, d.M)
+    else:
+      workspace.copy(out, d.M, "world")
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
     wp.launch(
