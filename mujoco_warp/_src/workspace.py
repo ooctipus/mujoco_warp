@@ -19,6 +19,12 @@ import dataclasses
 import math
 
 import warp as wp
+from gpu_components import fields as field_ops
+from gpu_components import graph as graph_ops
+from gpu_components.field_data import FieldStorage
+from gpu_components.graph_data import GraphKernelBinding
+from gpu_components.graph_data import GraphUpdateTable
+from gpu_components.graph_data import KernelParameterBinding
 
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
@@ -38,6 +44,223 @@ class WorkspaceFieldSpec:
   capacity_domain: str
 
 
+@dataclasses.dataclass(eq=False)
+class StepBindings:
+  """Borrowed native capacity domains and their single captured binding ledger.
+
+  Keep all three storage owners alive through graph retirement. World launches use
+  world_storage.protected_count; candidate and CCD launches use their ready_count.
+  Admission must keep those counts within physically ready rows. Set updates before
+  the first recorded operation. Only native binding operations mutate the ledgers
+  and recording snapshot; do not replace their storage or count sources. A composing
+  engine also sets recording_failed on application or capture failure. Never clear
+  this latch or publish a graph after it becomes true.
+  """
+
+  world_storage: FieldStorage
+  contact_storage: FieldStorage
+  ccd_storage: FieldStorage
+  updates: GraphUpdateTable | None = None
+  recording_failed: bool = False
+  bindings: list[GraphKernelBinding] = dataclasses.field(default_factory=list)
+  operations: list[dict] = dataclasses.field(default_factory=list)
+  _recording_binding: tuple | None = None
+
+
+def _binding_layout(bindings):
+  if bindings is None:
+    return None
+  return tuple(
+    (id(storage), storage.capacity, id(storage.device), id(count), _StepWorkspace._layout(count))
+    for storage, count in (
+      (bindings.world_storage, bindings.world_storage.protected_count),
+      (bindings.contact_storage, bindings.contact_storage.ready_count),
+      (bindings.ccd_storage, bindings.ccd_storage.ready_count),
+    )
+  ) + (id(bindings.bindings), id(bindings.operations))
+
+
+def _validate_bindings(bindings):
+  if not isinstance(bindings, StepBindings):
+    raise TypeError("Prepared bindings must be a native StepBindings record")
+  if bindings.recording_failed:
+    raise RuntimeError("The native step program has a failed recording")
+  if not all(
+    isinstance(storage, FieldStorage) for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
+  ):
+    raise TypeError("Native capacity domains must borrow FieldStorage records")
+  device = bindings.world_storage.device
+  for storage, count in (
+    (bindings.world_storage, bindings.world_storage.protected_count),
+    (bindings.contact_storage, bindings.contact_storage.ready_count),
+    (bindings.ccd_storage, bindings.ccd_storage.ready_count),
+  ):
+    if storage.closed or storage.service_failed:
+      raise RuntimeError("Native step storage is closed or quarantined")
+    if type(storage.capacity) is not int or not 0 < storage.capacity <= 2**31 - 1:
+      raise ValueError("Native storage capacity must be a positive int32 count")
+    if (
+      storage.device != device
+      or not isinstance(count, wp.array)
+      or count.device != device
+      or count.dtype != wp.int32
+      or count.shape != (1,)
+      or not count.is_contiguous
+    ):
+      raise ValueError("Native counts must be contiguous int32 scalars on the storage device")
+  updates = bindings.updates
+  if updates is not None and (
+    not isinstance(updates, GraphUpdateTable)
+    or updates.device != device
+    or updates.enable_count is not bindings.world_storage.protected_count
+    or updates.enable_count_maximum != bindings.world_storage.capacity
+  ):
+    raise ValueError("Native updates must use the exact world protected count and capacity")
+  if bindings._recording_binding is not None and bindings._recording_binding != (_binding_layout(bindings), id(updates)):
+    raise ValueError("Native recording binding changed; restore its original storage, counts, updates and ledgers")
+
+
+def validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains):
+  """Resolve native count declarations before emitting a launch; mutate no recording state.
+
+  A dynamic extent is the leading axis of world, candidate or CCD storage. Fixed
+  worker grids explicitly use extent_domain=None and extent_axis=None. Named int32
+  scalar arguments may independently use any of those domains. Returned descriptors
+  borrow their exact count arrays; parameter indices include Warp's launch bounds.
+  """
+  _validate_bindings(bindings)
+  owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
+  if extent_domain is not None and extent_domain not in owners:
+    raise ValueError(f"Unknown native extent domain: {extent_domain!r}")
+  if extent_domain is None and extent_axis is not None:
+    raise ValueError("A fixed worker grid must explicitly omit its extent axis")
+  if extent_domain is not None and (type(extent_axis) is not int or extent_axis != 0):
+    raise ValueError("Native dynamic extents require explicit leading axis zero")
+  if parameter_domains is not None and len(parameter_domains) > 4:
+    raise ValueError("A native launch supports at most four count parameters")
+  sources = {
+    name: (owner.protected_count if name == "world" else owner.ready_count, owner.capacity) for name, owner in owners.items()
+  }
+  labels = {argument.label: (index + 1, argument.type) for index, argument in enumerate(kernel.adj.args)}
+  parameters = []
+  for name, domain in (parameter_domains or {}).items():
+    if name not in labels or domain not in sources:
+      raise ValueError(f"Unknown native count argument or domain: {name!r}, {domain!r}")
+    index, dtype = labels[name]
+    if dtype not in (int, wp.int32):
+      raise ValueError(f"Native count argument must be int32: {name!r}")
+    parameters.append(KernelParameterBinding(index, *sources[domain]))
+  return sources[extent_domain][0] if extent_domain is not None else None, tuple(parameters)
+
+
+def _begin_recording(bindings):
+  if bindings.updates is None:
+    raise RuntimeError("Prepare native graph updates before recording step operations")
+  device = bindings.world_storage.device
+  graph = device.captures.get(wp.get_stream(device))
+  if graph is None:
+    raise RuntimeError("Record native step operations inside a Warp-managed graph capture")
+  if getattr(graph, "_preparation_failed", False):
+    raise RuntimeError("Discard this graph after failed preparation")
+  if bindings._recording_binding is None:
+    bindings._recording_binding = _binding_layout(bindings), id(bindings.updates)
+  owners = getattr(graph, "_resource_owners", ())
+  if not any(owner is bindings for owner in owners):
+    graph._resource_owners = (*owners, bindings)
+    for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
+      field_ops.retain_graph(storage, graph)
+
+
+def _fail_recording(bindings):
+  if not isinstance(bindings, StepBindings):
+    return
+  bindings.recording_failed = True
+  try:
+    device = (
+      bindings.updates.device
+      if isinstance(bindings.updates, GraphUpdateTable)
+      else bindings.world_storage.protected_count.device
+    )
+    graph = device.captures.get(wp.get_stream(device) if device.is_cuda else None)
+    if graph is not None:
+      graph._preparation_failed = True
+  except BaseException:
+    # A malformed borrowed descriptor must not mask the error that poisoned it.
+    # The composition root must also reject the native recording_failed latch.
+    pass
+
+
+def bind_step_launch(bindings, kernel, dim, extent_domain, *, extent_axis=0, parameter_domains=None):
+  """Bind the just-emitted native kernel and retain its explicit count sources.
+
+  Call validate_step_launch before emission when declarations come from callers.
+  Zero-sized operations claim no node. Any other failure poisons this binding
+  record and the active graph, because a launch may already have been emitted.
+  """
+  try:
+    extent, parameters = validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains)
+    dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
+    if not all(dimensions):
+      return
+    _begin_recording(bindings)
+    binding = GraphKernelBinding(
+      graph_ops.register_last_kernel_node(bindings.updates),
+      launch_rank=kernel.adj.kernel_dim,
+      extent_axis=extent_axis,
+      extent_source=extent,
+      parameters=parameters,
+    )
+    bindings.bindings.append(binding)
+    bindings.operations.append(
+      {
+        "operation": "launch",
+        "kernel": kernel.key,
+        "module": kernel.func.__module__,
+        "function": kernel.func.__qualname__,
+        "dim": list(dimensions),
+        "extent_domain": extent_domain,
+        "extent_axis": extent_axis,
+        "parameter_domains": dict(parameter_domains or {}),
+        "launch_rank": binding.launch_rank,
+        "node": binding.node,
+      }
+    )
+  except BaseException:
+    _fail_recording(bindings)
+    raise
+
+
+def _fill_step_rows(bindings, array, value, domain):
+  try:
+    _validate_bindings(bindings)
+    _begin_recording(bindings)
+    owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
+    if domain not in owners:
+      raise ValueError(f"Unknown native memory domain: {domain!r}")
+    owner = owners[domain]
+    field_ops.fill(owner, array, value, count=owner.protected_count if domain == "world" else owner.ready_count)
+    bindings.operations.append({"operation": "fill", "domain": domain, "field": field_ops.lookup(owner, array).name})
+  except BaseException:
+    _fail_recording(bindings)
+    raise
+
+
+def _copy_step_rows(bindings, destination, source, domain):
+  try:
+    _validate_bindings(bindings)
+    _begin_recording(bindings)
+    owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
+    if domain not in owners:
+      raise ValueError(f"Unknown native memory domain: {domain!r}")
+    owner = owners[domain]
+    field_ops.copy(owner, destination, source, count=owner.protected_count if domain == "world" else owner.ready_count)
+    field = field_ops.lookup(owner, destination) or field_ops.lookup(owner, source)
+    bindings.operations.append({"operation": "copy", "domain": domain, "field": field.name})
+  except BaseException:
+    _fail_recording(bindings)
+    raise
+
+
 class _StepWorkspace:
   """Internal owner of prepared scratch and borrowed native stage views.
 
@@ -48,10 +271,12 @@ class _StepWorkspace:
   provide only the original Model/Data and declared scratch descriptors.
   """
 
-  def __init__(self, model, data, world_live_count, specs, solver_model, solver_data, arrays=None, recorder=None):
-    self.model, self.data, self.world_live_count = model, data, world_live_count
-    self.recorder = recorder
-    self._execution_binding = world_live_count, self._layout(world_live_count), recorder
+  def __init__(self, model, data, specs, solver_model, solver_data, arrays=None, bindings=None):
+    self.model, self.data = model, data
+    self.world_live_count = None if bindings is None else bindings.world_storage.protected_count
+    self.bindings = bindings
+    self._execution_binding = self.world_live_count, self._layout(self.world_live_count), bindings
+    self._binding_layout = _binding_layout(bindings)
     self.device = data.qpos.device
     self._solver_model, self._solver_data = solver_model, solver_data
     self.arrays, self._ledger = {}, []
@@ -135,12 +360,15 @@ class _StepWorkspace:
 
   def validate(self, model, data):
     """Check binding before recording; GPU replay never calls this host method."""
-    _validate_execution_binding(self.world_live_count, self.recorder)
-    count, count_layout, recorder = self._execution_binding
+    count, count_layout, bindings = self._execution_binding
     if (
-      self.world_live_count is not count or self._layout(self.world_live_count) != count_layout or self.recorder is not recorder
+      self.world_live_count is not count or self._layout(self.world_live_count) != count_layout or self.bindings is not bindings
     ):
-      raise ValueError("Prepared execution binding changed; restore its original world count and recorder before recording")
+      raise ValueError("Prepared execution binding changed; restore its original count and bindings before recording")
+    if self.bindings is not None:
+      _validate_bindings(self.bindings)
+      if _binding_layout(self.bindings) != self._binding_layout:
+        raise ValueError("Prepared native storage or count descriptors changed; prepare a new workspace")
     if model is not self.model or data is not self.data:
       raise ValueError("Prepared workspace requires its original model, data and immutable step options")
     if self._layout(data) != self._data_layout or self._layout(model) != self._model_layout:
@@ -157,32 +385,32 @@ class _StepWorkspace:
     """Publish explicit count semantics after a native launch, during preparation.
 
     Dim only distinguishes an emitted launch from a zero-sized operation; it does
-    not identify a population domain. The recorder owns CUDA node bindings. Model,
+    not identify a population domain. StepBindings owns CUDA node bindings. Model,
     Data and this workspace already retain all allocation owners of the step.
     """
-    if self.recorder is None:
+    if self.bindings is None:
       return
     dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
     if any(size == 0 for size in dimensions):
       return
-    self.recorder.bind_launch(kernel, dim, extent_domain, extent_axis=extent_axis, parameter_domains=parameter_domains or {})
+    bind_step_launch(self.bindings, kernel, dim, extent_domain, extent_axis=extent_axis, parameter_domains=parameter_domains)
 
   def fill(self, array, value, domain):
-    """Fill an explicitly declared row domain, bounded by the recorder's count."""
+    """Fill an explicitly declared row domain, bounded by its native count source."""
     if array.size:
-      if self.recorder is None:
+      if self.bindings is None:
         array.fill_(value)
       else:
-        self.recorder.fill(array, value, domain)
+        _fill_step_rows(self.bindings, array, value, domain)
     return array
 
   def copy(self, destination, source, domain):
     """Copy an explicitly declared row domain without touching inactive rows."""
     if destination.size:
-      if self.recorder is None:
+      if self.bindings is None:
         wp.copy(destination, source)
       else:
-        self.recorder.copy(destination, source, domain)
+        _copy_step_rows(self.bindings, destination, source, domain)
 
   def memory_report(self):
     return {
@@ -209,7 +437,7 @@ def step_workspace_layout(
   At least one dynamic tree is required; the static-only island path is unbound.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
   Every admitted runtime launch and world/candidate/CCD memory operation must
-  declare its recorder domain. Route copies/fills through the workspace and reject
+  declare its native count domain. Route copies/fills through the workspace and reject
   unsupported execution branches here before allocating any scratch.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
@@ -329,16 +557,7 @@ def step_workspace_layout(
   return tuple(fields)
 
 
-def _validate_execution_binding(world_live_count, recorder):
-  if recorder is not None and not all(callable(getattr(recorder, name, None)) for name in ("bind_launch", "fill", "copy")):
-    raise TypeError("Prepared recorder must implement bind_launch, fill and copy")
-  if (world_live_count is None) != (recorder is None):
-    raise ValueError("Dynamic execution requires world_live_count and recorder together; fixed execution supplies neither")
-
-
-def make_step_workspace(
-  model: types.Model, data: types.Data, *, world_live_count=None, arrays=None, recorder=None
-) -> _StepWorkspace:
+def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bindings=None) -> _StepWorkspace:
   """Prepare a workspace with caller-owned typed scratch or fixed scratch allocated here.
 
   This is the sole public workspace construction operation. The returned owner
@@ -352,34 +571,37 @@ def make_step_workspace(
   Blocked Cholesky matrices (Data.cM/cqLD and solver.h/hfactor on the blocked
   Newton path) require 16-byte-aligned bases and both world and matrix-row strides.
   Scalar counters and nonblocked/empty matrices retain their natural alignment.
-  Fixed execution supplies neither world_live_count nor recorder. Dynamic execution
-  supplies both: world_live_count is a CUDA int32 scalar in [0, data.nworld], enforced
-  by admission, and recorder implements bind_launch, fill and copy. The recorder
-  must bind every declared world launch to that same count, with independent
-  candidate/CCD counts, and bound row operations in the caller's graph program.
-  The count descriptor, execution mode and recorder identity are fixed at preparation.
-  A temporarily detached recorder must be restored before recording any step.
-  The recorder runs only at declared
-  stage sites; no global Warp dispatch is replaced.
+  Fixed execution supplies bindings=None. Dynamic execution borrows StepBindings;
+  its world protected count is the sole world-live-count source. Admission enforces
+  values in [0, data.nworld] and physically ready rows; candidate and CCD extents use
+  their independent storage ready counts. Native operations bind declared launches
+  and bound row operations in the caller's graph program. Keep the borrowed storage
+  owners alive through graph retirement. Binding identity, storage, count descriptors
+  and capacities are fixed at preparation. Set bindings.updates before recording;
+  the updater identity is fixed at the first recorded operation. Temporarily detached
+  bindings must be restored before recording any step. Only declared stage sites
+  invoke binding operations; no global Warp dispatch is replaced.
   """
   if not data.qpos.device.is_cuda:
     raise ValueError("Prepared step workspace currently requires CUDA")
   if wp.get_stream(data.qpos.device).is_capturing:
     raise RuntimeError("Prepare native step workspace before graph capture")
-  _validate_execution_binding(world_live_count, recorder)
+  if bindings is not None:
+    _validate_bindings(bindings)
+    if bindings.world_storage.device != data.qpos.device:
+      raise ValueError("Native storage must use the Data device")
+    for storage, name in (
+      (bindings.world_storage, "nworld"),
+      (bindings.contact_storage, "naconmax"),
+      (bindings.ccd_storage, "naccdmax"),
+    ):
+      if storage.capacity != getattr(data, name):
+        raise ValueError(f"Native storage capacity must equal Data.{name}")
   specs = step_workspace_layout(model, data)
   for name in ("cM", "cqLD"):
     array = getattr(data, name)
     # The compact smooth solve always uses explicitly aligned blocked matrices.
     if array.size and (array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16):
       raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: Data.{name}")
-  if world_live_count is not None and (
-    not isinstance(world_live_count, wp.array)
-    or world_live_count.dtype != wp.int32
-    or world_live_count.shape != (1,)
-    or not world_live_count.is_contiguous
-    or world_live_count.device != data.qpos.device
-  ):
-    raise ValueError("World live count must be one contiguous int32 scalar on the Data device")
   m2, d2 = solver._compact_solver_views(model, data)
-  return _StepWorkspace(model, data, world_live_count, specs, m2, d2, arrays=arrays, recorder=recorder)
+  return _StepWorkspace(model, data, specs, m2, d2, arrays=arrays, bindings=bindings)

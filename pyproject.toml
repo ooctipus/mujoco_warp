@@ -29,6 +29,7 @@ requires-python = ">=3.10"
 dependencies = [
     "absl-py",
     "etils[epath]",
+    "gpu-components>=0.1.0",
     "mujoco>=3.12.0",
     "numpy",
     "warp-lang>=1.15",
@@ -45,6 +46,8 @@ url = "https://py.mujoco.org/"
 explicit = true
 
 [tool.uv.sources]
+# Development checkout for the unpublished component extraction.
+gpu-components = {path = "../../gpu-components", editable = true}
 warp-lang = {index = "nvidia"}
 mujoco = {index = "mujoco"}
 
