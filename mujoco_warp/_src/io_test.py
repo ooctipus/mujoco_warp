@@ -16,8 +16,10 @@
 """Tests for io functions."""
 
 import dataclasses
+import gc
 import tempfile
 import warnings
+import weakref
 from unittest import mock
 
 import mujoco
@@ -445,6 +447,588 @@ _MESH_RANDOMIZE_XML = """
 
 
 class IOTest(parameterized.TestCase):
+  def test_array_fields_and_replacement_share_one_native_domain(self):
+    """Keep annotation semantics, nested paths, aliases and source metadata during binding."""
+
+    @dataclasses.dataclass
+    class Leaf:
+      values: types.array("nworld", float)
+      label: int = 9
+
+    @dataclasses.dataclass
+    class Record:
+      nworld: int
+      nested: tuple
+      topology: tuple[types.array("nbody", float), ...]
+      parameters: list[types.array("*", float)]
+      empty: list
+
+    original = wp.zeros(2, dtype=float, device="cpu")
+    source = Record(1, (Leaf(original), [original, (Leaf(original),)]), (original,), [original], [])
+    expected = {
+      "nested[0].values": ("nworld",),
+      "nested[1][0]": (),
+      "nested[1][1][0].values": ("nworld",),
+      "topology[0]": ("nbody",),
+      "parameters[0]": ("*",),
+    }
+    with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("device readback")):
+      self.assertEqual({name: shape for name, _, shape in io.array_fields(source)}, expected)
+      replacements = {name: wp.ones(3, dtype=float, device="cpu") for name in expected}
+      replaced = io.replace_arrays(source, replacements)
+    self.assertEqual(replaced.nworld, 1)
+    self.assertEqual(replaced.nested[0].label, 9)
+    self.assertIsInstance(replaced.nested, tuple)
+    self.assertIsInstance(replaced.nested[1], list)
+    self.assertEqual(replaced.empty, [])
+    for name, array, shape in io.array_fields(replaced):
+      self.assertIs(array, replacements[name], name)
+      self.assertEqual(shape, expected[name])
+    for _, array, _ in io.array_fields(source):
+      self.assertIs(array, original)
+    partial = io.replace_arrays(source, {"nested[0].values": replacements["nested[0].values"]})
+    self.assertIs(partial.topology[0], original)
+    self.assertIsNot(partial.nested, source.nested)
+    for invalid in ({"nested[2]": original}, {"nworld": original}):
+      with self.assertRaisesRegex(ValueError, "unknown native array fields"):
+        io.replace_arrays(source, invalid)
+    for invalid in (None, wp.zeros(2, dtype=int, device="cpu"), wp.zeros((1, 2), dtype=float, device="cpu")):
+      with self.assertRaisesRegex(ValueError, "dtype and rank"):
+        io.replace_arrays(source, {"nested[0].values": invalid})
+
+  def test_array_fields_rejects_unsupported_record_structure(self):
+    """Reject mutable metadata and malformed fixed tuple annotations before rebinding."""
+
+    @dataclasses.dataclass
+    class Record:
+      arrays: tuple[types.array("nworld", float)]
+
+    array = wp.zeros(1, dtype=float, device="cpu")
+    self.assertEqual(next(io.array_fields(Record((array,))))[2], ("nworld",))
+    with self.assertRaisesRegex(ValueError, "tuple annotation"):
+      tuple(io.array_fields(Record((array, array))))
+    for invalid in ({"field": array}, {1}, np.zeros(1)):
+      with self.assertRaisesRegex(TypeError, "Unsupported mutable native field"):
+        tuple(io.array_fields(invalid))
+      with self.assertRaisesRegex(TypeError, "Unsupported mutable native field"):
+        io.replace_arrays(invalid, {})
+
+  @parameterized.parameters(("dense", False), ("sparse", True))
+  def test_copy_worlds_preserves_snapshot_and_continuation(self, jacobian, sleeping):
+    """Move real contacting worlds, including nonempty actuator delay history."""
+    cpu_model = mujoco.MjModel.from_xml_string(f"""
+      <mujoco><option jacobian="{jacobian}" integrator="implicitfast">
+        <flag sleep="{"enable" if sleeping else "disable"}"/>
+      </option><worldbody><geom type="plane" size="3 3 .1"/>
+        <body pos="0 0 .08"><freejoint/><geom type="sphere" size=".1" mass="1"/></body>
+        <body pos=".5 0 .4"><joint name="slider" type="slide" axis="0 0 1"/>
+          <geom size=".1" mass="1"/></body>
+      </worldbody><actuator><general joint="slider" dyntype="filter" dynprm=".03"
+        delay=".02" nsample="3" interp="linear"/></actuator></mujoco>""")
+    initial = mujoco.MjData(cpu_model)
+    mujoco.mj_forward(cpu_model, initial)
+    prototype_model = mjwarp.put_model(cpu_model)
+    prototype_data = mjwarp.put_data(cpu_model, initial, nconmax=16, njmax=64)
+    src_model, dst_model = mjwarp.replicate_model(prototype_model, 3), mjwarp.replicate_model(prototype_model, 5)
+    src, dst = mjwarp.replicate_data(prototype_data, 3), mjwarp.replicate_data(prototype_data, 5)
+    src.ctrl.assign(np.array([[0.3], [0.6], [0.9]], dtype=np.float32))
+    dst.ctrl.fill_(-0.2)
+    for _ in range(8):
+      mjwarp.step(src_model, src)
+    for _ in range(3):
+      mjwarp.step(dst_model, dst)
+    self.assertGreater(src.history.size, 0)
+    self.assertGreater(src.act.size, 0)
+    self.assertGreater(src.nacon.numpy()[0], 0)
+    if sleeping:
+      sleep_mask = np.zeros((3, src_model.ntree), dtype=np.int32)
+      sleep_mask[0, -1] = 1
+      mjwarp.set_sleep_policy(src_model, src, wp.array(sleep_mask, dtype=int), types.SleepPolicy.ALWAYS)
+      self.assertGreaterEqual(src.tree_asleep.numpy()[0, -1], 0)
+    source_ids, target_ids = [2, 0], [1, 4]
+    source_rows = wp.array(source_ids, dtype=int)
+    target_rows = wp.array(target_ids, dtype=int)
+    before = [
+      (name, a.numpy().copy(), b.numpy().copy(), b)
+      for name, a, b in io._world_copy_fields(src_model, dst_model, 3, 5) + io._world_copy_fields(src, dst, 3, 5)
+    ]
+    contact_before = {field.name: getattr(dst.contact, field.name).numpy().copy() for field in dataclasses.fields(dst.contact)}
+    source_contacts = {field.name: getattr(src.contact, field.name).numpy().copy() for field in dataclasses.fields(src.contact)}
+    nsrc, ndst = int(src.nacon.numpy()[0]), int(dst.nacon.numpy()[0])
+    keep_dst = np.flatnonzero(~np.isin(contact_before["worldid"][:ndst], target_ids))
+    keep_src = np.flatnonzero(np.isin(source_contacts["worldid"][:nsrc], source_ids))
+    dst_efc, src_efc = dst.efc.id.numpy().copy(), src.efc.id.numpy().copy()
+    with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("physics readback")):
+      status = mjwarp.copy_worlds(src_model, src, dst_model, dst, source_rows, target_rows)
+    np.testing.assert_array_equal(status.numpy(), 0)
+    for name, source_value, old_value, target in before:
+      if name == "efc.id":
+        continue
+      expected = old_value.copy()
+      expected[target_ids] = source_value[np.array(source_ids) % len(source_value)]
+      np.testing.assert_array_equal(target.numpy(), expected, err_msg=name)
+    new_count = len(keep_dst) + len(keep_src)
+    np.testing.assert_array_equal(dst.nacon.numpy(), new_count)
+    for name, previous in contact_before.items():
+      if not previous.size:
+        continue
+      expected = np.concatenate((previous[keep_dst], source_contacts[name][keep_src]))
+      if name == "worldid":
+        mapping = dict(zip(source_ids, target_ids, strict=True))
+        expected[len(keep_dst) :] = [mapping[int(x)] for x in expected[len(keep_dst) :]]
+      np.testing.assert_array_equal(getattr(dst.contact, name).numpy()[:new_count], expected, err_msg=name)
+    source_contact_map = {old: new + len(keep_dst) for new, old in enumerate(keep_src)}
+    target_contact_map = {old: new for new, old in enumerate(keep_dst)}
+    dst_kinds, dst_nefc = dst.efc.type.numpy(), dst.nefc.numpy()
+    expected_ids = dst_efc.copy()
+    for old, new in zip(source_ids, target_ids, strict=True):
+      expected_ids[new] = src_efc[old]
+    for world in range(5):
+      remap = source_contact_map if world in target_ids else target_contact_map
+      for row in range(dst_nefc[world]):
+        if dst_kinds[world, row] >= int(types.ConstraintType.CONTACT_FRICTIONLESS):
+          expected_ids[world, row] = remap[expected_ids[world, row]]
+    np.testing.assert_array_equal(dst.efc.id.numpy(), expected_ids)
+    # Source remains live and is the continuation oracle for the transferred rows.
+    for _ in range(8):
+      mjwarp.step(src_model, src)
+      mjwarp.step(dst_model, dst)
+      for name in ("qpos", "qvel", "act", "history", "time", "qacc_warmstart"):
+        np.testing.assert_allclose(
+          getattr(dst, name).numpy()[target_ids], getattr(src, name).numpy()[source_ids], atol=2e-5, rtol=2e-5, err_msg=name
+        )
+      np.testing.assert_array_equal(dst.tree_asleep.numpy()[target_ids], src.tree_asleep.numpy()[source_ids])
+
+  @parameterized.parameters(([0, 0], [0, 1], 1), ([0, 1], [0, 0], 1), ([-1], [0], 1), ([0], [2], 1))
+  def test_copy_worlds_invalid_mapping_is_atomic(self, source_ids, target_ids, error):
+    model = mujoco.MjModel.from_xml_string("<mujoco><worldbody><body><freejoint/><geom size='.1'/></body></worldbody></mujoco>")
+    prototype = mjwarp.put_model(model)
+    prepared = mjwarp.make_data(model, nconmax=4, njmax=8)
+    sm, tm = mjwarp.replicate_model(prototype, 2), mjwarp.replicate_model(prototype, 2)
+    sd, td = mjwarp.replicate_data(prepared, 2), mjwarp.replicate_data(prepared, 2)
+    sd.qpos.fill_(7.0)
+    before = td.qpos.numpy().copy()
+    status = mjwarp.copy_worlds(sm, sd, tm, td, wp.array(source_ids, dtype=int), wp.array(target_ids, dtype=int))
+    self.assertEqual(int(status.numpy()[0]), error)
+    np.testing.assert_array_equal(td.qpos.numpy(), before)
+
+  @parameterized.parameters((3, False, 4), (5, False, 6), (1, True, 2))
+  def test_copy_worlds_invalid_contact_state_is_atomic(self, count, bad_constraint, error):
+    """A valid source population may still exceed a smaller destination's capacity."""
+    model = mujoco.MjModel.from_xml_string("<mujoco><worldbody><body><freejoint/><geom size='.1'/></body></worldbody></mujoco>")
+    prototype = mjwarp.put_model(model)
+    prepared = mjwarp.make_data(model, nconmax=2, njmax=8)
+    sm, tm = mjwarp.replicate_model(prototype, 2), mjwarp.replicate_model(prototype, 1)
+    sd, td = mjwarp.replicate_data(prepared, 2), mjwarp.replicate_data(prepared, 1)
+    sd.qpos.fill_(7.0)
+    sd.nacon.fill_(count)
+    sd.contact.worldid.zero_()
+    if bad_constraint:
+      sd.nefc.fill_(1)
+      sd.efc.type.fill_(int(types.ConstraintType.CONTACT_FRICTIONLESS))
+      sd.efc.id.fill_(sd.naconmax)
+    before = [
+      (dst, dst.numpy().copy()) for _, _, dst in io._world_copy_fields(sm, tm, 2, 1) + io._world_copy_fields(sd, td, 2, 1)
+    ]
+    before.extend(
+      (getattr(td.contact, field.name), getattr(td.contact, field.name).numpy().copy())
+      for field in dataclasses.fields(td.contact)
+    )
+    before.append((td.nacon, td.nacon.numpy().copy()))
+    with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("physics readback")):
+      status = mjwarp.copy_worlds(sm, sd, tm, td, wp.array([0], dtype=int), wp.array([0], dtype=int))
+    self.assertEqual(int(status.numpy()[0]), error)
+    for array, value in before:
+      np.testing.assert_array_equal(array.numpy(), value)
+
+  @parameterized.parameters(("world", True), ("world", False), ("contact", True), ("contact", False))
+  def test_copy_worlds_rejects_strided_storage_before_mutation(self, kind, is_source):
+    model = mujoco.MjModel.from_xml_string("<mujoco><worldbody><body><freejoint/><geom size='.1'/></body></worldbody></mujoco>")
+    prototype = mjwarp.put_model(model)
+    prepared = mjwarp.make_data(model, nconmax=2, njmax=8)
+    sm, tm = mjwarp.replicate_model(prototype, 2), mjwarp.replicate_model(prototype, 3)
+    sd, td = mjwarp.replicate_data(prepared, 2), mjwarp.replicate_data(prepared, 3)
+    data = sd if is_source else td
+    owner, name = (data, "qpos") if kind == "world" else (data.contact, "pos")
+    value = getattr(owner, name)
+    setattr(owner, name, wp.array(np.repeat(value.numpy(), 2, axis=0), dtype=value.dtype)[::2])
+    self.assertFalse(getattr(owner, name).is_contiguous)
+    before = (td.qpos.numpy().copy(), td.efc.id.numpy().copy(), td.contact.pos.numpy().copy())
+    src_ids, dst_ids = wp.array([0], dtype=int), wp.array([1], dtype=int)
+    with mock.patch.object(wp, "launch", side_effect=AssertionError("launched before validation")):
+      with self.assertRaisesRegex(ValueError, "must be contiguous"):
+        mjwarp.copy_worlds(sm, sd, tm, td, src_ids, dst_ids)
+    for value, expected in zip((td.qpos, td.efc.id, td.contact.pos), before, strict=True):
+      np.testing.assert_array_equal(value.numpy(), expected)
+
+  @parameterized.parameters((wp.uint8, np.uint8, 5, 0), (wp.uint16, np.uint16, 6, 1), (wp.float64, np.float64, 5, 0))
+  def test_copy_worlds_packed_units_and_broadcast(self, dtype, numpy_dtype, width, offset):
+    """Cover odd row widths, unaligned views, broadcast sources and failed copies."""
+    if not wp.get_device().is_cuda:
+      self.skipTest("Packed row copies require CUDA")
+    for nsource in (1, 3):
+      values = np.arange(nsource * width + offset, dtype=numpy_dtype)[offset:].reshape(nsource, width)
+      storage = wp.array(np.arange(nsource * width + offset, dtype=numpy_dtype), dtype=dtype)
+      source = storage[offset:].reshape((nsource, width))
+      target_storage = wp.full(5 * width + offset, 17, dtype=dtype)
+      target = target_storage[offset:].reshape((5, width))
+      src_ids, dst_ids, status = wp.array([2, 0], dtype=int), wp.array([1, 4], dtype=int), wp.zeros(1, dtype=int)
+      with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("physics readback")):
+        self.assertTrue(io._world_copy_packed_rows([("value", source, target)], src_ids, dst_ids, status, 5))
+      expected = np.full((5, width), 17, dtype=numpy_dtype)
+      expected[[1, 4]] = values[np.array([2, 0]) % nsource]
+      np.testing.assert_array_equal(target.numpy().view(np.uint8), expected.view(np.uint8))
+      status.fill_(1)
+      source.zero_()
+      self.assertTrue(io._world_copy_packed_rows([("value", source, target)], src_ids, dst_ids, status, 5))
+      np.testing.assert_array_equal(target.numpy().view(np.uint8), expected.view(np.uint8))
+
+  def test_copy_worlds_packed_capture_status_owns_descriptors(self):
+    """Ordinary Graph does not own Python upload storage: the retained status must."""
+    if not wp.get_device().is_cuda:
+      self.skipTest("Capture requires CUDA")
+
+    def capture_temporary_inputs():
+      source = wp.array(np.arange(19, dtype=np.uint16), dtype=wp.uint16)[1:].reshape((3, 6))
+      target = wp.full((5, 6), 17, dtype=wp.uint16)
+      src_ids, dst_ids, status = wp.array([2, 0], dtype=int), wp.array([1, 4], dtype=int), wp.zeros(1, dtype=int)
+      with wp.ScopedCapture() as capture:
+        self.assertTrue(io._world_copy_packed_rows([("value", source, target)], src_ids, dst_ids, status, 5))
+      resources = [weakref.ref(value) for value in status._world_copy_storage]
+      return capture.graph, status, target, weakref.ref(source), resources
+
+    graph, status, target, source, resources = capture_temporary_inputs()
+    gc.collect()
+    self.assertIsInstance(graph, wp.Graph)
+    self.assertTrue(all(value() is not None for value in resources))
+    self.assertIsNotNone(source())
+    wp.capture_launch(graph)
+    expected = np.full((5, 6), 17, dtype=np.uint16)
+    expected[[1, 4]] = np.arange(1, 19, dtype=np.uint16).reshape(3, 6)[[2, 0]]
+    np.testing.assert_array_equal(target.numpy(), expected)
+    source().fill_(9)
+    wp.capture_launch(graph)
+    expected[[1, 4]] = 9
+    np.testing.assert_array_equal(target.numpy(), expected)
+    wp.synchronize_device()
+    status_ref = weakref.ref(status)
+    del graph, status
+    gc.collect()
+    self.assertIsNone(status_ref())
+    self.assertIsNone(source())
+
+  def test_copy_worlds_capture_replays_live_indices_and_contacts(self):
+    if not wp.get_device().is_cuda:
+      self.skipTest("Capture requires CUDA")
+    model = mujoco.MjModel.from_xml_string("<mujoco><worldbody><body><freejoint/><geom size='.1'/></body></worldbody></mujoco>")
+    prototype = mjwarp.put_model(model)
+    prepared = mjwarp.make_data(model, nconmax=2, njmax=8)
+    sm, tm = mjwarp.replicate_model(prototype, 2), mjwarp.replicate_model(prototype, 3)
+    sd, td = mjwarp.replicate_data(prepared, 2), mjwarp.replicate_data(prepared, 3)
+    # Index vectors use direct indexing and can retain arbitrary row strides.
+    src_ids, dst_ids = wp.array([0, -1], dtype=int)[::2], wp.array([1, -1], dtype=int)[::2]
+    with wp.ScopedCapture(device=sd.qpos.device) as capture:
+      status = mjwarp.copy_worlds(sm, sd, tm, td, src_ids, dst_ids)
+    for src, dst, count in ((0, 1, 1), (1, 2, 0), (0, 0, 2)):
+      src_ids.fill_(src)
+      dst_ids.fill_(dst)
+      sd.nacon.fill_(count)
+      sd.contact.worldid.fill_(src)
+      sd.qpos.fill_(float(2 + src + dst))
+      wp.capture_launch(capture.graph)
+      np.testing.assert_array_equal(status.numpy(), 0)
+      np.testing.assert_array_equal(td.qpos.numpy()[dst], sd.qpos.numpy()[src])
+      valid_worlds = td.contact.worldid.numpy()[: td.nacon.numpy()[0]]
+      self.assertEqual(np.count_nonzero(valid_worlds == dst), count)
+
+  @parameterized.parameters(("dense", False), ("sparse", True))
+  def test_replicate_prepared_world(self, jacobian, sleeping):
+    """Replicate contacts and derived state without entering host preparation."""
+    model = mujoco.MjModel.from_xml_string(f"""
+      <mujoco><option jacobian="{jacobian}" integrator="implicitfast">
+        <flag sleep="{"enable" if sleeping else "disable"}"/>
+      </option><worldbody>
+        <geom type="plane" size="2 2 .1"/>
+        <body pos="0 0 .08"><freejoint/><geom type="sphere" size=".1" mass="1"/></body>
+        <body pos=".4 0 1"><joint type="slide" axis="0 0 1"/><geom size=".1" mass="1"/></body>
+      </worldbody></mujoco>""")
+    initial = mujoco.MjData(model)
+    mujoco.mj_forward(model, initial)
+    source_model = mjwarp.put_model(model)
+    source = mjwarp.put_data(model, initial, nconmax=8, njmax=32)
+    expected = mjwarp.put_data(model, initial, nworld=3, nconmax=8, njmax=32)
+    self.assertGreater(initial.ncon, 0)
+    snapshot = source.qpos.numpy().copy()
+    with (
+      mock.patch.object(io, "put_model", side_effect=AssertionError("host model construction")),
+      mock.patch.object(io, "put_data", side_effect=AssertionError("host data construction")),
+      mock.patch.object(io, "make_data", side_effect=AssertionError("host allocation preparation")),
+      mock.patch.object(wp.array, "numpy", side_effect=AssertionError("GPU readback")),
+      mock.patch.object(mujoco, "mj_kinematics", side_effect=AssertionError("CPU kinematics")),
+    ):
+      replica_model = mjwarp.replicate_model(source_model, 3)
+      replica = mjwarp.replicate_data(source, 3)
+    self.assertIsNot(replica_model.opt, source_model.opt)
+    self.assertNotEqual(replica_model.body_mass.ptr, source_model.body_mass.ptr)
+    self.assertNotEqual(replica.qpos.ptr, source.qpos.ptr)
+    self.assertEqual(replica.nworld, 3)
+    self.assertEqual(replica.naconmax, 24)
+    for name in ("qpos", "qvel", "geom_xpos", "xmat", "M", "qLD", "tree_asleep", "body_awake"):
+      np.testing.assert_allclose(getattr(replica, name).numpy(), getattr(expected, name).numpy(), err_msg=name)
+    np.testing.assert_array_equal(replica.contact.worldid.numpy()[: initial.ncon * 3], np.repeat(np.arange(3), initial.ncon))
+    np.testing.assert_array_equal(replica.nacon.numpy(), initial.ncon * 3)
+    for world in range(3):
+      contact_rows = source.efc.type.numpy()[0, : initial.nefc] >= int(types.ConstraintType.CONTACT_FRICTIONLESS)
+      wanted_ids = source.efc.id.numpy()[0, : initial.nefc].copy()
+      wanted_ids[contact_rows] += world * initial.ncon
+      np.testing.assert_array_equal(replica.efc.id.numpy()[world, : initial.nefc], wanted_ids)
+    for _ in range(3):
+      mjwarp.step(replica_model, replica)
+      mjwarp.step(source_model, expected)
+    np.testing.assert_allclose(replica.qpos.numpy(), expected.qpos.numpy(), atol=1e-6)
+    np.testing.assert_allclose(replica.qvel.numpy(), expected.qvel.numpy(), atol=1e-6)
+    np.testing.assert_array_equal(source.qpos.numpy(), snapshot)
+    replica_model.body_mass.fill_(2.0)
+    np.testing.assert_array_equal(source_model.body_mass.numpy()[0], model.body_mass.astype(np.float32))
+    with self.assertRaisesRegex(ValueError, "one-world"):
+      mjwarp.replicate_data(replica, 2)
+    source_model.callback.control = lambda m, d: None
+    with self.assertRaisesRegex(ValueError, "callbacks"):
+      mjwarp.replicate_model(source_model, 2)
+    if source.qpos.device.is_cuda:
+      with wp.ScopedCapture(device=source.qpos.device) as capture:
+        captured = mjwarp.replicate_data(source, 2)
+      wp.capture_launch(capture.graph)
+      np.testing.assert_array_equal(captured.qpos.numpy(), np.repeat(snapshot, 2, axis=0))
+      source.qpos.fill_(2.0)
+      wp.capture_launch(capture.graph)
+      np.testing.assert_array_equal(captured.qpos.numpy(), 2.0)
+
+  def test_replicate_model_all_fields_and_plan_refresh(self):
+    """Preserve every schema field while caching only live source descriptors."""
+    cpu_model = mujoco.MjModel.from_xml_string(_MESH_RANDOMIZE_XML)
+    source = mjwarp.put_model(cpu_model)
+
+    def arrays(value, path="", repeated=False):
+      if dataclasses.is_dataclass(value):
+        for field in dataclasses.fields(value):
+          dims = getattr(field.type, "shape", ())
+          yield from arrays(getattr(value, field.name), f"{path}.{field.name}", bool(dims and dims[0] in ("*", "nworld")))
+      elif isinstance(value, wp.array):
+        yield path, value, repeated
+      elif isinstance(value, tuple):
+        for index, item in enumerate(value):
+          yield from arrays(item, f"{path}[{index}]")
+
+    for count in (3, 5):
+      with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("physics readback")):
+        replica = mjwarp.replicate_model(source, count)
+      for (path, original, repeated), (result_path, actual, _) in zip(arrays(source), arrays(replica), strict=True):
+        self.assertEqual(path, result_path)
+        self.assertIsNot(original, actual)
+        self.assertEqual(original.dtype, actual.dtype)
+        expected = np.repeat(original.numpy(), count, axis=0) if repeated and original.shape[0] else original.numpy()
+        np.testing.assert_array_equal(actual.numpy(), expected, err_msg=path)
+        if actual.size:
+          self.assertNotEqual(actual.ptr, original.ptr)
+      self.assertIsNot(replica.opt, source.opt)
+    if not source.body_mass.device.is_cuda:
+      return
+    first_plan = source._replication_copy_plan
+    source.body_mass.fill_(3.0)
+    replica = mjwarp.replicate_model(source, 2)
+    self.assertIs(source._replication_copy_plan, first_plan)
+    np.testing.assert_array_equal(replica.body_mass.numpy(), 3.0)
+    source.body_mass = wp.clone(source.body_mass)
+    source.body_mass.fill_(7.0)
+    replica = mjwarp.replicate_model(source, 2)
+    self.assertIsNot(source._replication_copy_plan, first_plan)
+    np.testing.assert_array_equal(replica.body_mass.numpy(), 7.0)
+    self.assertFalse(hasattr(source._replication_copy_plan, "nworld"))
+
+  def test_replicate_model_fallback_releases_source_plan(self):
+    """Fallback releases stale source descriptors while existing replicas retain their owners."""
+    source = mjwarp.put_model(mujoco.MjModel.from_xml_string(_MESH_RANDOMIZE_XML))
+    if not source.mesh_vert.device.is_cuda:
+      self.skipTest("CUDA packed source plans")
+    original = source.mesh_vert.numpy().copy()
+    first = mjwarp.replicate_model(source, 2)
+    plan_ref, array_ref = weakref.ref(source._replication_copy_plan), weakref.ref(source.mesh_vert)
+    source.mesh_vert = wp.array(np.repeat(original, 2, axis=0), dtype=wp.vec3, device=source.mesh_vert.device)[::2]
+    fallback = mjwarp.replicate_model(source, 3)
+    wp.synchronize_device(source.mesh_vert.device)
+    self.assertFalse(hasattr(source, "_replication_copy_plan"))
+    gc.collect()
+    self.assertIsNotNone(plan_ref())
+    self.assertIsNotNone(array_ref())
+    np.testing.assert_array_equal(first.mesh_vert.numpy(), original)
+    np.testing.assert_array_equal(fallback.mesh_vert.numpy(), original)
+    del first
+    gc.collect()
+    self.assertIsNone(plan_ref())
+    self.assertIsNone(array_ref())
+    source.mesh_vert = wp.array(original, dtype=wp.vec3, device=source.mesh_vert.device)
+    next_replica = mjwarp.replicate_model(source, 4)
+    self.assertTrue(hasattr(source, "_replication_copy_plan"))
+    np.testing.assert_array_equal(next_replica.mesh_vert.numpy(), original)
+
+  def test_replicate_model_captured_first_plan_and_view_lifetime(self):
+    """A first-use captured plan retains metadata uploads and individual views own storage."""
+    source = mjwarp.put_model(mujoco.MjModel.from_xml_string(_MESH_RANDOMIZE_XML))
+    if not source.body_mass.device.is_cuda:
+      self.skipTest("CUDA graph storage lifetime")
+    # Load the kernels before capture, but rebuild the plan during capture itself.
+    temporary = mjwarp.replicate_model(source, 2)
+    del temporary, source._replication_copy_plan
+    with wp.ScopedCapture(device=source.body_mass.device) as capture:
+      captured = mjwarp.replicate_model(source, 2)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(captured.body_mass.numpy(), np.repeat(source.body_mass.numpy(), 2, axis=0))
+    source.body_mass.fill_(5.0)
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(captured.body_mass.numpy(), 5.0)
+    # A downstream view may outlive its model; the public array deleter retains its arena.
+    owned = mjwarp.replicate_model(source, 3)
+    view = owned.body_mass
+    owner = next(
+      weakref.ref(storage)
+      for storage in owned._replication_storage
+      if isinstance(storage, wp.array) and storage.ptr <= view.ptr < storage.ptr + storage.capacity
+    )
+    del owned
+    gc.collect()
+    self.assertIsNotNone(owner())
+    np.testing.assert_array_equal(view.numpy(), 5.0)
+    del view
+    gc.collect()
+    self.assertIsNone(owner())
+
+  @parameterized.parameters(0, -1, True, 1.5)
+  def test_replicate_invalid_count(self, count):
+    """Reject invalid sizes before touching device storage."""
+    with self.assertRaisesRegex(ValueError, "positive integer"):
+      mjwarp.replicate_model(None, count)
+
+  @parameterized.parameters(("dense", False), ("sparse", True))
+  def test_replicate_data_every_snapshot_field(self, jacobian, sleeping):
+    """Copy the live bytes of all Data fields, including history and contact tails."""
+    cpu_model = mujoco.MjModel.from_xml_string(f"""
+      <mujoco><option jacobian="{jacobian}" integrator="implicitfast">
+        <flag sleep="{"enable" if sleeping else "disable"}"/>
+      </option><worldbody><geom type="plane" size="3 3 .1"/>
+        <body pos="0 0 .08"><freejoint/><geom type="sphere" size=".1" mass="1"/></body>
+        <body pos=".5 0 .4"><joint name="slider" type="slide" axis="0 0 1"/>
+          <geom size=".1" mass="1"/></body>
+      </worldbody><actuator><general joint="slider" dyntype="filter" dynprm=".03"
+        delay=".02" nsample="3" interp="linear"/></actuator></mujoco>""")
+    initial = mujoco.MjData(cpu_model)
+    mujoco.mj_forward(cpu_model, initial)
+    model = mjwarp.put_model(cpu_model)
+    source = mjwarp.put_data(cpu_model, initial, nconmax=16, njmax=64)
+    source.ctrl.fill_(0.7)
+    for _ in range(8):
+      mjwarp.step(model, source)
+    self.assertGreater(source.history.size, 0)
+    self.assertGreater(source.act.size, 0)
+    count, active, nefc = 3, int(source.nacon.numpy()[0]), int(source.nefc.numpy()[0])
+    self.assertGreater(active, 0)
+    with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("physics readback")):
+      replica = mjwarp.replicate_data(source, count)
+
+    def check(original, copied, path=""):
+      for field in dataclasses.fields(original):
+        src, dst = getattr(original, field.name), getattr(copied, field.name)
+        name = f"{path}.{field.name}"
+        if dataclasses.is_dataclass(src):
+          check(src, dst, name)
+        elif isinstance(src, wp.array):
+          dims = getattr(field.type, "shape", ())
+          repeated = bool(dims and dims[0] in ("*", "nworld"))
+          expected = np.repeat(src.numpy(), count, axis=0) if repeated and src.shape[0] else src.numpy().copy()
+          if original is source.contact:
+            expected = np.zeros_like(dst.numpy())
+            if field.name == "worldid":
+              expected[: active * count] = np.repeat(np.arange(count), active)
+            elif src.size:
+              expected[: active * count] = np.tile(src.numpy()[:active], (count,) + (1,) * (expected.ndim - 1))
+          elif original is source and field.name in ("nacon", "ncollision"):
+            expected *= count
+          elif original is source.efc and field.name == "id":
+            rows = source.efc.type.numpy()[0, :nefc] >= int(types.ConstraintType.CONTACT_FRICTIONLESS)
+            for world in range(count):
+              expected[world, :nefc][rows] += world * active
+          self.assertEqual(src.dtype, dst.dtype, name)
+          self.assertEqual(expected.shape, dst.numpy().shape, name)
+          np.testing.assert_array_equal(dst.numpy().view(np.uint8), expected.view(np.uint8), err_msg=name)
+          self.assertIsNot(src, dst, name)
+          if src.size:
+            self.assertNotEqual(src.ptr, dst.ptr, name)
+
+    check(source, replica)
+    self.assertEqual(replica.nworld, count)
+    self.assertEqual(replica.naconmax, source.naconmax * count)
+    self.assertEqual(replica.naccdmax, source.naccdmax * count)
+    if source.qpos.device.is_cuda:
+      first_plan = source._replication_copy_plan
+      source.history.fill_(3.0)
+      updated = mjwarp.replicate_data(source, 2)
+      self.assertIs(source._replication_copy_plan, first_plan)
+      np.testing.assert_array_equal(updated.history.numpy(), 3.0)
+      source.history = wp.clone(source.history)
+      source.history.fill_(7.0)
+      updated = mjwarp.replicate_data(source, 2)
+      self.assertIsNot(source._replication_copy_plan, first_plan)
+      np.testing.assert_array_equal(updated.history.numpy(), 7.0)
+
+  @parameterized.parameters((0, 0), (3, 0), (3, 1), (3, 3))
+  def test_replicate_contact_snapshot(self, capacity, count):
+    """Copy every contact field, clear unused capacity, and replay dynamic counts."""
+    model = mujoco.MjModel.from_xml_string("""
+      <mujoco><worldbody><body><freejoint/><geom size=".1" mass="1"/></body></worldbody></mujoco>""")
+    source = mjwarp.make_data(model, nconmax=capacity, njmax=8)
+    for index, field in enumerate(dataclasses.fields(source.contact)):
+      value = getattr(source.contact, field.name)
+      if value.size:
+        value.fill_(value.dtype(index + 1))
+    source.contact.worldid.zero_()
+    source.nacon.fill_(count)
+    source.ncollision.fill_(5)
+    source.nefc.fill_(2)
+    source.efc.id.fill_(7)
+    source.efc.type.fill_(int(types.ConstraintType.CONTACT_FRICTIONLESS))
+
+    def assert_snapshot(replica, expected_count):
+      np.testing.assert_array_equal(replica.nacon.numpy(), expected_count * 3)
+      np.testing.assert_array_equal(replica.ncollision.numpy(), 15)
+      for field in dataclasses.fields(source.contact):
+        value = getattr(source.contact, field.name)
+        target = getattr(replica.contact, field.name)
+        if value.size:
+          self.assertNotEqual(value.ptr, target.ptr, field.name)
+        expected = np.zeros_like(target.numpy())
+        if field.name == "worldid":
+          expected[: expected_count * 3] = np.repeat(np.arange(3), expected_count)
+        elif value.size:
+          expected[: expected_count * 3] = np.tile(value.numpy()[:expected_count], (3,) + (1,) * (expected.ndim - 1))
+        np.testing.assert_array_equal(target.numpy(), expected, err_msg=field.name)
+      expected_ids = np.tile(source.efc.id.numpy(), (3, 1))
+      for world in range(3):
+        expected_ids[world, : source.nefc.numpy()[0]] += world * expected_count
+      np.testing.assert_array_equal(replica.efc.id.numpy(), expected_ids)
+
+    with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("GPU readback")):
+      replica = mjwarp.replicate_data(source, 3)
+    assert_snapshot(replica, count)
+    if source.qpos.device.is_cuda:
+      del source._replication_copy_plan  # Exercise first-use metadata ownership inside capture.
+      with wp.ScopedCapture(device=source.qpos.device) as capture:
+        captured = mjwarp.replicate_data(source, 3)
+      for next_count in (capacity, 0, min(1, capacity)):
+        source.nacon.fill_(next_count)
+        source.nefc.fill_(next_count)
+        wp.capture_launch(capture.graph)
+        assert_snapshot(captured, next_count)
+
   @parameterized.named_parameters(
     dict(
       testcase_name="control_timestamps",

@@ -14,8 +14,9 @@
 # ==============================================================================
 
 import dataclasses
+import functools
 import warnings
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, get_args, get_origin
 
 import mujoco
 import numpy as np
@@ -34,6 +35,1009 @@ from mujoco_warp._src.set_const import set_const_spring as set_const_spring
 from mujoco_warp._src.set_const import set_length_range as set_length_range
 
 wp.set_module_options({"default_grid_stride": False})
+
+
+def array_fields(source):
+  """Yield borrowed arrays as ``(path, array, declared_shape)`` in declaration order.
+
+  Experimental. Traverse native dataclasses, tuples and lists without reading device data.
+  Paths identify bindings, including indexed entries such as ``M_tiles[0].elemid``. Dimensions
+  come from the existing native type annotations, never from equal numerical extents. An
+  unannotated array has an empty declared shape. Every declared occurrence is returned even
+  when multiple fields alias one array; this enumeration does not assign storage ownership.
+  Unsupported mutable metadata is rejected rather than silently omitting its arrays.
+  """
+
+  def visit(value, path, annotation=None):
+    if isinstance(value, wp.array):
+      yield path, value, tuple(getattr(annotation, "shape", ()))
+    elif dataclasses.is_dataclass(value):
+      for field in dataclasses.fields(value):
+        name = f"{path}.{field.name}" if path else field.name
+        yield from visit(getattr(value, field.name), name, field.type)
+    elif isinstance(value, (tuple, list)):
+      args = get_args(annotation)
+      repeated_type = get_origin(annotation) is list or (len(args) == 2 and args[1] is Ellipsis)
+      if args and not repeated_type and len(args) != len(value):
+        raise ValueError(f"Native tuple annotation does not match field length: {path}")
+      for index, child in enumerate(value):
+        item_type = args[0] if repeated_type else args[index] if args else None
+        yield from visit(child, f"{path}[{index}]", item_type)
+    elif isinstance(value, (dict, set, np.ndarray)):
+      raise TypeError(f"Unsupported mutable native field at {path}: {type(value).__name__}")
+
+  yield from visit(source, "")
+
+
+def replace_arrays(source, arrays):
+  """Return the native record tree with specified array bindings replaced.
+
+  Experimental. Keys must be paths from ``array_fields(source)``. Replacements retain the
+  existing dtype and rank; dimensions and device may change. Unspecified arrays and scalar
+  metadata are borrowed unchanged, while dataclass, tuple and list containers are rebuilt.
+  No payload is allocated, copied or validated for physics readiness. Change scalar metadata
+  explicitly with ``dataclasses.replace``; this operation only binds existing array fields.
+  """
+  declared = {path: array for path, array, _ in array_fields(source)}
+  unknown = set(arrays) - declared.keys()
+  if unknown:
+    raise ValueError(f"Cannot bind unknown native array fields: {sorted(unknown)}")
+  for path, array in arrays.items():
+    if not isinstance(array, wp.array) or (array.dtype, array.ndim) != (declared[path].dtype, declared[path].ndim):
+      raise ValueError(f"Replacement must retain native array dtype and rank: {path}")
+
+  def bind(value, path):
+    if path in arrays:
+      return arrays[path]
+    if dataclasses.is_dataclass(value):
+      return dataclasses.replace(
+        value,
+        **{
+          field.name: bind(getattr(value, field.name), f"{path}.{field.name}" if path else field.name)
+          for field in dataclasses.fields(value)
+        },
+      )
+    if isinstance(value, (tuple, list)):
+      return type(value)(bind(child, f"{path}[{index}]") for index, child in enumerate(value))
+    return value
+
+  return bind(source, "")
+
+
+@wp.kernel
+def _repeat_array(source: wp.array[Any], target_out: wp.array[Any]):
+  i = wp.tid()
+  target_out[i] = source[i % source.shape[0]]
+
+
+@functools.cache
+def _repeat_array_kernel(dtype):
+  """Resolve array types once without retaining population storage."""
+  return wp.overload(_repeat_array, [wp.array[dtype], wp.array[dtype]])
+
+
+@wp.kernel
+def _repeat_contact_array(
+  # Data in:
+  nworld_in: int,
+  nacon_in: wp.array[int],
+  # In:
+  source: wp.array[Any],
+  width: int,
+  zero: Any,
+  # Out:
+  target_out: wp.array[Any],
+):
+  i = wp.tid()
+  size = wp.min(nacon_in[0] * width, source.shape[0])
+  if i < size * nworld_in:
+    target_out[i] = source[i % size]
+  else:
+    target_out[i] = zero
+
+
+@wp.kernel
+def _repeat_contact_indices(
+  # Data in:
+  nworld_in: int,
+  nacon_in: wp.array[int],
+  ncollision_in: wp.array[int],
+  # Data out:
+  nacon_out: wp.array[int],
+  ncollision_out: wp.array[int],
+  # Out:
+  worldid_out: wp.array[int],
+):
+  i = wp.tid()
+  count = wp.min(nacon_in[0], worldid_out.shape[0] // nworld_in)
+  if i == 0:
+    nacon_out[0] = count * nworld_in
+    ncollision_out[0] = ncollision_in[0] * nworld_in
+  if i < count * nworld_in:
+    worldid_out[i] = i // count
+  elif i < worldid_out.shape[0]:
+    worldid_out[i] = 0
+
+
+@wp.kernel
+def _repeat_constraint_contact_ids(
+  # Data in:
+  nefc_in: wp.array[int],
+  nacon_in: wp.array[int],
+  # In:
+  kind: wp.array2d[int],
+  source: wp.array2d[int],
+  # Out:
+  ids_out: wp.array2d[int],
+):
+  world, row = wp.tid()
+  value = source[0, row]
+  if row < nefc_in[0] and kind[0, row] >= int(types.ConstraintType.CONTACT_FRICTIONLESS):
+    value += world * nacon_in[0]
+  ids_out[world, row] = value
+
+
+def _replicate_device_fields(source, nworld: int, overrides=None):
+  """Copy native fields, expanding the explicitly declared world axes."""
+  overrides, arrays = overrides or {}, {}
+  for name, value, shape in array_fields(source):
+    if name.split(".", 1)[0].split("[", 1)[0] in overrides:
+      continue
+    if shape and shape[0] in ("*", "nworld") and value.shape[0]:
+      if value.shape[0] != 1:
+        raise ValueError(f"Replication requires a one-world source: {name} has shape {value.shape}")
+      target = wp.empty((nworld, *value.shape[1:]), dtype=value.dtype, device=value.device)
+      if target.size:
+        wp.launch(_repeat_array_kernel(value.dtype), target.size, [value.flatten()], [target.flatten()], device=value.device)
+      arrays[name] = target
+    else:
+      arrays[name] = wp.clone(value)
+  return dataclasses.replace(replace_arrays(source, arrays), **overrides)
+
+
+@wp.struct
+class _CopyWords:
+  values: wp.array[wp.uint32]
+  count: int
+  mode: int
+  width: int
+
+
+@wp.struct
+class _CopyBytes:
+  values: wp.array[wp.uint8]
+  count: int
+  mode: int
+  width: int
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _device_copy_offsets(
+  # Data in:
+  nworld_in: int,
+  # In:
+  fields: wp.array[Any],
+  unit: int,
+  # Out:
+  offsets_out: wp.array[wp.int64],
+):
+  total = wp.int64(0)
+  for i in range(fields.shape[0]):
+    offsets_out[i] = total
+    count = wp.int64(fields[i].count)
+    if fields[i].mode != 0:
+      count *= wp.int64(nworld_in)
+    total += ((count * wp.int64(unit) + wp.int64(255)) // wp.int64(256)) * wp.int64(256 // unit)
+  offsets_out[fields.shape[0]] = total
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _device_copy_words(
+  # Data in:
+  nworld_in: int,
+  nacon_in: wp.array[int],
+  # In:
+  fields: wp.array[_CopyWords],
+  offsets: wp.array[wp.int64],
+  # Out:
+  target_out: wp.array[wp.vec4ui],
+):
+  thread = wp.tid()
+  i = wp.int64(thread) * wp.int64(4)
+  lo, hi = int(0), fields.shape[0]
+  while lo + 1 < hi:
+    mid = (lo + hi) // 2
+    if i < offsets[mid]:
+      hi = mid
+    else:
+      lo = mid
+  field = fields[lo]
+  local = wp.int32(i - offsets[lo])
+  count = field.count
+  if field.mode == 2:
+    count = wp.min(nacon_in[0], field.count // field.width) * field.width
+  limit = count * wp.where(field.mode != 0, nworld_in, 1)
+  value = wp.vec4ui(0)
+  for component in range(4):
+    if local + component < limit:
+      value[component] = field.values[(local + component) % count]
+  target_out[thread] = value
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _device_copy_bytes(
+  # Data in:
+  nworld_in: int,
+  nacon_in: wp.array[int],
+  # In:
+  fields: wp.array[_CopyBytes],
+  offsets: wp.array[wp.int64],
+  # Out:
+  target_out: wp.array[wp.uint8],
+):
+  i = wp.int64(wp.tid())
+  lo, hi = int(0), fields.shape[0]
+  while lo + 1 < hi:
+    mid = (lo + hi) // 2
+    if i < offsets[mid]:
+      hi = mid
+    else:
+      lo = mid
+  field = fields[lo]
+  local = wp.int32(i - offsets[lo])
+  count = field.count
+  if field.mode == 2:
+    count = wp.min(nacon_in[0], field.count // field.width) * field.width
+  if local < count * wp.where(field.mode != 0, nworld_in, 1):
+    target_out[i] = field.values[local % count]
+  else:
+    target_out[i] = wp.uint8(0)
+
+
+class _DeviceCopyPlan:
+  """Source-owned array descriptors; no population sizes or physics snapshots are cached."""
+
+  def __init__(self, arrays, signature):
+    self.signature = signature
+    self.arrays = arrays  # Retain every live source buffer referenced by the device descriptors.
+    self.groups = []
+    device = arrays[0][0].device
+    for unit, dtype, struct in ((4, wp.uint32, _CopyWords), (1, wp.uint8, _CopyBytes)):
+      records, descriptors = [], []
+      for index, (value, mode, nbytes, field_unit) in enumerate(arrays):
+        if not nbytes or field_unit != unit:
+          continue
+        descriptor = struct()
+        descriptor.values = wp.array(ptr=value.ptr, shape=nbytes // unit, dtype=dtype, device=device)
+        descriptor.count = nbytes // unit
+        descriptor.mode = mode
+        descriptor.width = descriptor.count // value.shape[0] if mode == 2 else 0
+        descriptors.append(descriptor)
+        records.append((index, value, mode, nbytes))
+      if not records:
+        continue
+      # First use can itself be captured: retain upload storage for graph replay.
+      host = wp.array(descriptors, dtype=struct, device="cpu")
+      fields = wp.empty(len(descriptors), dtype=struct, device=device)
+      wp.copy(fields, host)
+      offset_kernel = wp.overload(_device_copy_offsets, [int, wp.array[struct], int, wp.array[wp.int64]])
+      self.groups.append((unit, dtype, records, fields, host, offset_kernel))
+
+  def copy(self, source, nworld, overrides=None, nacon=None):
+    arrays, owners = [None] * len(self.arrays), [self]
+    for unit, dtype, records, fields, _host, offset_kernel in self.groups:
+      offsets, total = [], 0
+      for _, _, mode, nbytes in records:
+        offsets.append(total)
+        total += ((nbytes * (nworld if mode else 1) + 255) // 256) * (256 // unit)
+      arena = wp.empty(total, dtype=dtype, device=fields.device)
+      owners.append(arena)
+
+      def retain_arena(_ptr, _size, owner=arena):
+        pass
+
+      for offset, (index, value, mode, nbytes) in zip(offsets, records, strict=True):
+        shape = (value.shape[0] * nworld, *value.shape[1:]) if mode else value.shape
+        arrays[index] = wp.array(
+          ptr=arena.ptr + offset * unit,
+          shape=shape,
+          dtype=value.dtype,
+          capacity=nbytes * (nworld if mode else 1),
+          device=fields.device,
+          deleter=retain_arena,
+        )
+      device_offsets = wp.empty(len(records) + 1, dtype=wp.int64, device=fields.device)
+      owners.append(device_offsets)
+      wp.launch(offset_kernel, 1, [nworld, fields, unit], [device_offsets], device=fields.device)
+      if unit == 4:
+        wp.launch(
+          _device_copy_words,
+          total // 4,
+          [nworld, nacon, fields, device_offsets],
+          [arena.reshape((-1, 4)).view(wp.vec4ui)],
+          device=fields.device,
+        )
+      else:
+        wp.launch(_device_copy_bytes, total, [nworld, nacon, fields, device_offsets], [arena], device=fields.device)
+    for index, (value, mode, _, _) in enumerate(self.arrays):
+      if arrays[index] is None:
+        shape = (value.shape[0] * nworld, *value.shape[1:]) if mode else value.shape
+        arrays[index] = wp.empty(shape, dtype=value.dtype, device=value.device)
+    replacements = {name: array for (name, _, _), array in zip(array_fields(source), arrays, strict=True)}
+    result = dataclasses.replace(replace_arrays(source, replacements), **(overrides or {}))
+    result._replication_storage = tuple(owners)
+    return result
+
+
+def _packed_device_fields(source, nworld, overrides=None, nacon=None):
+  """Use exact aligned arenas when storage permits a byte-preserving CUDA copy."""
+  # Contact fields repeat only their valid shared prefix; native world axes repeat full rows.
+  fields = tuple(
+    (value, 2 if nacon is not None and name.startswith("contact.") else int(bool(shape and shape[0] in ("*", "nworld"))))
+    for name, value, shape in array_fields(source)
+  )
+  for value, mode in fields:
+    if mode == 1 and value.shape[0] not in (0, 1):
+      raise ValueError(f"Replication requires a one-world source, got shape {value.shape}")
+  if not fields or any(
+    value.device != fields[0][0].device or not value.device.is_cuda or not value.is_contiguous or value.requires_grad
+    for value, _ in fields
+  ):
+    vars(source).pop("_replication_copy_plan", None)
+    return None
+  arrays, totals = [], {1: 0, 4: 0}
+  for value, mode in fields:
+    nbytes = value.size * value.strides[-1]
+    rowbytes = nbytes // value.shape[0] if mode == 2 and value.shape[0] else nbytes
+    unit = 4 if rowbytes % 4 == 0 else 1
+    count = nbytes // unit * (nworld if mode else 1)
+    # Local field offsets and launch indices use int32; arena byte offsets are int64.
+    # Large overall Data storage is supported without truncating an individual field.
+    if count >= 2**31 - 256:
+      vars(source).pop("_replication_copy_plan", None)
+      return None
+    totals[unit] += ((count * unit + 255) // 256) * (256 // unit)
+    arrays.append((value, mode, nbytes, unit))
+  if totals[4] // 4 >= 2**31 or totals[1] >= 2**31:
+    vars(source).pop("_replication_copy_plan", None)
+    return None
+  signature = tuple((id(value), value.ptr, value.shape, value.strides, value.dtype, mode) for value, mode in fields)
+  plan = getattr(source, "_replication_copy_plan", None)
+  if plan is None or plan.signature != signature:
+    plan = source._replication_copy_plan = _DeviceCopyPlan(tuple(arrays), signature)
+  return plan.copy(source, nworld, overrides, nacon)
+
+
+def replicate_model(model: types.Model, nworld: int) -> types.Model:
+  """Expand a prepared one-world model on its device without compilation or readbacks.
+
+  Experimental. All arrays and nested options are independently owned. Batched fields
+  expand to ``nworld``; topology and geometry arrays are copied without recomputation.
+  Callbacks are rejected because they may retain references to the source population.
+  Allocation and Python metadata construction still execute on the host.
+  """
+  if isinstance(nworld, bool) or not isinstance(nworld, (int, np.integer)) or nworld < 1:
+    raise ValueError("nworld must be a positive integer")
+  if any(getattr(model.callback, field.name) is not None for field in dataclasses.fields(model.callback)):
+    raise ValueError("Replication does not support model callbacks")
+  nworld = int(nworld)
+  result = _packed_device_fields(model, nworld)
+  if result is None:
+    result = _replicate_device_fields(model, nworld)
+  warp_util.mark_batched(result)
+  return result
+
+
+def replicate_data(data: types.Data, nworld: int) -> types.Data:
+  """Expand a prepared one-world state on its device without host reconstruction.
+
+  Experimental. Copy world-local derived state, sleeping state, constraints and valid
+  contacts. Contact IDs are rebased into the new shared contact buffer. Per-world
+  capacities remain unchanged; total contact and CCD capacities grow with ``nworld``.
+  The source must have no contact overflow. All destination arrays are independent.
+  This copies a snapshot; it does not reset an episode or copy a captured graph.
+  """
+  if data.nworld != 1:
+    raise ValueError("Replication requires a one-world Data source")
+  if isinstance(nworld, bool) or not isinstance(nworld, (int, np.integer)) or nworld < 1:
+    raise ValueError("nworld must be a positive integer")
+  nworld = int(nworld)
+  result = _packed_device_fields(
+    data,
+    nworld,
+    dict(nworld=nworld, naconmax=data.naconmax * nworld, naccdmax=data.naccdmax * nworld),
+    nacon=data.nacon,
+  )
+  if result is None:
+    # Contact storage has one shared valid prefix, unlike world-local Data fields.
+    # Exclude it from generic replication so no intermediate contact copy is allocated.
+    contact = {}
+    for field in dataclasses.fields(data.contact):
+      value = getattr(data.contact, field.name)
+      target = wp.empty((value.shape[0] * nworld, *value.shape[1:]), dtype=value.dtype, device=value.device)
+      if value.size and field.name != "worldid":
+        width = value.size // value.shape[0]
+        wp.launch(
+          _repeat_contact_array,
+          target.size,
+          [nworld, data.nacon, value.flatten(), width, value.dtype()],
+          [target.flatten()],
+          device=value.device,
+        )
+      contact[field.name] = target
+    # Fuse ID rebasing into the initial copy; neither IDs nor counters need an
+    # intermediate repeated value before their final initialization.
+    efc_ids = wp.empty((nworld, *data.efc.id.shape[1:]), dtype=int, device=data.efc.id.device)
+    result = _replicate_device_fields(
+      data,
+      nworld,
+      dict(
+        contact=types.Contact(**contact),
+        efc=_replicate_device_fields(data.efc, nworld, dict(id=efc_ids)),
+        nacon=wp.empty_like(data.nacon),
+        ncollision=wp.empty_like(data.ncollision),
+        nworld=nworld,
+        naconmax=data.naconmax * nworld,
+        naccdmax=data.naccdmax * nworld,
+      ),
+    )
+  if result.efc.id.size:
+    wp.launch(
+      _repeat_constraint_contact_ids,
+      result.efc.id.shape,
+      [data.nefc, data.nacon, data.efc.type, data.efc.id],
+      [result.efc.id],
+      device=data.nacon.device,
+    )
+  wp.launch(
+    _repeat_contact_indices,
+    max(1, result.naconmax),
+    [nworld, data.nacon, data.ncollision],
+    [result.nacon, result.ncollision, result.contact.worldid],
+    device=data.nacon.device,
+  )
+  warp_util.mark_batched(result)
+  return result
+
+
+@wp.kernel
+def _world_copy_maps(
+  # In:
+  source_ids: wp.array[int],
+  target_ids: wp.array[int],
+  # Out:
+  source_map_out: wp.array[int],
+  target_map_out: wp.array[int],
+  status_out: wp.array[int],
+):
+  i = wp.tid()
+  src, dst = source_ids[i], target_ids[i]
+  if src < 0 or src >= source_map_out.shape[0] or dst < 0 or dst >= target_map_out.shape[0]:
+    wp.atomic_or(status_out, 0, 1)
+    return
+  if wp.atomic_cas(source_map_out, src, -1, dst) != -1 or wp.atomic_cas(target_map_out, dst, -1, src) != -1:
+    wp.atomic_or(status_out, 0, 1)
+
+
+@wp.kernel
+def _world_copy_contact_flags(
+  # In:
+  source_count: wp.array[int],
+  target_count: wp.array[int],
+  source_worlds: wp.array[int],
+  target_worlds: wp.array[int],
+  source_map: wp.array[int],
+  target_map: wp.array[int],
+  # Out:
+  flags_out: wp.array[int],
+  status_out: wp.array[int],
+):
+  i = wp.tid()
+  flags_out[i] = 0
+  if i == 0:
+    if source_count[0] < 0 or source_count[0] > source_worlds.shape[0]:
+      wp.atomic_or(status_out, 0, 2)
+    if target_count[0] < 0 or target_count[0] > target_worlds.shape[0]:
+      wp.atomic_or(status_out, 0, 2)
+  if i < target_worlds.shape[0]:
+    if i < target_count[0]:
+      world = target_worlds[i]
+      if world < 0 or world >= target_map.shape[0]:
+        wp.atomic_or(status_out, 0, 2)
+      elif target_map[world] < 0:
+        flags_out[i] = 1
+  else:
+    cid = i - target_worlds.shape[0]
+    if cid < source_worlds.shape[0] and cid < source_count[0]:
+      world = source_worlds[cid]
+      if world < 0 or world >= source_map.shape[0]:
+        wp.atomic_or(status_out, 0, 2)
+      elif source_map[world] >= 0:
+        flags_out[i] = 1
+
+
+@wp.kernel
+def _world_copy_capacity(prefix: wp.array[int], capacity: int, status_out: wp.array[int]):
+  if prefix[prefix.shape[0] - 1] > capacity:
+    wp.atomic_or(status_out, 0, 4)
+
+
+@wp.kernel
+def _world_copy_validate_constraints(
+  # Data in:
+  nefc_in: wp.array[int],
+  nacon_in: wp.array[int],
+  # In:
+  kind: wp.array2d[int],
+  ids: wp.array2d[int],
+  contact_worlds: wp.array[int],
+  world_map: wp.array[int],
+  selected: bool,
+  # Out:
+  status_out: wp.array[int],
+):
+  world, row = wp.tid()
+  if (world_map[world] >= 0) != selected:
+    return
+  if nefc_in[world] < 0 or nefc_in[world] > ids.shape[1]:
+    wp.atomic_or(status_out, 0, 2)
+  if row < nefc_in[world] and kind[world, row] >= int(types.ConstraintType.CONTACT_FRICTIONLESS):
+    cid = ids[world, row]
+    if cid < 0 or cid >= nacon_in[0] or cid >= contact_worlds.shape[0]:
+      wp.atomic_or(status_out, 0, 2)
+    elif contact_worlds[cid] != world:
+      wp.atomic_or(status_out, 0, 2)
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _world_copy_rows(
+  # In:
+  source: wp.array[Any],
+  source_ids: wp.array[int],
+  target_ids: wp.array[int],
+  source_worlds: int,
+  width: int,
+  status: wp.array[int],
+  # Out:
+  target_out: wp.array[Any],
+):
+  pair, column = wp.tid()
+  if status[0] == 0:
+    target_out[target_ids[pair] * width + column] = source[(source_ids[pair] % source_worlds) * width + column]
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _world_copy_contact_values(
+  # In:
+  source: wp.array[Any],
+  previous: wp.array[Any],
+  width: int,
+  flags: wp.array[int],
+  prefix: wp.array[int],
+  status: wp.array[int],
+  # Out:
+  target_out: wp.array[Any],
+):
+  cid, column = wp.tid()
+  if status[0] != 0 or flags[cid] == 0:
+    return
+  offset = (prefix[cid] - 1) * width + column
+  if cid < previous.shape[0] // width:
+    target_out[offset] = previous[cid * width + column]
+  else:
+    target_out[offset] = source[cid * width + column - previous.shape[0]]
+
+
+@wp.kernel
+def _world_copy_contact_worlds(
+  # In:
+  source: wp.array[int],
+  previous: wp.array[int],
+  source_map: wp.array[int],
+  flags: wp.array[int],
+  prefix: wp.array[int],
+  status: wp.array[int],
+  # Out:
+  target_out: wp.array[int],
+):
+  cid = wp.tid()
+  if status[0] != 0 or flags[cid] == 0:
+    return
+  if cid < previous.shape[0]:
+    target_out[prefix[cid] - 1] = previous[cid]
+  else:
+    target_out[prefix[cid] - 1] = source_map[source[cid - previous.shape[0]]]
+
+
+@wp.kernel
+def _world_copy_constraint_ids(
+  # In:
+  source_ids: wp.array2d[int],
+  source_types: wp.array2d[int],
+  source_nefc: wp.array[int],
+  target_map: wp.array[int],
+  prefix: wp.array[int],
+  previous_capacity: int,
+  status: wp.array[int],
+  target_nefc: wp.array[int],
+  target_types: wp.array2d[int],
+  # Out:
+  target_ids_out: wp.array2d[int],
+):
+  world, row = wp.tid()
+  if status[0] != 0:
+    return
+  src = target_map[world]
+  if src >= 0:
+    value = source_ids[src, row]
+    if row < source_nefc[src] and source_types[src, row] >= int(types.ConstraintType.CONTACT_FRICTIONLESS):
+      value = prefix[previous_capacity + value] - 1
+    target_ids_out[world, row] = value
+  elif row < target_nefc[world] and target_types[world, row] >= int(types.ConstraintType.CONTACT_FRICTIONLESS):
+    target_ids_out[world, row] = prefix[target_ids_out[world, row]] - 1
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _world_copy_commit_contact(source: wp.array[Any], status: wp.array[int], target_out: wp.array[Any]):
+  i = wp.tid()
+  if status[0] == 0:
+    target_out[i] = source[i]
+
+
+@wp.kernel
+def _world_copy_commit_counts(
+  prefix: wp.array[int], status: wp.array[int], nacon_out: wp.array[int], ncollision_out: wp.array[int]
+):
+  if status[0] == 0:
+    nacon_out[0] = prefix[prefix.shape[0] - 1]
+    # This counter describes the previous global broadphase, not a world state.
+    # Native collision detection overwrites it before the next integration.
+    ncollision_out[0] = 0
+
+
+@functools.cache
+def _world_copy_rows_kernel(dtype):
+  return wp.overload(
+    _world_copy_rows, [wp.array[dtype], wp.array[int], wp.array[int], int, int, wp.array[int], wp.array[dtype]]
+  )
+
+
+@functools.cache
+def _world_copy_contact_kernel(dtype):
+  return wp.overload(
+    _world_copy_contact_values,
+    [wp.array[dtype], wp.array[dtype], int, wp.array[int], wp.array[int], wp.array[int], wp.array[dtype]],
+  )
+
+
+@functools.cache
+def _world_copy_commit_kernel(dtype):
+  return wp.overload(_world_copy_commit_contact, [wp.array[dtype], wp.array[int], wp.array[dtype]])
+
+
+@wp.struct
+class _WorldCopyWords:
+  source: wp.array[wp.uint32]
+  target: wp.array[wp.uint32]
+  width: int
+  source_worlds: int
+
+
+@wp.struct
+class _WorldCopyBytes:
+  source: wp.array[wp.uint8]
+  target: wp.array[wp.uint8]
+  width: int
+  source_worlds: int
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _world_copy_words(
+  # In:
+  fields: wp.array[_WorldCopyWords],
+  offsets: wp.array[wp.int64],
+  source_ids: wp.array[int],
+  target_ids: wp.array[int],
+  status: wp.array[int],
+):
+  actor, chunk = wp.tid()
+  if status[0] != 0:
+    return
+  column = wp.int64(chunk) * wp.int64(4)
+  lo, hi = int(0), fields.shape[0]
+  while lo + 1 < hi:
+    mid = (lo + hi) // 2
+    if column < offsets[mid]:
+      hi = mid
+    else:
+      lo = mid
+  field = fields[lo]
+  local = wp.int32(column - offsets[lo])
+  src = wp.int64(wp.where(field.source_worlds == 1, 0, source_ids[actor])) * wp.int64(field.width)
+  dst = wp.int64(target_ids[actor]) * wp.int64(field.width)
+  for component in range(4):
+    if local + component < field.width:
+      field.target[dst + wp.int64(local + component)] = field.source[src + wp.int64(local + component)]
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _world_copy_bytes(
+  # In:
+  fields: wp.array[_WorldCopyBytes],
+  offsets: wp.array[wp.int64],
+  source_ids: wp.array[int],
+  target_ids: wp.array[int],
+  status: wp.array[int],
+):
+  actor, column = wp.tid()
+  if status[0] != 0:
+    return
+  lo, hi = int(0), fields.shape[0]
+  while lo + 1 < hi:
+    mid = (lo + hi) // 2
+    if wp.int64(column) < offsets[mid]:
+      hi = mid
+    else:
+      lo = mid
+  field = fields[lo]
+  local = wp.int32(wp.int64(column) - offsets[lo])
+  src = wp.int64(wp.where(field.source_worlds == 1, 0, source_ids[actor])) * wp.int64(field.width)
+  dst = wp.int64(target_ids[actor]) * wp.int64(field.width)
+  field.target[dst + wp.int64(local)] = field.source[src + wp.int64(local)]
+
+
+def _world_copy_packed_rows(fields, source_ids, target_ids, status, nworld):
+  """Fuse validated CUDA rows, keeping pointer and upload owners on status."""
+  device = status.device
+  if not device.is_cuda:
+    return False
+  arrays, totals = [], {1: 0, 4: 0}
+  for name, src, dst in fields:
+    if name == "efc.id" or not dst.size:
+      continue  # Contact indices have a separate checked rebasing operation.
+    if any(value.device != device or not value.is_contiguous or value.requires_grad for value in (src, dst)):
+      return False
+    rowbytes = dst.size // nworld * dst.strides[-1]
+    unit = 4 if rowbytes % 4 == 0 and src.ptr % 4 == 0 and dst.ptr % 4 == 0 else 1
+    width = rowbytes // unit
+    # Raw array descriptors and local column indices are int32; row addresses are int64.
+    if max(src.size * src.strides[-1] // unit, dst.size * dst.strides[-1] // unit, width) >= 2**31 - 4:
+      return False
+    totals[unit] += ((width + 3) // 4) * 4 if unit == 4 else width
+    arrays.append((src, dst, width, unit))
+  if source_ids.size * (totals[4] // 4) >= 2**31 or source_ids.size * totals[1] >= 2**31:
+    return False
+  owners = [source_ids, target_ids]
+  for unit, dtype, struct, kernel in (
+    (4, wp.uint32, _WorldCopyWords, _world_copy_words),
+    (1, wp.uint8, _WorldCopyBytes, _world_copy_bytes),
+  ):
+    descriptors, offsets, total = [], [], 0
+    for src, dst, width, field_unit in arrays:
+      if field_unit != unit:
+        continue
+      descriptor = struct()
+      descriptor.source = wp.array(ptr=src.ptr, shape=src.size * src.strides[-1] // unit, dtype=dtype, device=device)
+      descriptor.target = wp.array(ptr=dst.ptr, shape=dst.size * dst.strides[-1] // unit, dtype=dtype, device=device)
+      descriptor.width = width
+      descriptor.source_worlds = src.shape[0]
+      descriptors.append(descriptor)
+      offsets.append(total)
+      total += ((width + 3) // 4) * 4 if unit == 4 else width
+      owners.extend((src, dst))
+    if not descriptors:
+      continue
+    offsets.append(total)
+    # Ordinary graphs do not own these Python objects. Keep both uploads and the
+    # arrays behind the descriptors alive on status through completion/replay.
+    host = wp.array(descriptors, dtype=struct, device="cpu")
+    device_fields = wp.empty(len(descriptors), dtype=struct, device=device)
+    wp.copy(device_fields, host)
+    host_offsets = wp.array(offsets, dtype=wp.int64, device="cpu")
+    device_offsets = wp.empty(len(offsets), dtype=wp.int64, device=device)
+    wp.copy(device_offsets, host_offsets)
+    owners.extend((host, device_fields, host_offsets, device_offsets))
+    wp.launch(
+      kernel,
+      (source_ids.size, total // (4 if unit == 4 else 1)),
+      [device_fields, device_offsets, source_ids, target_ids, status],
+      device=device,
+    )
+  status._world_copy_storage = tuple(owners)
+  return True
+
+
+def _world_copy_fields(source, target, nsource, ntarget):
+  """Use canonical dimension annotations, retaining destination topology/layout."""
+  result = []
+  destination = {name: value for name, value, _ in array_fields(target)}
+  for name, src, shape in array_fields(source):
+    if shape and shape[0] in ("*", "nworld"):
+      dst = destination[name]
+      if src.dtype != dst.dtype or src.shape[1:] != dst.shape[1:] or src.device != dst.device:
+        raise ValueError(f"Incompatible world-copy field {name}")
+      if not src.is_contiguous or not dst.is_contiguous:
+        raise ValueError(f"World-copy field must be contiguous: {name}")
+      if src.shape[0] == dst.shape[0] == 0:
+        continue
+      if src.shape[0] not in (1, nsource) or dst.shape[0] != ntarget:
+        raise ValueError(f"World-copy destination must have expanded world storage: {name}")
+      if src.size and src.ptr == dst.ptr:
+        raise ValueError(f"World-copy source and destination must not alias: {name}")
+      result.append((name, src, dst))
+  return result
+
+
+def copy_worlds(
+  source_model: types.Model,
+  source_data: types.Data,
+  target_model: types.Model,
+  target_data: types.Data,
+  source_ids: wp.array,
+  target_ids: wp.array,
+) -> wp.array:
+  """Copy selected ongoing worlds between compatible independently owned populations.
+
+  Experimental. Both populations must have the same immutable topology, scalar options,
+  layout and device. The destination model must have expanded world storage, as produced
+  by ``replicate_model``. Indices are unique same-device int32 vectors of equal length.
+  Sources and destinations must be distinct; in-place permutations are unsupported.
+  World and contact storage must be contiguous; index vectors may be strided.
+  Order source/destination work before this call on the current device stream.
+
+  All world-shaped Model and Data fields are copied using their dimension annotations,
+  including time, actuator history, warm starts, sleeping and derived solver state.
+  Untouched destination worlds retain their state. Contacts are stably compacted and
+  their world/constraint references remapped. The global previous-broadphase diagnostic
+  ``ncollision`` becomes zero; collision detection recomputes it on the next step.
+
+  Returns a device int32[1] status: 0 succeeds, bit 1 means invalid/duplicate indices,
+  bit 2 means invalid input contacts/constraints, bit 4 means insufficient destination
+  contact capacity. On failure no destination field is modified. Check status before
+  publishing or stepping the destination. Physics payload never leaves the device.
+
+  Keep both populations, index arrays and the returned status alive through completion
+  and every replay of a captured copy. Status owns temporary descriptor/upload storage
+  that an ordinary CUDA Graph does not retain.
+  """
+  if source_data is target_data or source_model is target_model:
+    raise ValueError("World copying requires distinct source and destination populations")
+  device = source_data.qpos.device
+  if (
+    source_ids.dtype != wp.int32
+    or target_ids.dtype != wp.int32
+    or source_ids.ndim != 1
+    or source_ids.shape != target_ids.shape
+    or source_ids.device != device
+    or target_ids.device != device
+    or target_data.qpos.device != device
+  ):
+    raise ValueError("World indices must be equal-length same-device int32 vectors")
+  if any(
+    getattr(model.callback, field.name) is not None
+    for model in (source_model, target_model)
+    for field in dataclasses.fields(model.callback)
+  ):
+    raise ValueError("World copying does not support model callbacks")
+  fields = _world_copy_fields(source_model, target_model, source_data.nworld, target_data.nworld)
+  fields += _world_copy_fields(source_data, target_data, source_data.nworld, target_data.nworld)
+  contact_fields = []
+  for field in dataclasses.fields(source_data.contact):
+    src, dst = getattr(source_data.contact, field.name), getattr(target_data.contact, field.name)
+    if src.dtype != dst.dtype or src.shape[1:] != dst.shape[1:] or src.device != dst.device:
+      raise ValueError(f"Incompatible contact layout: {field.name}")
+    if not src.is_contiguous or not dst.is_contiguous:
+      raise ValueError(f"World-copy contact field must be contiguous: {field.name}")
+    if src.size and src.ptr == dst.ptr:
+      raise ValueError(f"World-copy contacts must not alias: {field.name}")
+    if source_data.naconmax and target_data.naconmax and bool(src.size) != bool(dst.size):
+      raise ValueError(f"Incompatible optional contact storage: {field.name}")
+    contact_fields.append((field.name, src, dst))
+  if source_data.nacon.ptr == target_data.nacon.ptr or source_data.ncollision.ptr == target_data.ncollision.ptr:
+    raise ValueError("World-copy contact counters must not alias")
+  status = wp.zeros(1, dtype=int, device=device)
+  if not source_ids.size:
+    return status
+  # Resolve contact types before launching: adding a new generic overload
+  # after the first launch would recompile that kernel module for every new type.
+  contact_kernels = {
+    dst.dtype: _world_copy_contact_kernel(dst.dtype) for name, _, dst in contact_fields if name != "worldid" and dst.size
+  }
+  commit_kernels = {dst.dtype: _world_copy_commit_kernel(dst.dtype) for _, _, dst in contact_fields if dst.size}
+  source_map = wp.full(source_data.nworld, -1, dtype=int, device=device)
+  target_map = wp.full(target_data.nworld, -1, dtype=int, device=device)
+  if source_ids.size:
+    wp.launch(_world_copy_maps, source_ids.size, [source_ids, target_ids], [source_map, target_map, status], device=device)
+  capacity = source_data.naconmax + target_data.naconmax
+  flags = wp.empty(max(1, capacity), dtype=int, device=device)
+  prefix = wp.empty_like(flags)
+  wp.launch(
+    _world_copy_contact_flags,
+    flags.size,
+    [
+      source_data.nacon,
+      target_data.nacon,
+      source_data.contact.worldid,
+      target_data.contact.worldid,
+      source_map,
+      target_map,
+    ],
+    [flags, status],
+    device=device,
+  )
+  wp.utils.array_scan(flags, prefix, inclusive=True)
+  wp.launch(_world_copy_capacity, 1, [prefix, target_data.naconmax], [status], device=device)
+  for data, mapping, selected in ((source_data, source_map, True), (target_data, target_map, False)):
+    if data.efc.id.size:
+      wp.launch(
+        _world_copy_validate_constraints,
+        data.efc.id.shape,
+        [data.nefc, data.nacon, data.efc.type, data.efc.id, data.contact.worldid, mapping, selected],
+        [status],
+        device=device,
+      )
+  # Build the replacement prefix separately: target contact rows may move even
+  # when their owning world is untouched. Publish into the existing graph pointers.
+  contact = {}
+  for name, src, old in contact_fields:
+    out = wp.zeros_like(old)
+    contact[name] = out
+    if not out.size:
+      continue
+    if name == "worldid":
+      wp.launch(_world_copy_contact_worlds, capacity, [src, old, source_map, flags, prefix, status], [out], device=device)
+    else:
+      width = old.size // old.shape[0]
+      wp.launch(
+        contact_kernels[src.dtype],
+        (capacity, width),
+        [src.flatten(), old.flatten(), width, flags, prefix, status],
+        [out.flatten()],
+        device=device,
+      )
+  # EFC ids are the sole world-shaped field containing shared contact indices.
+  if target_data.efc.id.size:
+    wp.launch(
+      _world_copy_constraint_ids,
+      target_data.efc.id.shape,
+      [
+        source_data.efc.id,
+        source_data.efc.type,
+        source_data.nefc,
+        target_map,
+        prefix,
+        target_data.naconmax,
+        status,
+        target_data.nefc,
+        target_data.efc.type,
+      ],
+      [target_data.efc.id],
+      device=device,
+    )
+  if not _world_copy_packed_rows(fields, source_ids, target_ids, status, target_data.nworld):
+    row_kernels = {src.dtype: _world_copy_rows_kernel(src.dtype) for name, src, dst in fields if name != "efc.id" and dst.size}
+    for name, src, dst in fields:
+      if name == "efc.id" or not dst.size or not source_ids.size:
+        continue
+      width = dst.size // target_data.nworld
+      wp.launch(
+        row_kernels[src.dtype],
+        (source_ids.size, width),
+        [src.flatten(), source_ids, target_ids, src.shape[0], width, status],
+        [dst.flatten()],
+        device=device,
+      )
+  for name, value in contact.items():
+    if value.size:
+      wp.launch(
+        commit_kernels[value.dtype],
+        value.size,
+        [value.flatten(), status],
+        [getattr(target_data.contact, name).flatten()],
+        device=device,
+      )
+  wp.launch(_world_copy_commit_counts, 1, [prefix, status], [target_data.nacon, target_data.ncollision], device=device)
+  return status
 
 
 def _create_array(data: Any, spec, sizes: dict[str, int], batch_size: int = 1) -> wp.array | None:
