@@ -120,6 +120,7 @@ class StepWorkspace:
 
   def validate(self, model, data):
     """Check binding before recording; GPU replay never calls this host method."""
+    _validate_execution_binding(self.live_count, self.observer)
     if model is not self.model or data is not self.data:
       raise ValueError("Prepared workspace requires its original model, data and immutable step options")
     if self._layout(data) != self._data_layout or self._layout(model) != self._model_layout:
@@ -131,10 +132,6 @@ class StepWorkspace:
       owners = getattr(graph, "mjw_workspaces", ())
       if self not in owners:
         graph.mjw_workspaces = (*owners, self)
-
-  def world_arrays(self):
-    """Return declared nonempty world scratch; no numerical extent inference."""
-    return {field["name"]: self.arrays[field["name"]] for field in self._ledger if field["world_axis"] == 0 and field["bytes"]}
 
   def observe_launch(self, kernel, dim, extent_domain, *, extent_axis=0, parameters=None):
     """Publish explicit count semantics after a native launch, during preparation.
@@ -312,6 +309,13 @@ def step_workspace_layout(
   return tuple(fields)
 
 
+def _validate_execution_binding(live_count, observer):
+  if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("observe_launch", "fill", "copy")):
+    raise TypeError("Prepared observer must implement observe_launch, fill and copy")
+  if (live_count is None) != (observer is None):
+    raise ValueError("Dynamic execution requires live_count and observer together; fixed execution supplies neither")
+
+
 def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None, arrays=None, observer=None) -> StepWorkspace:
   """Bind complete caller-owned typed scratch, or allocate fixed scratch by default.
 
@@ -322,17 +326,19 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   Blocked Cholesky matrices (Data.cM/cqLD and solver.h/hfactor on the blocked
   Newton path) require 16-byte-aligned bases and both world and matrix-row strides.
   Scalar counters and nonblocked/empty matrices retain their natural alignment.
-  A live_count is a CUDA int32 scalar in [0, data.nworld], enforced by admission.
-  An optional observer implements observe_launch, fill and copy to prepare explicit
-  launch-count bindings and bounded row operations in the caller's graph program.
-  It is invoked only at declared stage sites; no global Warp dispatch is replaced.
+  Fixed execution supplies neither live_count nor observer. Dynamic execution
+  supplies both: live_count is a CUDA int32 scalar in [0, data.nworld], enforced
+  by admission, and observer implements observe_launch, fill and copy. The observer
+  must bind every declared world launch to that same count, with independent
+  candidate/CCD counts, and bound row operations in the caller's graph program.
+  Both must remain bound while recording steps. The observer runs only at declared
+  stage sites; no global Warp dispatch is replaced.
   """
   if not data.qpos.device.is_cuda:
     raise ValueError("Prepared step workspace currently requires CUDA")
   if wp.get_stream(data.qpos.device).is_capturing:
     raise RuntimeError("Prepare native step workspace before graph capture")
-  if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("observe_launch", "fill", "copy")):
-    raise TypeError("Prepared observer must implement observe_launch, fill and copy")
+  _validate_execution_binding(live_count, observer)
   specs = step_workspace_layout(model, data)
   for name in ("cM", "cqLD"):
     array = getattr(data, name)

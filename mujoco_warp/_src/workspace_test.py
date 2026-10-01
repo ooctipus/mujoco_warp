@@ -131,6 +131,7 @@ class WorkspaceTest(unittest.TestCase):
   def test_launch_observer_receives_declared_domains_and_skips_empty_launches(self):
     calls = []
     workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.live_count, workspace.observer = None, None
     workspace.observer = SimpleNamespace(observe_launch=lambda *args, **kwargs: calls.append((args, kwargs)))
     kernel = object()
     workspace.observe_launch(kernel, (31, 4), "world")
@@ -142,6 +143,7 @@ class WorkspaceTest(unittest.TestCase):
 
   def test_explicit_memory_operations_preserve_eager_behavior_without_observer(self):
     workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.live_count, workspace.observer = None, None
     workspace.observer = None
     source = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), device="cpu")
     destination = wp.zeros((3, 4), dtype=wp.float32, device="cpu")
@@ -152,6 +154,7 @@ class WorkspaceTest(unittest.TestCase):
 
   def test_observer_memory_failure_propagates_without_dense_fallback(self):
     workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.live_count, workspace.observer = None, None
     array = SimpleNamespace(size=12, fill_=lambda *_: self.fail("Unexpected dense fill"))
 
     def fail(*args):
@@ -175,6 +178,30 @@ class WorkspaceTest(unittest.TestCase):
     ):
       with self.assertRaisesRegex(TypeError, "observe_launch, fill and copy"):
         make_step_workspace(None, data, observer=SimpleNamespace(observe_launch=lambda *_: None))
+
+  def test_dynamic_execution_requires_count_and_observer_together(self):
+    """Reject incomplete execution bindings before planning or allocating scratch."""
+    data = SimpleNamespace(qpos=SimpleNamespace(device=SimpleNamespace(is_cuda=True)))
+    observer = SimpleNamespace(observe_launch=lambda *_: None, fill=lambda *_: None, copy=lambda *_: None)
+    with (
+      patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
+      patch("mujoco_warp._src.workspace.step_workspace_layout", side_effect=AssertionError("Unexpected scratch planning")),
+    ):
+      for arguments in ({"live_count": object()}, {"observer": observer}):
+        with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, "together"):
+          make_step_workspace(None, data, **arguments)
+
+  def test_recording_rejects_detached_dynamic_execution_binding(self):
+    """Reject a detached count observer before a partial-capacity program is recorded."""
+    workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.live_count, workspace.observer = None, None
+    workspace.model, workspace.data = Metadata(), Metadata()
+    workspace.live_count, workspace.observer = object(), None
+    workspace._model_layout, workspace._data_layout = workspace._layout(workspace.model), workspace._layout(workspace.data)
+    workspace.arrays, workspace._scratch_layout = {}, ()
+    workspace.device = SimpleNamespace(captures={})
+    with patch.object(wp, "get_stream", return_value=None), self.assertRaisesRegex(ValueError, "together"):
+      workspace.validate(workspace.model, workspace.data)
 
   def test_cpu_template_plans_capacity_without_allocating_or_mutating(self):
     instances = []
@@ -274,6 +301,7 @@ class WorkspaceTest(unittest.TestCase):
     for owner, field in (("data", "nworld"), ("data", "njmax"), ("data", "naccdmax"), ("model", "nv"), ("model", "option")):
       with self.subTest(owner=owner, field=field):
         workspace = StepWorkspace.__new__(StepWorkspace)
+        workspace.live_count, workspace.observer = None, None
         workspace.model, workspace.data = Metadata(), Metadata()
         workspace._data_layout = workspace._layout(workspace.data)
         workspace._model_layout = workspace._layout(workspace.model)
@@ -284,6 +312,7 @@ class WorkspaceTest(unittest.TestCase):
 
   def test_foreign_model_or_data_rejected(self):
     workspace = StepWorkspace.__new__(StepWorkspace)
+    workspace.live_count, workspace.observer = None, None
     workspace.model, workspace.data = Metadata(), Metadata()
     for model, data in ((Metadata(), workspace.data), (workspace.model, Metadata())):
       with self.assertRaisesRegex(ValueError, "original model"):
@@ -292,6 +321,7 @@ class WorkspaceTest(unittest.TestCase):
   def test_prepared_topology_tuple_or_callback_change_rejected(self):
     for field, replacement in (("pair_counts", (2, 2)), ("callback", lambda *_: None)):
       workspace = StepWorkspace.__new__(StepWorkspace)
+      workspace.live_count, workspace.observer = None, None
       workspace.model, workspace.data = Metadata(), Metadata()
       workspace._data_layout = workspace._layout(workspace.data)
       workspace._model_layout = workspace._layout(workspace.model)

@@ -19,5 +19,8 @@
 
 # Code Style
 
+- Prepared execution must keep live counts and launch bindings coherent: dynamic workspaces require both a live-count scalar and the bounded launch/copy/fill observer; fixed workspaces supply neither. Reject incomplete bindings before recording.
+- Schema field names belong to preparation. Numeric identity and membership APIs must not also resolve paths or names.
+
 - Line length limit is 128 characters. Docstring length limit is 100 characters.
 - Prefer targeted, efficient tests over exhaustive edge-case coverage.
