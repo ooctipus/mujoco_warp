@@ -16,14 +16,15 @@
 """Prepared native step scratch with explicit allocation and lifetime ownership."""
 
 import dataclasses
-import math
+from typing import get_type_hints
 
 import warp as wp
+from gpu_components import fields as field_ops
 
 from mujoco_warp._src import solver
 from mujoco_warp._src import step_execution
 from mujoco_warp._src import types
-from mujoco_warp._src.collision_convex import _convex_scratch_layout
+from mujoco_warp._src.collision_convex import _convex_scratch_shapes
 from mujoco_warp._src.collision_convex import _ConvexScratch
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
@@ -40,168 +41,45 @@ class WorkspaceFieldSpec:
   capacity_domain: str
 
 
+@dataclasses.dataclass(eq=False)
 class _StepWorkspace:
-  """Internal owner of prepared scratch and borrowed native stage views.
+  """Passive prepared scratch and borrowed stage views, constructed by make_step_workspace.
 
-  Prepare with make_step_workspace. One workspace may serve ordered substeps and
-  both collision passes; concurrent steps require separate workspaces. Model and
-  Data storage must remain unchanged. Captured steps retain this owner on the graph.
-  Compact solver and collision views are private engine implementation; callers
-  provide only the original Model/Data and declared scratch descriptors.
+  One record serves ordered substeps and collision passes. Concurrent steps need
+  separate scratch. Only preparation operations create owners and derived views;
+  native execution operations validate bindings and retain this record on capture.
   """
 
-  def __init__(self, model, data, specs, solver_model, solver_data, arrays=None, bindings=None):
-    self.model, self.data = model, data
-    self.world_live_count = None if bindings is None else bindings.world_storage.protected_count
-    self.bindings = bindings
-    self._execution_binding = self.world_live_count, self._layout(self.world_live_count), bindings
-    self._binding_layout = step_execution._binding_layout(bindings)
-    self.device = data.qpos.device
-    self._solver_model, self._solver_data = solver_model, solver_data
-    self.arrays, self._ledger = {}, []
-    offset = 0
-    for spec in specs:
-      name, shape, dtype, capacity_domain = spec.name, spec.shape, spec.dtype, spec.capacity_domain
-      nbytes = math.prod(shape) * wp.types.type_size_in_bytes(dtype)
-      offset = (offset + 127) // 128 * 128
-      field = dict(
-        name=name,
-        shape=shape,
-        dtype=dtype,
-        allocation_offset_bytes=offset,
-        payload_bytes=nbytes,
-        capacity_domain=capacity_domain,
-      )
-      field["world_axis"] = 0 if capacity_domain == "world" else None
-      self._ledger.append(field)
-      offset += nbytes
-    self.storage = None
-    if arrays is None:
-      self.storage = wp.empty(offset, dtype=wp.uint8, device=self.device)
-      for field in self._ledger:
-        array = (
-          wp.array(
-            ptr=self.storage.ptr + field["allocation_offset_bytes"],
-            shape=field["shape"],
-            dtype=field["dtype"],
-            device=self.device,
-          )
-          if field["payload_bytes"]
-          else wp.empty(field["shape"], dtype=field["dtype"], device=self.device)
-        )
-        array.workspace_storage = self.storage
-        self.arrays[field["name"]] = array
-    else:
-      if set(arrays) != {spec.name for spec in specs}:
-        raise ValueError("Caller-owned scratch must supply exactly the declared field names")
-      for spec in specs:
-        array = arrays[spec.name]
-        expected = spec.shape, spec.dtype, self.device
-        if not isinstance(array, wp.array) or (array.shape, array.dtype, array.device) != expected:
-          raise ValueError(f"Caller-owned scratch has incompatible descriptor: {spec.name}")
-        width = wp.types.type_size_in_bytes(array.dtype)
-        for axis in range(array.ndim - 1, 0, -1):
-          if array.size and array.strides[axis] != width:
-            raise ValueError(f"Scratch inner dimensions must be contiguous: {spec.name}")
-          width *= array.shape[axis]
-        alignment = wp.types.type_size_in_bytes(getattr(array.dtype, "_wp_scalar_type_", array.dtype))
-        if array.size and (not array.ptr or array.ptr % alignment or array.strides[0] < width or array.strides[0] % alignment):
-          raise ValueError(f"Scratch rows must have a nonoverlapping aligned stride: {spec.name}")
-        if spec.name in ("solver.h", "solver.hfactor") and array.size and solver_model.nv > solver._BLOCK_CHOLESKY_DIM:
-          # Blocked Cholesky explicitly opts its matrix tiles into aligned=True.
-          if array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16:
-            raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: {spec.name}")
-        self.arrays[spec.name] = array
-        self._ledger[len(self.arrays) - 1]["allocation_offset_bytes"] = None
-    self._collision = CollisionContext(
-      **{name: self.arrays[name] for name in ("collision_pair", "collision_pairid", "collision_worldid")}
-    )
-    self._convex = _ConvexScratch(**{field.name: self.arrays[field.name] for field in dataclasses.fields(_ConvexScratch)})
-    self._solver_context = types.SolverContext(
-      **{name: self.arrays["solver." + name] for name, _, _, _ in solver._solver_context_layout(solver_model, solver_data)}
-    )
-    self._solver_context.compact_m_full = model
-    self._solver_context.compact_d_full = data
-    self._data_layout = self._layout(data)
-    self._model_layout = self._layout(model)
-    self._scratch_layout = self._layout(tuple(self.arrays.items()))
+  model: types.Model
+  data: types.Data
+  bindings: step_execution.StepBindings | None
+  device: object
+  storage: wp.array | None
+  arrays: dict[str, wp.array]
+  convex: _ConvexScratch
+  _collision: CollisionContext
+  _solver_model: object
+  _solver_data: object
+  _solver_context: types.SolverContext
+  _ledger: tuple[dict, ...]
+  _execution_binding: object
+  _binding_layout: tuple | None
+  _data_layout: object
+  _model_layout: object
+  _scratch_layout: object
 
-  @staticmethod
-  def _layout(value):
-    if isinstance(value, wp.array):
-      return value.ptr, value.shape, value.strides, value.dtype
-    if dataclasses.is_dataclass(value):
-      return tuple((field.name, _StepWorkspace._layout(getattr(value, field.name))) for field in dataclasses.fields(value))
-    if isinstance(value, (tuple, list)):
-      return tuple(_StepWorkspace._layout(item) for item in value)
-    if value is None or isinstance(value, (int, float, bool, str)):
-      return value
-    return id(value)
 
-  def validate(self, model, data):
-    """Check binding before recording; GPU replay never calls this host method."""
-    count, count_layout, bindings = self._execution_binding
-    if (
-      self.world_live_count is not count or self._layout(self.world_live_count) != count_layout or self.bindings is not bindings
-    ):
-      raise ValueError("Prepared execution binding changed; restore its original count and bindings before recording")
-    if self.bindings is not None:
-      step_execution._validate_bindings(self.bindings)
-      if step_execution._binding_layout(self.bindings) != self._binding_layout:
-        raise ValueError("Prepared native storage or count descriptors changed; prepare a new workspace")
-    if model is not self.model or data is not self.data:
-      raise ValueError("Prepared workspace requires its original model, data and immutable step options")
-    if self._layout(data) != self._data_layout or self._layout(model) != self._model_layout:
-      raise ValueError("Prepared Model/Data descriptors or scalar metadata changed; prepare a new workspace")
-    if self._layout(tuple(self.arrays.items())) != self._scratch_layout:
-      raise ValueError("Prepared scratch descriptors changed; prepare a new workspace")
-    graph = self.device.captures.get(wp.get_stream(self.device))
-    if graph is not None:
-      owners = getattr(graph, "mjw_workspaces", ())
-      if self not in owners:
-        graph.mjw_workspaces = (*owners, self)
-
-  def bind_launch(self, kernel, dim, extent_domain, *, extent_axis=0, parameter_domains=None):
-    """Publish explicit count semantics after a native launch, during preparation.
-
-    Dim only distinguishes an emitted launch from a zero-sized operation; it does
-    not identify a population domain. StepBindings owns CUDA node bindings. Model,
-    Data and this workspace already retain all allocation owners of the step.
-    """
-    if self.bindings is None:
-      return
-    dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
-    if any(size == 0 for size in dimensions):
-      return
-    step_execution.bind_step_launch(
-      self.bindings, kernel, dim, extent_domain, extent_axis=extent_axis, parameter_domains=parameter_domains
-    )
-
-  def fill(self, array, value, domain):
-    """Fill an explicitly declared row domain, bounded by its native count source."""
-    if array.size:
-      if self.bindings is None:
-        array.fill_(value)
-      else:
-        step_execution._fill_step_rows(self.bindings, array, value, domain)
-    return array
-
-  def copy(self, destination, source, domain):
-    """Copy an explicitly declared row domain without touching inactive rows."""
-    if destination.size:
-      if self.bindings is None:
-        wp.copy(destination, source)
-      else:
-        step_execution._copy_step_rows(self.bindings, destination, source, domain)
-
-  def memory_report(self):
-    return {
-      "physical_scratch_bytes": None if self.storage is None else self.storage.capacity,
-      "allocation_owner": "caller" if self.storage is None else "workspace",
-      "payload_bytes": sum(row["payload_bytes"] for row in self._ledger),
-      "fields": [{**row, "dtype": str(row["dtype"]), "pointer": self.arrays[row["name"]].ptr} for row in self._ledger],
-      "scope": "scratch payload only; caller-owned physical backing and Model/Data/Contact/graph/context are excluded",
-    }
+def step_workspace_memory_report(workspace):
+  """Describe scratch payload without claiming ownership of caller-managed backing."""
+  return {
+    "physical_scratch_bytes": None if workspace.storage is None else workspace.storage.capacity,
+    "allocation_owner": "caller" if workspace.storage is None else "workspace",
+    "payload_bytes": sum(field["payload_bytes"] for field in workspace._ledger),
+    "fields": [
+      {**field, "dtype": str(field["dtype"]), "pointer": workspace.arrays[field["name"]].ptr} for field in workspace._ledger
+    ],
+    "scope": "scratch payload only; caller-owned physical backing and Model/Data/Contact/graph/context are excluded",
+  }
 
 
 def step_workspace_layout(
@@ -289,11 +167,20 @@ def step_workspace_layout(
   nc = d.naccdmax if ccd_capacity is None else ccd_capacity
   if any(type(value) is not int or not 1 <= value < 2**31 for value in (nw, candidates, nc)):
     raise ValueError("World, contact and CCD capacities must be positive int32 counts")
+  _, _, convex_shapes = _convex_scratch_shapes(m, pairs, nc)
+  convex_types = get_type_hints(_ConvexScratch)
+  if set(convex_shapes) != set(convex_types) or any(
+    len(convex_shapes[name]) != hint.ndim for name, hint in convex_types.items()
+  ):
+    raise ValueError("Convex shapes must match the typed scratch declaration")
   specs = [
     ("collision_pair", (candidates,), wp.vec2i, "candidate"),
     ("collision_pairid", (candidates,), wp.vec2i, "candidate"),
     ("collision_worldid", (candidates,), int, "candidate"),
-    *_convex_scratch_layout(m, pairs, nc)[2],
+    *(
+      (name, convex_shapes[name], hint.dtype, "global_counter" if name == "nccd" else "ccd")
+      for name, hint in convex_types.items()
+    ),
     ("awake_prev", d.body_awake.shape, int, "world"),
     ("awake_changed", (1,), int, "global_counter"),
     ("efc_nnz", (nw,), int, "world"),
@@ -321,7 +208,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   """Prepare a workspace with caller-owned typed scratch or fixed scratch allocated here.
 
   This is the sole public workspace construction operation. The returned owner
-  records bounded scratch operations and retains all borrowed native stage views;
+  retains borrowed native stage views and data; free operations perform execution;
   its implementation type and derived views are private.
 
   Supplied arrays must cover step_workspace_layout exactly and retain their backing
@@ -342,6 +229,8 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   bindings must be restored before recording any step. Only declared stage sites
   invoke binding operations; no global Warp dispatch is replaced.
   """
+  if bindings is not None and arrays is None:
+    raise ValueError("Dynamic execution requires caller-owned registered scratch")
   if not data.qpos.device.is_cuda:
     raise ValueError("Prepared step workspace currently requires CUDA")
   if wp.get_stream(data.qpos.device).is_capturing:
@@ -358,10 +247,78 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
       if storage.capacity != getattr(data, name):
         raise ValueError(f"Native storage capacity must equal Data.{name}")
   specs = step_workspace_layout(model, data)
-  for name in ("cM", "cqLD"):
-    array = getattr(data, name)
-    # The compact smooth solve always uses explicitly aligned blocked matrices.
-    if array.size and (array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16):
-      raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: Data.{name}")
+  solver.validate_blocked_matrix(data.cM)
+  solver.validate_blocked_matrix(data.cqLD)
   m2, d2 = solver._compact_solver_views(model, data)
-  return _StepWorkspace(model, data, specs, m2, d2, arrays=arrays, bindings=bindings)
+  device = data.qpos.device
+  layouts = tuple(field_ops.contiguous(spec.shape, wp.types.type_size_in_bytes(spec.dtype)) for spec in specs)
+  for spec, layout in zip(specs, layouts):
+    field_ops.validate_layout(layout, dtype=spec.dtype)
+  spans = tuple(field_ops.span_bytes(layout, wp.types.type_size_in_bytes(spec.dtype)) for spec, layout in zip(specs, layouts))
+  offsets, nbytes = field_ops.pack(spans, (128,) * len(specs), end_alignment_bytes=128)
+  storage = None
+  if arrays is None:
+    buffer_shape = (nbytes // 128, 128)
+    field_ops.validate_layout(field_ops.contiguous(buffer_shape, 1), dtype=wp.uint8)
+    storage = wp.empty(buffer_shape, dtype=wp.uint8, device=device)
+    if nbytes and storage.ptr % 128:
+      raise ValueError("Scratch allocation requires 128-byte base alignment")
+    arrays = {
+      spec.name: field_ops.bind(storage, spec.dtype, layout, byte_offset=offset)
+      for spec, layout, offset in zip(specs, layouts, offsets)
+    }
+  else:
+    if set(arrays) != {spec.name for spec in specs}:
+      raise ValueError("Caller-owned scratch must supply exactly the declared field names")
+    arrays = dict(arrays)
+    for spec in specs:
+      field_ops.validate_array(arrays[spec.name], dtype=spec.dtype, shape=spec.shape, device=device)
+    field_ops.validate_disjoint_arrays(tuple(arrays.values()))
+    if bindings is not None:
+      domains = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
+      for spec in specs:
+        array = arrays[spec.name]
+        if spec.capacity_domain in domains and spec.shape[0]:
+          if field_ops.lookup(domains[spec.capacity_domain], array) is None:
+            raise ValueError(f"Scratch must be registered in its declared {spec.capacity_domain} storage: {spec.name}")
+        elif spec.capacity_domain == "global_counter" and not array.is_contiguous:
+          raise ValueError(f"Global counters require dense descriptors and caller-guaranteed full backing: {spec.name}")
+  collision = CollisionContext(**{name: arrays[name] for name in ("collision_pair", "collision_pairid", "collision_worldid")})
+  convex = _ConvexScratch(**{field.name: arrays[field.name] for field in dataclasses.fields(_ConvexScratch)})
+  solver_context = types.SolverContext(
+    **{name: arrays["solver." + name] for name, _, _, _ in solver._solver_context_layout(m2, d2)}
+  )
+  solver.validate_solver_scratch(m2, solver_context)
+  solver_context.compact_m_full, solver_context.compact_d_full = model, data
+  ledger = tuple(
+    dict(
+      name=spec.name,
+      shape=spec.shape,
+      dtype=spec.dtype,
+      allocation_offset_bytes=offset if storage is not None else None,
+      payload_bytes=span,
+      capacity_domain=spec.capacity_domain,
+      world_axis=0 if spec.capacity_domain == "world" else None,
+    )
+    for spec, offset, span in zip(specs, offsets, spans)
+  )
+  memo = {}
+  return _StepWorkspace(
+    model=model,
+    data=data,
+    bindings=bindings,
+    device=device,
+    storage=storage,
+    arrays=arrays,
+    convex=convex,
+    _collision=collision,
+    _solver_model=m2,
+    _solver_data=d2,
+    _solver_context=solver_context,
+    _ledger=ledger,
+    _execution_binding=bindings,
+    _binding_layout=step_execution._binding_layout(bindings),
+    _data_layout=step_execution._layout(data, memo),
+    _model_layout=step_execution._layout(model, memo),
+    _scratch_layout=step_execution._layout((tuple(arrays.items()), convex, collision, solver_context, m2, d2), memo),
+  )

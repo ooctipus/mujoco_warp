@@ -15,6 +15,7 @@
 
 import warp as wp
 
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import types
 from mujoco_warp._src.types import EqType
 from mujoco_warp._src.types import ObjType
@@ -212,7 +213,7 @@ def update_sleep(
     outputs=[d.ntree_awake, d.nbody_awake, d.nv_awake],
   )
   if workspace is not None:
-    workspace.bind_launch(_zero_sleep_counters, d.nworld, "world")
+    step_execution.bind_step_launch(workspace.bindings, _zero_sleep_counters, d.nworld, "world")
 
   wp.launch(
     _update_sleep_trees,
@@ -221,7 +222,7 @@ def update_sleep(
     outputs=[d.ntree_awake, d.tree_awake],
   )
   if workspace is not None:
-    workspace.bind_launch(_update_sleep_trees, (d.nworld, m.ntree), "world")
+    step_execution.bind_step_launch(workspace.bindings, _update_sleep_trees, (d.nworld, m.ntree), "world")
 
   wp.launch(
     _update_sleep_bodies,
@@ -244,7 +245,7 @@ def update_sleep(
     ],
   )
   if workspace is not None:
-    workspace.bind_launch(_update_sleep_bodies, (d.nworld, m.nbody), "world")
+    step_execution.bind_step_launch(workspace.bindings, _update_sleep_bodies, (d.nworld, m.nbody), "world")
 
   wp.launch(
     _update_sleep_dofs,
@@ -259,7 +260,7 @@ def update_sleep(
     outputs=[d.nv_awake, d.dof_awake_ind],
   )
   if workspace is not None:
-    workspace.bind_launch(_update_sleep_dofs, (d.nworld, m.nv), "world")
+    step_execution.bind_step_launch(workspace.bindings, _update_sleep_dofs, (d.nworld, m.nv), "world")
 
 
 @event_scope
@@ -799,7 +800,7 @@ def wake(m: types.Model, d: types.Data, *, workspace=None):
     outputs=[d.qvel, d.qacc_warmstart, d.qfrc_applied, d.qacc],
   )
   if workspace is not None:
-    workspace.bind_launch(_clear_disabled_dofs, (d.nworld, m.nv), "world")
+    step_execution.bind_step_launch(workspace.bindings, _clear_disabled_dofs, (d.nworld, m.nv), "world")
   wp.launch(
     _wake_kernel,
     dim=(d.nworld, m.ntree),
@@ -819,7 +820,7 @@ def wake(m: types.Model, d: types.Data, *, workspace=None):
     outputs=[d.tree_asleep],
   )
   if workspace is not None:
-    workspace.bind_launch(_wake_kernel, (d.nworld, m.ntree), "world")
+    step_execution.bind_step_launch(workspace.bindings, _wake_kernel, (d.nworld, m.ntree), "world")
 
 
 @event_scope
@@ -841,7 +842,7 @@ def wake_collision(m: types.Model, d: types.Data, *, workspace=None):
     outputs=[d.tree_asleep],
   )
   if workspace is not None:
-    workspace.bind_launch(_wake_collision_kernel, d.naconmax, "candidate")
+    step_execution.bind_step_launch(workspace.bindings, _wake_collision_kernel, d.naconmax, "candidate")
 
 
 @wp.kernel
@@ -1259,7 +1260,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     outputs=[d.tree_asleep],
   )
   if workspace is not None:
-    workspace.bind_launch(_sweep_awake_trees, (d.nworld, m.ntree), "world")
+    step_execution.bind_step_launch(workspace.bindings, _sweep_awake_trees, (d.nworld, m.ntree), "world")
 
   # 2. Check which constraint islands can sleep (all trees in island must be asleep)
   if island_can_sleep is None:
@@ -1268,7 +1269,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     if workspace is None:
       island_can_sleep.fill_(1)
     else:
-      workspace.fill(island_can_sleep, 1, "world")
+      step_execution.fill_step_rows(workspace.bindings, island_can_sleep, 1, "world")
   wp.launch(
     _check_island_can_sleep,
     dim=(d.nworld, m.ntree),
@@ -1281,7 +1282,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     outputs=[island_can_sleep],
   )
   if workspace is not None:
-    workspace.bind_launch(_check_island_can_sleep, (d.nworld, m.ntree), "world")
+    step_execution.bind_step_launch(workspace.bindings, _check_island_can_sleep, (d.nworld, m.ntree), "world")
 
   # 3. Build sleep cycles for sleeping islands and sleep unconstrained trees
   wp.launch(
@@ -1302,4 +1303,4 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     ],
   )
   if workspace is not None:
-    workspace.bind_launch(_build_cycles, d.nworld, "world")
+    step_execution.bind_step_launch(workspace.bindings, _build_cycles, d.nworld, "world")

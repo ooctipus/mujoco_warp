@@ -16,6 +16,7 @@
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.passive import ellipsoid_max_moment
 from mujoco_warp._src.passive import geom_semiaxes
@@ -1164,7 +1165,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
     actuator_vel: Optional prepared actuator-velocity scratch.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
     if actuator_vel is not None and actuator_vel is not workspace.arrays["actuator_vel"]:
       raise ValueError("Prepared derivatives require workspace actuator_vel scratch")
   Mi = m.M_fullm_i
@@ -1176,7 +1177,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
     if workspace is None:
       out.zero_()
     else:
-      workspace.fill(out, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, out, 0, "world")
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
       if actuator_vel is None:
         vel = wp.empty((d.nworld, m.nactuator), dtype=float) if workspace is None else workspace.arrays["actuator_vel"]
@@ -1209,7 +1210,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
         outputs=[vel],
       )
       if workspace is not None:
-        workspace.bind_launch(_qderiv_actuator_passive_vel, (d.nworld, m.nactuator), "world")
+        step_execution.bind_step_launch(workspace.bindings, _qderiv_actuator_passive_vel, (d.nworld, m.nactuator), "world")
       # out (qDeriv) is in M-structure.
       wp.launch(
         _qderiv_actuator_passive_actuation_sparse,
@@ -1225,7 +1226,9 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
         outputs=[out],
       )
       if workspace is not None:
-        workspace.bind_launch(_qderiv_actuator_passive_actuation_sparse, (d.nworld, m.nactuator), "world")
+        step_execution.bind_step_launch(
+          workspace.bindings, _qderiv_actuator_passive_actuation_sparse, (d.nworld, m.nactuator), "world"
+        )
     wp.launch(
       _qderiv_actuator_passive,
       dim=(d.nworld, Mi.size),
@@ -1244,13 +1247,13 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
       outputs=[out],
     )
     if workspace is not None:
-      workspace.bind_launch(_qderiv_actuator_passive, (d.nworld, Mi.size), "world")
+      step_execution.bind_step_launch(workspace.bindings, _qderiv_actuator_passive, (d.nworld, Mi.size), "world")
   else:
     # TODO(team): directly utilize M for these settings
     if workspace is None:
       wp.copy(out, d.M)
     else:
-      workspace.copy(out, d.M, "world")
+      step_execution.copy_step_rows(workspace.bindings, out, d.M, "world")
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
     wp.launch(
@@ -1273,7 +1276,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
       outputs=[out],
     )
     if workspace is not None:
-      workspace.bind_launch(_qderiv_tendon_damping, (d.nworld, Mi.size), "world")
+      step_execution.bind_step_launch(workspace.bindings, _qderiv_tendon_damping, (d.nworld, Mi.size), "world")
   if m.has_fluid:
     if m.body_fluid_ellipsoid_adr.size > 0:
       wp.launch(

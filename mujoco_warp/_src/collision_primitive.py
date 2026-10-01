@@ -17,6 +17,7 @@ from typing import Tuple
 
 import warp as wp
 
+from mujoco_warp._src import step_execution
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_core import contact_params
@@ -1536,7 +1537,7 @@ def primitive_narrowphase(
   unnecessary checks for non-existent collision pairs.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   # TODO(team): keep the overhead of this small - not launching anything
   # for pair types without collisions, as well as updating the launch dimensions.
 
@@ -1615,7 +1616,8 @@ def primitive_narrowphase(
     ],
   )
   if workspace is not None:
-    workspace.bind_launch(
+    step_execution.bind_step_launch(
+      workspace.bindings,
       launch_kernel,
       d.naconmax,
       "candidate",

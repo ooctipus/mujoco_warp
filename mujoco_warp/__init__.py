@@ -140,3 +140,4 @@ from mujoco_warp._src.types import TrnType as TrnType
 from mujoco_warp._src.workspace import WorkspaceFieldSpec as WorkspaceFieldSpec
 from mujoco_warp._src.workspace import make_step_workspace as make_step_workspace
 from mujoco_warp._src.workspace import step_workspace_layout as step_workspace_layout
+from mujoco_warp._src.workspace import step_workspace_memory_report as step_workspace_memory_report

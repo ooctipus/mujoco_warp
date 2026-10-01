@@ -14,10 +14,11 @@
 # ==============================================================================
 
 import dataclasses
-from typing import Tuple
+from typing import Tuple, get_type_hints
 
 import warp as wp
 
+from mujoco_warp._src import step_execution
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_core import contact_margin_gap
@@ -1238,30 +1239,30 @@ def _ccd_grid_size(kernel, naconmax: int, device) -> int:
 class _ConvexScratch:
   """Borrowed convex-collision arrays; allocation and lifetime belong to the caller."""
 
-  nccd: wp.array  # CCD collider count by geometry-pair type.
-  epa_vert: wp.array  # Vertices in the EPA polytope.
-  epa_vert_index: wp.array  # Vertex indices in the EPA polytope.
-  epa_face: wp.array  # Polytope faces as triples of vertex indices.
-  epa_pr: wp.array  # Projection of the origin onto polytope faces.
-  epa_norm2: wp.array  # Squared projection lengths, epa_pr dot epa_pr.
-  epa_horizon: wp.array  # Vertex-index pairs for horizon edges.
-  multiccd_polygon: wp.array  # Clipped contact surface.
-  multiccd_clipped: wp.array  # Intermediate clipped contact surface.
-  multiccd_pnormal: wp.array  # Clipping-polygon normals.
-  multiccd_pdist: wp.array  # Clipping-polygon plane distances.
-  multiccd_idx1: wp.array  # Normal-index candidates for geometry 1.
-  multiccd_idx2: wp.array  # Normal-index candidates for geometry 2.
-  multiccd_n1: wp.array  # Normal candidates for geometry 1.
-  multiccd_n2: wp.array  # Normal candidates for geometry 2.
-  multiccd_endvert: wp.array  # Edge-vertex candidates.
-  multiccd_face1: wp.array  # Contact face for geometry 1.
-  multiccd_face2: wp.array  # Contact face for geometry 2.
+  nccd: wp.array[wp.int32]  # CCD collider count by geometry-pair type.
+  epa_vert: wp.array2d[wp.vec3]  # Vertices in the EPA polytope.
+  epa_vert_index: wp.array2d[wp.int32]  # Vertex indices in the EPA polytope.
+  epa_face: wp.array2d[wp.int32]  # Polytope faces as triples of vertex indices.
+  epa_pr: wp.array2d[wp.vec3]  # Projection of the origin onto polytope faces.
+  epa_norm2: wp.array2d[wp.float32]  # Squared projection lengths, epa_pr dot epa_pr.
+  epa_horizon: wp.array2d[wp.int32]  # Vertex-index pairs for horizon edges.
+  multiccd_polygon: wp.array2d[wp.vec3]  # Clipped contact surface.
+  multiccd_clipped: wp.array2d[wp.vec3]  # Intermediate clipped contact surface.
+  multiccd_pnormal: wp.array2d[wp.vec3]  # Clipping-polygon normals.
+  multiccd_pdist: wp.array2d[wp.float32]  # Clipping-polygon plane distances.
+  multiccd_idx1: wp.array2d[wp.int32]  # Normal-index candidates for geometry 1.
+  multiccd_idx2: wp.array2d[wp.int32]  # Normal-index candidates for geometry 2.
+  multiccd_n1: wp.array2d[wp.vec3]  # Normal candidates for geometry 1.
+  multiccd_n2: wp.array2d[wp.vec3]  # Normal candidates for geometry 2.
+  multiccd_endvert: wp.array2d[wp.vec3]  # Edge-vertex candidates.
+  multiccd_face1: wp.array2d[wp.vec3]  # Contact face for geometry 1.
+  multiccd_face2: wp.array2d[wp.vec3]  # Contact face for geometry 2.
 
 
-def _convex_scratch_layout(m: Model, collision_table: list[tuple[GeomType, GeomType]], ccd_capacity: int):
-  """Return pair count, EPA iterations and scratch specs for eager or prepared collision.
+def _convex_scratch_shapes(m: Model, collision_table: list[tuple[GeomType, GeomType]], ccd_capacity: int):
+  """Return pair count, EPA iterations and shapes for eager or prepared collision.
 
-  Each spec declares name, shape, dtype and capacity domain. This host-only description
+  The typed scratch declaration owns dtype and rank. This host-only shape relation
   preserves mesh, cylinder and heightfield requirements independently of prepared-step admission.
   """
 
@@ -1289,32 +1290,32 @@ def _convex_scratch_layout(m: Model, collision_table: list[tuple[GeomType, GeomT
     nmeshdegmax = max(m.nmeshdegmax, 3)
 
   nc = ccd_capacity
-  specs = (
-    ("nccd", (len(GeomType) * (len(GeomType) + 1) // 2,), int, "global_counter"),
-    ("epa_vert", (nc, 10 + 2 * epa_iterations), wp.vec3, "ccd"),
-    ("epa_vert_index", (nc, 10 + 2 * epa_iterations), int, "ccd"),
-    ("epa_face", (nc, 6 + MJ_MAX_EPAFACES * epa_iterations), int, "ccd"),
-    ("epa_pr", (nc, 6 + MJ_MAX_EPAFACES * epa_iterations), wp.vec3, "ccd"),
-    ("epa_norm2", (nc, 6 + MJ_MAX_EPAFACES * epa_iterations), float, "ccd"),
-    ("epa_horizon", (nc, MJ_MAX_EPAHORIZON), int, "ccd"),
-    ("multiccd_polygon", (nc, 2 * npolygonmax), wp.vec3, "ccd"),
-    ("multiccd_clipped", (nc, 2 * npolygonmax), wp.vec3, "ccd"),
-    ("multiccd_pnormal", (nc, npolygonmax), wp.vec3, "ccd"),
-    ("multiccd_pdist", (nc, npolygonmax), float, "ccd"),
-    ("multiccd_idx1", (nc, nmeshdegmax), int, "ccd"),
-    ("multiccd_idx2", (nc, nmeshdegmax), int, "ccd"),
-    ("multiccd_n1", (nc, nmeshdegmax), wp.vec3, "ccd"),
-    ("multiccd_n2", (nc, nmeshdegmax), wp.vec3, "ccd"),
-    ("multiccd_endvert", (nc, nmeshdegmax), wp.vec3, "ccd"),
-    ("multiccd_face1", (nc, npolygonmax), wp.vec3, "ccd"),
-    ("multiccd_face2", (nc, npolygonmax), wp.vec3, "ccd"),
-  )
-  return ncollision, epa_iterations, specs
+  shapes = {
+    "nccd": (len(GeomType) * (len(GeomType) + 1) // 2,),
+    "epa_vert": (nc, 10 + 2 * epa_iterations),
+    "epa_vert_index": (nc, 10 + 2 * epa_iterations),
+    "epa_face": (nc, 6 + MJ_MAX_EPAFACES * epa_iterations),
+    "epa_pr": (nc, 6 + MJ_MAX_EPAFACES * epa_iterations),
+    "epa_norm2": (nc, 6 + MJ_MAX_EPAFACES * epa_iterations),
+    "epa_horizon": (nc, MJ_MAX_EPAHORIZON),
+    "multiccd_polygon": (nc, 2 * npolygonmax),
+    "multiccd_clipped": (nc, 2 * npolygonmax),
+    "multiccd_pnormal": (nc, npolygonmax),
+    "multiccd_pdist": (nc, npolygonmax),
+    "multiccd_idx1": (nc, nmeshdegmax),
+    "multiccd_idx2": (nc, nmeshdegmax),
+    "multiccd_n1": (nc, nmeshdegmax),
+    "multiccd_n2": (nc, nmeshdegmax),
+    "multiccd_endvert": (nc, nmeshdegmax),
+    "multiccd_face1": (nc, npolygonmax),
+    "multiccd_face2": (nc, npolygonmax),
+  }
+  return ncollision, epa_iterations, shapes
 
 
 @event_scope
 def convex_narrowphase(
-  m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]], *, workspace=None
+  m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]], *, scratch=None, bindings=None
 ):
   """Runs narrowphase collision detection for convex geom pairs.
 
@@ -1328,21 +1329,35 @@ def convex_narrowphase(
 
   To optimize performance, this function dynamically builds and launches a specialized
   kernel for each type of convex collision pair present in the model, avoiding unnecessary
-  computations for non-existent pair types.
+  computations for non-existent pair types. Supplied scratch must be validated by
+  native workspace preparation and retained through execution; bindings require
+  that prepared scratch and an active graph recording.
   """
 
   def _pair_count(p1: int, p2: int) -> Tuple[int, int]:
     idx = upper_trid_index(len(GeomType), p1, p2)
     return m.geom_pair_type_count[idx], idx
 
-  ncollision, epa_iterations, specs = _convex_scratch_layout(m, collision_table, d.naccdmax)
+  if bindings is not None:
+    if scratch is None:
+      raise ValueError("Dynamic execution requires prepared convex scratch")
+    step_execution._validate_bindings(bindings)
+  ncollision, epa_iterations, shapes = _convex_scratch_shapes(m, collision_table, d.naccdmax)
   if ncollision == 0:
     return
-  scratch = (
-    _ConvexScratch(**{name: wp.empty(shape, dtype=dtype) for name, shape, dtype, _ in specs})
-    if workspace is None
-    else workspace._convex
-  )
+  if scratch is None:
+    hints = get_type_hints(_ConvexScratch)
+    if set(shapes) != set(hints) or any(len(shapes[name]) != hint.ndim for name, hint in hints.items()):
+      raise ValueError("Convex shapes must match the typed scratch declaration")
+    scratch = _ConvexScratch(
+      **{name: wp.empty(shapes[name], dtype=hint.dtype, device=d.ncollision.device) for name, hint in hints.items()}
+    )
+  if bindings is not None:
+    try:
+      step_execution._begin_recording(bindings)
+    except BaseException:
+      step_execution._fail_recording(bindings)
+      raise
   scratch.nccd.zero_()
   use_multiccd = (m.opt.disableflags & DisableBit.MULTICCD) == 0
 
@@ -1454,7 +1469,7 @@ def convex_narrowphase(
       )
       ccd_grid = _ccd_grid_size(ccd_k, d.naconmax, d.ncollision.device)
       launch_step_kernel(
-        None if workspace is None else workspace.bindings,
+        bindings,
         ccd_k,
         dim=ccd_grid,
         extent_domain=None,
