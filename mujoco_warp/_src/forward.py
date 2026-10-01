@@ -1004,7 +1004,7 @@ def implicit(m: Model, d: Data, *, workspace=None):
   if m.opt.integrator == IntegratorType.IMPLICIT:
     # 1. Smooth velocity derivatives into M-structure
     qH_M = wp.empty((d.nworld, m.nC), dtype=float)
-    derivative.deriv_smooth_vel(m, d, qH_M, workspace=workspace)
+    derivative.deriv_smooth_vel(m, d, qH_M)
 
     # 2. Map qH_M (M-structure) to qLU (D-structure) via mapM2D.
     wp.launch(
@@ -1031,7 +1031,10 @@ def implicit(m: Model, d: Data, *, workspace=None):
     qDeriv = wp.empty((d.nworld, m.nC), dtype=float) if workspace is None else workspace.arrays["qDeriv"]
     qLD = wp.empty_like(d.qLD) if workspace is None else workspace.arrays["qLD"]
     qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float) if workspace is None else workspace.arrays["qLDiagInv"]
-    derivative.deriv_smooth_vel(m, d, qDeriv, workspace=workspace)
+    if workspace is None:
+      derivative.deriv_smooth_vel(m, d, qDeriv)
+    else:
+      derivative._deriv_smooth_vel(m, d, qDeriv, workspace.arrays["actuator_vel"], bindings=workspace.bindings)
     if m.body_freeadr.size > 0:
       wp.launch(
         _implicit_free_body_reset_m,
@@ -1127,7 +1130,10 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
       else:
         collision(m, d, awake_prev=awake_prev, workspace=workspace)
 
-  constraint.make_constraint(m, d, workspace=workspace)
+  if workspace is None:
+    constraint.make_constraint(m, d)
+  else:
+    constraint._make_constraint(m, d, workspace.arrays["efc_nnz"], bindings=workspace.bindings)
 
   if sleep_enabled:
     if m.neq > 0:
@@ -1135,8 +1141,14 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
     sleep.update_sleep(m, d, workspace=workspace)
 
   if sleep_enabled:
-    island.island(m, d, workspace=workspace)
-  smooth.transmission(m, d, workspace=workspace)
+    if workspace is None:
+      island.island(m, d)
+    else:
+      island._island(m, d, workspace.arrays["island_parent"], bindings=workspace.bindings)
+  if workspace is None:
+    smooth.transmission(m, d)
+  else:
+    smooth._compute_transmission(m, d, workspace.arrays["moment_nnz"], body_ncon=None, bindings=workspace.bindings)
 
 
 @wp.kernel
