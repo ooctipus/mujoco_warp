@@ -16,7 +16,7 @@
 import dataclasses
 import functools
 import warnings
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, get_args, get_origin
 
 import mujoco
 import numpy as np
@@ -35,6 +35,73 @@ from mujoco_warp._src.set_const import set_const_spring as set_const_spring
 from mujoco_warp._src.set_const import set_length_range as set_length_range
 
 wp.set_module_options({"default_grid_stride": False})
+
+
+def array_fields(source):
+  """Yield borrowed arrays as ``(path, array, declared_shape)`` in declaration order.
+
+  Experimental. Traverse native dataclasses, tuples and lists without reading device data.
+  Paths identify bindings, including indexed entries such as ``M_tiles[0].elemid``. Dimensions
+  come from the existing native type annotations, never from equal numerical extents. An
+  unannotated array has an empty declared shape. Every declared occurrence is returned even
+  when multiple fields alias one array; this enumeration does not assign storage ownership.
+  Unsupported mutable metadata is rejected rather than silently omitting its arrays.
+  """
+
+  def visit(value, path, annotation=None):
+    if isinstance(value, wp.array):
+      yield path, value, tuple(getattr(annotation, "shape", ()))
+    elif dataclasses.is_dataclass(value):
+      for field in dataclasses.fields(value):
+        name = f"{path}.{field.name}" if path else field.name
+        yield from visit(getattr(value, field.name), name, field.type)
+    elif isinstance(value, (tuple, list)):
+      args = get_args(annotation)
+      repeated_type = get_origin(annotation) is list or (len(args) == 2 and args[1] is Ellipsis)
+      if args and not repeated_type and len(args) != len(value):
+        raise ValueError(f"Native tuple annotation does not match field length: {path}")
+      for index, child in enumerate(value):
+        item_type = args[0] if repeated_type else args[index] if args else None
+        yield from visit(child, f"{path}[{index}]", item_type)
+    elif isinstance(value, (dict, set, np.ndarray)):
+      raise TypeError(f"Unsupported mutable native field at {path}: {type(value).__name__}")
+
+  yield from visit(source, "")
+
+
+def replace_arrays(source, arrays):
+  """Return the native record tree with specified array bindings replaced.
+
+  Experimental. Keys must be paths from ``array_fields(source)``. Replacements retain the
+  existing dtype and rank; dimensions and device may change. Unspecified arrays and scalar
+  metadata are borrowed unchanged, while dataclass, tuple and list containers are rebuilt.
+  No payload is allocated, copied or validated for physics readiness. Change scalar metadata
+  explicitly with ``dataclasses.replace``; this operation only binds existing array fields.
+  """
+  declared = {path: array for path, array, _ in array_fields(source)}
+  unknown = set(arrays) - declared.keys()
+  if unknown:
+    raise ValueError(f"Cannot bind unknown native array fields: {sorted(unknown)}")
+  for path, array in arrays.items():
+    if not isinstance(array, wp.array) or (array.dtype, array.ndim) != (declared[path].dtype, declared[path].ndim):
+      raise ValueError(f"Replacement must retain native array dtype and rank: {path}")
+
+  def bind(value, path):
+    if path in arrays:
+      return arrays[path]
+    if dataclasses.is_dataclass(value):
+      return dataclasses.replace(
+        value,
+        **{
+          field.name: bind(getattr(value, field.name), f"{path}.{field.name}" if path else field.name)
+          for field in dataclasses.fields(value)
+        },
+      )
+    if isinstance(value, (tuple, list)):
+      return type(value)(bind(child, f"{path}[{index}]") for index, child in enumerate(value))
+    return value
+
+  return bind(source, "")
 
 
 @wp.kernel
@@ -110,39 +177,22 @@ def _repeat_constraint_contact_ids(
   ids_out[world, row] = value
 
 
-def _replicate_device_fields(source, nworld: int, overrides=None, array_copy=None):
-  """Copy a prepared dataclass using its existing dimension annotations."""
-  if dataclasses.is_dataclass(source):
-    values = {}
-    for field in dataclasses.fields(source):
-      if overrides is not None and field.name in overrides:
-        values[field.name] = overrides[field.name]
-        continue
-      value = getattr(source, field.name)
-      shape = getattr(field.type, "shape", ())
-      if isinstance(value, wp.array) and shape and shape[0] in ("*", "nworld"):
-        if array_copy is not None:
-          values[field.name] = array_copy(value, True)
-          continue
-        if value.shape[0] == 0:
-          values[field.name] = wp.clone(value)
-          continue
-        if value.shape[0] != 1:
-          raise ValueError(f"Replication requires a one-world source: {field.name} has shape {value.shape}")
-        target = wp.empty((nworld, *value.shape[1:]), dtype=value.dtype, device=value.device)
-        if target.size:
-          wp.launch(_repeat_array_kernel(value.dtype), target.size, [value.flatten()], [target.flatten()], device=value.device)
-        values[field.name] = target
-      else:
-        values[field.name] = _replicate_device_fields(value, nworld, array_copy=array_copy)
-    return type(source)(**values)
-  if isinstance(source, wp.array):
-    return wp.clone(source) if array_copy is None else array_copy(source, False)
-  if isinstance(source, tuple):
-    return tuple(_replicate_device_fields(value, nworld, array_copy=array_copy) for value in source)
-  if isinstance(source, (dict, list, set, np.ndarray)):
-    raise TypeError(f"Unsupported mutable replication field: {type(source).__name__}")
-  return source
+def _replicate_device_fields(source, nworld: int, overrides=None):
+  """Copy native fields, expanding the explicitly declared world axes."""
+  overrides, arrays = overrides or {}, {}
+  for name, value, shape in array_fields(source):
+    if name.split(".", 1)[0].split("[", 1)[0] in overrides:
+      continue
+    if shape and shape[0] in ("*", "nworld") and value.shape[0]:
+      if value.shape[0] != 1:
+        raise ValueError(f"Replication requires a one-world source: {name} has shape {value.shape}")
+      target = wp.empty((nworld, *value.shape[1:]), dtype=value.dtype, device=value.device)
+      if target.size:
+        wp.launch(_repeat_array_kernel(value.dtype), target.size, [value.flatten()], [target.flatten()], device=value.device)
+      arrays[name] = target
+    else:
+      arrays[name] = wp.clone(value)
+  return dataclasses.replace(replace_arrays(source, arrays), **overrides)
 
 
 @wp.struct
@@ -244,24 +294,6 @@ def _device_copy_bytes(
     target_out[i] = wp.uint8(0)
 
 
-def _device_copy_arrays(value, repeated=False, owner=None, contacts=None):
-  """Visit canonical storage: mode 0 copies, 1 repeats worlds, 2 repeats valid contacts."""
-  if dataclasses.is_dataclass(value):
-    for field in dataclasses.fields(value):
-      shape = getattr(field.type, "shape", ())
-      yield from _device_copy_arrays(getattr(value, field.name), bool(shape and shape[0] in ("*", "nworld")), value, contacts)
-  elif isinstance(value, wp.array):
-    mode = 2 if contacts is not None and owner is contacts else int(repeated)
-    if mode == 1 and value.shape[0] not in (0, 1):
-      raise ValueError(f"Replication requires a one-world source, got shape {value.shape}")
-    yield value, mode
-  elif isinstance(value, tuple):
-    for item in value:
-      yield from _device_copy_arrays(item, contacts=contacts)
-  elif isinstance(value, (dict, list, set, np.ndarray)):
-    raise TypeError(f"Unsupported mutable replication field: {type(value).__name__}")
-
-
 class _DeviceCopyPlan:
   """Source-owned array descriptors; no population sizes or physics snapshots are cached."""
 
@@ -331,15 +363,22 @@ class _DeviceCopyPlan:
       if arrays[index] is None:
         shape = (value.shape[0] * nworld, *value.shape[1:]) if mode else value.shape
         arrays[index] = wp.empty(shape, dtype=value.dtype, device=value.device)
-    replacements = iter(arrays)
-    result = _replicate_device_fields(source, nworld, overrides, array_copy=lambda _value, _repeated: next(replacements))
+    replacements = {name: array for (name, _, _), array in zip(array_fields(source), arrays, strict=True)}
+    result = dataclasses.replace(replace_arrays(source, replacements), **(overrides or {}))
     result._replication_storage = tuple(owners)
     return result
 
 
-def _packed_device_fields(source, nworld, overrides=None, contacts=None, nacon=None):
+def _packed_device_fields(source, nworld, overrides=None, nacon=None):
   """Use exact aligned arenas when storage permits a byte-preserving CUDA copy."""
-  fields = tuple(_device_copy_arrays(source, contacts=contacts))
+  # Contact fields repeat only their valid shared prefix; native world axes repeat full rows.
+  fields = tuple(
+    (value, 2 if nacon is not None and name.startswith("contact.") else int(bool(shape and shape[0] in ("*", "nworld"))))
+    for name, value, shape in array_fields(source)
+  )
+  for value, mode in fields:
+    if mode == 1 and value.shape[0] not in (0, 1):
+      raise ValueError(f"Replication requires a one-world source, got shape {value.shape}")
   if not fields or any(
     value.device != fields[0][0].device or not value.device.is_cuda or not value.is_contiguous or value.requires_grad
     for value, _ in fields
@@ -407,7 +446,6 @@ def replicate_data(data: types.Data, nworld: int) -> types.Data:
     data,
     nworld,
     dict(nworld=nworld, naconmax=data.naconmax * nworld, naccdmax=data.naccdmax * nworld),
-    contacts=data.contact,
     nacon=data.nacon,
   )
   if result is None:
@@ -755,7 +793,7 @@ def _world_copy_packed_rows(fields, source_ids, target_ids, status, nworld):
     return False
   arrays, totals = [], {1: 0, 4: 0}
   for name, src, dst in fields:
-    if name == ".efc.id" or not dst.size:
+    if name == "efc.id" or not dst.size:
       continue  # Contact indices have a separate checked rebasing operation.
     if any(value.device != device or not value.is_contiguous or value.requires_grad for value in (src, dst)):
       return False
@@ -809,14 +847,13 @@ def _world_copy_packed_rows(fields, source_ids, target_ids, status, nworld):
   return True
 
 
-def _world_copy_fields(source, target, nsource, ntarget, path=""):
+def _world_copy_fields(source, target, nsource, ntarget):
   """Use canonical dimension annotations, retaining destination topology/layout."""
   result = []
-  for field in dataclasses.fields(source):
-    src, dst = getattr(source, field.name), getattr(target, field.name)
-    name = f"{path}.{field.name}"
-    shape = getattr(field.type, "shape", ())
-    if isinstance(src, wp.array) and shape and shape[0] in ("*", "nworld"):
+  destination = {name: value for name, value, _ in array_fields(target)}
+  for name, src, shape in array_fields(source):
+    if shape and shape[0] in ("*", "nworld"):
+      dst = destination[name]
       if src.dtype != dst.dtype or src.shape[1:] != dst.shape[1:] or src.device != dst.device:
         raise ValueError(f"Incompatible world-copy field {name}")
       if not src.is_contiguous or not dst.is_contiguous:
@@ -828,8 +865,6 @@ def _world_copy_fields(source, target, nsource, ntarget, path=""):
       if src.size and src.ptr == dst.ptr:
         raise ValueError(f"World-copy source and destination must not alias: {name}")
       result.append((name, src, dst))
-    elif dataclasses.is_dataclass(src):
-      result.extend(_world_copy_fields(src, dst, nsource, ntarget, name))
   return result
 
 
@@ -980,9 +1015,9 @@ def copy_worlds(
       device=device,
     )
   if not _world_copy_packed_rows(fields, source_ids, target_ids, status, target_data.nworld):
-    row_kernels = {src.dtype: _world_copy_rows_kernel(src.dtype) for name, src, dst in fields if name != ".efc.id" and dst.size}
+    row_kernels = {src.dtype: _world_copy_rows_kernel(src.dtype) for name, src, dst in fields if name != "efc.id" and dst.size}
     for name, src, dst in fields:
-      if name == ".efc.id" or not dst.size or not source_ids.size:
+      if name == "efc.id" or not dst.size or not source_ids.size:
         continue
       width = dst.size // target_data.nworld
       wp.launch(

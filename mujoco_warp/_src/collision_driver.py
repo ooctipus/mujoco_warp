@@ -913,6 +913,7 @@ def nxn_broadphase(
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP)
   incremental = awake_prev is not None
   awake_prev_in = awake_prev if awake_prev is not None else d.body_awake
@@ -927,23 +928,28 @@ def nxn_broadphase(
     else:
       cond = workspace.arrays["awake_changed"]
       cond.zero_()
-    wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _any_awake_changed, (d.nworld, m.nbody), "world")
+    step_execution.launch_step_kernel(
+      bindings,
+      _any_awake_changed,
+      dim=(d.nworld, m.nbody),
+      inputs=[d.body_awake, awake_prev],
+      outputs=[cond],
+      extent_domain="world",
+    )
 
   def _launch():
-    launch_kernel = _nxn_broadphase(
-      m.opt.broadphase_filter,
-      m.geom_aabb.shape[0] > 1,
-      m.geom_rbound.shape[0] > 1,
-      m.geom_margin.shape[0] > 1,
-      m.geom_gap.shape[0] > 1,
-      m.geom_dataid.shape[0] > 1,
-      enable_sleep,
-      incremental,
-    )
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _nxn_broadphase(
+        m.opt.broadphase_filter,
+        m.geom_aabb.shape[0] > 1,
+        m.geom_rbound.shape[0] > 1,
+        m.geom_margin.shape[0] > 1,
+        m.geom_gap.shape[0] > 1,
+        m.geom_dataid.shape[0] > 1,
+        enable_sleep,
+        incremental,
+      ),
       dim=(d.nworld, m.nxn_geom_pair_filtered.shape[0]),
       inputs=[
         m.body_treeid,
@@ -970,15 +976,9 @@ def nxn_broadphase(
         ctx.collision_pairid,
         ctx.collision_worldid,
       ],
+      extent_domain="world",
+      parameter_domains={"naconmax_in": "candidate"},
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(
-        workspace.bindings,
-        launch_kernel,
-        (d.nworld, m.nxn_geom_pair_filtered.shape[0]),
-        "world",
-        parameter_domains={"naconmax_in": "candidate"},
-      )
 
   if cond is not None:
     wp.capture_if(cond, on_true=_launch)

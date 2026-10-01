@@ -55,11 +55,13 @@ from mujoco_warp._src.history import read_ctrl as read_ctrl
 from mujoco_warp._src.history import read_sensor as read_sensor
 from mujoco_warp._src.history import reset_history as reset_history
 from mujoco_warp._src.inverse import inverse as inverse
+from mujoco_warp._src.io import array_fields as array_fields
 from mujoco_warp._src.io import copy_worlds as copy_worlds
 from mujoco_warp._src.io import get_data_into as get_data_into
 from mujoco_warp._src.io import make_data as make_data
 from mujoco_warp._src.io import put_data as put_data
 from mujoco_warp._src.io import put_model as put_model
+from mujoco_warp._src.io import replace_arrays as replace_arrays
 from mujoco_warp._src.io import replicate_data as replicate_data
 from mujoco_warp._src.io import replicate_model as replicate_model
 from mujoco_warp._src.io import reset_data as reset_data
@@ -101,9 +103,7 @@ from mujoco_warp._src.smooth import tendon as tendon
 from mujoco_warp._src.smooth import transmission as transmission
 from mujoco_warp._src.solver import solve as solve
 from mujoco_warp._src.step_execution import StepBindings as StepBindings
-from mujoco_warp._src.step_execution import bind_step_launch as bind_step_launch
 from mujoco_warp._src.step_execution import launch_step_kernel as launch_step_kernel
-from mujoco_warp._src.step_execution import validate_step_launch as validate_step_launch
 from mujoco_warp._src.support import contact_force as contact_force
 from mujoco_warp._src.support import get_state as get_state
 from mujoco_warp._src.support import jac as jac

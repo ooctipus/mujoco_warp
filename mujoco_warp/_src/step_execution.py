@@ -187,7 +187,7 @@ def _validate_bindings(bindings):
     raise ValueError("Native recording binding changed; restore its original storage, counts, updates and ledgers")
 
 
-def validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains):
+def _resolve_launch_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains):
   """Resolve native count declarations before emitting a launch; mutate no recording state.
 
   A dynamic extent is the leading axis of world, candidate or CCD storage. Fixed
@@ -307,7 +307,7 @@ def launch_step_kernel(
       device=device,
       stream=stream,
     )
-  extent, parameters = validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains)
+  extent, parameters = _resolve_launch_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains)
   if bindings.updates is None:
     raise RuntimeError("Prepare native graph updates before recording step operations")
   if type(tiled) is not bool or (tiled and (type(block_dim) is not int or block_dim < 1)):
@@ -334,34 +334,6 @@ def launch_step_kernel(
     return binding
   except BaseException:
     _fail_recording(bindings, stream)
-    raise
-
-
-def bind_step_launch(bindings, kernel, dim, extent_domain, *, extent_axis=0, parameter_domains=None):
-  """Bind the just-emitted native kernel and retain its explicit count sources.
-
-  Call validate_step_launch before emission when declarations come from callers.
-  Zero-sized operations claim no node. Any other failure poisons this binding
-  record and the active graph, because a launch may already have been emitted.
-  """
-  if bindings is None:
-    return
-  try:
-    extent, parameters = validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains)
-    dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
-    if not all(dimensions):
-      return
-    _begin_recording(bindings)
-    binding = GraphKernelBinding(
-      graph_ops.register_last_kernel_node(bindings.updates),
-      launch_rank=kernel.adj.kernel_dim,
-      extent_axis=extent_axis,
-      extent_source=extent,
-      parameters=parameters,
-    )
-    _record_launch(bindings, binding, kernel, dim, extent_domain, parameter_domains)
-  except BaseException:
-    _fail_recording(bindings)
     raise
 
 

@@ -447,6 +447,72 @@ _MESH_RANDOMIZE_XML = """
 
 
 class IOTest(parameterized.TestCase):
+  def test_array_fields_and_replacement_share_one_native_domain(self):
+    """Keep annotation semantics, nested paths, aliases and source metadata during binding."""
+
+    @dataclasses.dataclass
+    class Leaf:
+      values: types.array("nworld", float)
+      label: int = 9
+
+    @dataclasses.dataclass
+    class Record:
+      nworld: int
+      nested: tuple
+      topology: tuple[types.array("nbody", float), ...]
+      parameters: list[types.array("*", float)]
+      empty: list
+
+    original = wp.zeros(2, dtype=float, device="cpu")
+    source = Record(1, (Leaf(original), [original, (Leaf(original),)]), (original,), [original], [])
+    expected = {
+      "nested[0].values": ("nworld",),
+      "nested[1][0]": (),
+      "nested[1][1][0].values": ("nworld",),
+      "topology[0]": ("nbody",),
+      "parameters[0]": ("*",),
+    }
+    with mock.patch.object(wp.array, "numpy", side_effect=AssertionError("device readback")):
+      self.assertEqual({name: shape for name, _, shape in io.array_fields(source)}, expected)
+      replacements = {name: wp.ones(3, dtype=float, device="cpu") for name in expected}
+      replaced = io.replace_arrays(source, replacements)
+    self.assertEqual(replaced.nworld, 1)
+    self.assertEqual(replaced.nested[0].label, 9)
+    self.assertIsInstance(replaced.nested, tuple)
+    self.assertIsInstance(replaced.nested[1], list)
+    self.assertEqual(replaced.empty, [])
+    for name, array, shape in io.array_fields(replaced):
+      self.assertIs(array, replacements[name], name)
+      self.assertEqual(shape, expected[name])
+    for _, array, _ in io.array_fields(source):
+      self.assertIs(array, original)
+    partial = io.replace_arrays(source, {"nested[0].values": replacements["nested[0].values"]})
+    self.assertIs(partial.topology[0], original)
+    self.assertIsNot(partial.nested, source.nested)
+    for invalid in ({"nested[2]": original}, {"nworld": original}):
+      with self.assertRaisesRegex(ValueError, "unknown native array fields"):
+        io.replace_arrays(source, invalid)
+    for invalid in (None, wp.zeros(2, dtype=int, device="cpu"), wp.zeros((1, 2), dtype=float, device="cpu")):
+      with self.assertRaisesRegex(ValueError, "dtype and rank"):
+        io.replace_arrays(source, {"nested[0].values": invalid})
+
+  def test_array_fields_rejects_unsupported_record_structure(self):
+    """Reject mutable metadata and malformed fixed tuple annotations before rebinding."""
+
+    @dataclasses.dataclass
+    class Record:
+      arrays: tuple[types.array("nworld", float)]
+
+    array = wp.zeros(1, dtype=float, device="cpu")
+    self.assertEqual(next(io.array_fields(Record((array,))))[2], ("nworld",))
+    with self.assertRaisesRegex(ValueError, "tuple annotation"):
+      tuple(io.array_fields(Record((array, array))))
+    for invalid in ({"field": array}, {1}, np.zeros(1)):
+      with self.assertRaisesRegex(TypeError, "Unsupported mutable native field"):
+        tuple(io.array_fields(invalid))
+      with self.assertRaisesRegex(TypeError, "Unsupported mutable native field"):
+        io.replace_arrays(invalid, {})
+
   @parameterized.parameters(("dense", False), ("sparse", True))
   def test_copy_worlds_preserves_snapshot_and_continuation(self, jacobian, sleeping):
     """Move real contacting worlds, including nonempty actuator delay history."""
@@ -496,7 +562,7 @@ class IOTest(parameterized.TestCase):
       status = mjwarp.copy_worlds(src_model, src, dst_model, dst, source_rows, target_rows)
     np.testing.assert_array_equal(status.numpy(), 0)
     for name, source_value, old_value, target in before:
-      if name == ".efc.id":
+      if name == "efc.id":
         continue
       expected = old_value.copy()
       expected[target_ids] = source_value[np.array(source_ids) % len(source_value)]

@@ -1411,11 +1411,12 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
     ctx: SolverContext.
     fuse_jv: Whether jv is computed in-kernel (True) or pre-computed (False).
   """
-  launch_kernel = _linesearch_iterative_kernel(
-    m.opt.ls_iterations, m.opt.cone, fuse_jv, m.is_sparse, _use_incremental(m), int(m.opt.warn_overflow)
-  )
-  wp.launch_tiled(
-    launch_kernel,
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
+    _linesearch_iterative_kernel(
+      m.opt.ls_iterations, m.opt.cone, fuse_jv, m.is_sparse, _use_incremental(m), int(m.opt.warn_overflow)
+    ),
     dim=d.nworld,
     inputs=[
       m.nv,
@@ -1461,14 +1462,9 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
       ctx.ls_exhausted,
     ],
     block_dim=m.block_dim.linesearch_iterative,
+    extent_domain="world",
+    tiled=True,
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(
-      workspace.bindings,
-      launch_kernel,
-      d.nworld,
-      "world",
-    )
 
 
 @wp.kernel
@@ -1577,6 +1573,7 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, *, workspace=
     d: Data
     ctx: SolverContext
   """
+  bindings = None if workspace is None else workspace.bindings
   # mv and jv are pure functions of the search direction, and M and J are
   # constant within a solve, so worlds whose search was kept reuse last
   # iteration's values.
@@ -1611,15 +1608,14 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, *, workspace=
         outputs=[ctx.jv],
       )
 
-    launch_kernel = _linesearch_jv_fused_kernel(sc or m.is_sparse, m.nv, dofs_per_thread, sc)
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _linesearch_jv_fused_kernel(sc or m.is_sparse, m.nv, dofs_per_thread, sc),
       dim=(d.nworld, d.njmax, threads_per_efc),
       inputs=[d.nefc, dj.efc.J_rownnz, dj.efc.J_rowadr, dj.efc.J_colind, dj.efc.J, dj.dof_cdof, ctx.search, skip],
       outputs=[ctx.jv],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, d.njmax, threads_per_efc), "world")
 
   _linesearch_iterative(m, d, ctx, fuse_jv, workspace=workspace)
 
@@ -2128,6 +2124,7 @@ def _update_constraint(
   workspace=None,
 ):
   """Update constraint arrays after each solve iteration."""
+  bindings = None if workspace is None else workspace.bindings
   efc_inputs = [
     m.opt.impratio_invsqrt,
     d.ne,
@@ -2146,15 +2143,14 @@ def _update_constraint(
     ctx.done,
   ]
 
-  launch_kernel = _update_constraint_efc(track_changes)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _update_constraint_efc(track_changes),
     dim=(d.nworld, d.njmax),
     inputs=efc_inputs,
     outputs=[d.efc.force, d.efc.state, ctx.quad_changed_ids, ctx.quad_changed_count, ctx.state_changed_count],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, d.njmax), "world")
 
   # qfrc_constraint = efc_J.T @ efc_force. Fast-path worlds with no state flips
   # skip the rebuild; the public value is recovered after the solve.
@@ -2162,33 +2158,31 @@ def _update_constraint(
   sc = _sparse_compact(ctx)
   if m.is_sparse or sc:
     dj = ctx.compact_d_full if sc else d
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _zero_qfrc_constraint_sparse,
       dim=(d.nworld, m.nv),
       inputs=[changed, ctx.done],
       outputs=[d.qfrc_constraint],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _zero_qfrc_constraint_sparse, (d.nworld, m.nv), "world")
-    launch_kernel = _update_constraint_init_qfrc_constraint_sparse(sc)
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _update_constraint_init_qfrc_constraint_sparse(sc),
       dim=(d.nworld, d.njmax),
       inputs=[d.nefc, dj.efc.J_rownnz, dj.efc.J_rowadr, dj.efc.J_colind, dj.efc.J, d.efc.force, dj.dof_cdof, changed, ctx.done],
       outputs=[d.qfrc_constraint],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, d.njmax), "world")
   else:
-    launch_kernel = _update_constraint_init_qfrc_constraint_dense(stable_fast)
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _update_constraint_init_qfrc_constraint_dense(stable_fast),
       dim=(d.nworld, m.nv),
       inputs=[d.nefc, d.efc.J, d.efc.force, d.njmax, changed, ctx.done],
       outputs=[d.qfrc_constraint],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
 
 @cache_kernel
@@ -2815,17 +2809,18 @@ def _cholesky_factorize_solve(
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
+  bindings = None if workspace is None else workspace.bindings
   if m.nv <= _BLOCK_CHOLESKY_DIM:
-    launch_kernel = _update_gradient_cholesky(m.nv, skip_noflip)
-    wp.launch_tiled(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _update_gradient_cholesky(m.nv, skip_noflip),
       dim=d.nworld,
       inputs=[ctx.grad, ctx.h, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
       outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
       block_dim=m.block_dim.update_gradient_cholesky,
+      extent_domain="world",
+      tiled=True,
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
   else:
     wp.launch(
       _padding_h,
@@ -2840,9 +2835,9 @@ def _cholesky_factorize_solve(
     )
     grad_column._ref, search_column._ref = ctx.grad, ctx.search
     if skip_unchanged:
-      launch_kernel = _update_gradient_cholesky_blocked_skip_unchanged(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, skip_noflip)
-      wp.launch_tiled(
-        launch_kernel,
+      step_execution.launch_step_kernel(
+        bindings,
+        _update_gradient_cholesky_blocked_skip_unchanged(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, skip_noflip),
         dim=d.nworld,
         inputs=[
           ctx.done,
@@ -2858,18 +2853,13 @@ def _cholesky_factorize_solve(
           ctx.newton_decrement,
         ],
         block_dim=m.block_dim.update_gradient_cholesky_blocked,
+        extent_domain="world",
+        tiled=True,
       )
-      if workspace is not None:
-        step_execution.bind_step_launch(
-          workspace.bindings,
-          launch_kernel,
-          d.nworld,
-          "world",
-        )
     else:
-      launch_kernel = _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv)
-      wp.launch_tiled(
-        launch_kernel,
+      step_execution.launch_step_kernel(
+        bindings,
+        _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv),
         dim=d.nworld,
         inputs=[ctx.done, grad_column, ctx.h, ctx.hfactor],
         outputs=[
@@ -2878,9 +2868,9 @@ def _cholesky_factorize_solve(
           ctx.newton_decrement,
         ],
         block_dim=m.block_dim.update_gradient_cholesky_blocked,
+        extent_domain="world",
+        tiled=True,
       )
-      if workspace is not None:
-        step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
 
 
 # ---------------------------------------------------------------------------
@@ -3156,6 +3146,7 @@ def _jtdaj_groups_per_world(nworld: int, njmax: int) -> int:
 
 def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, workspace=None):
   # grad = Ma - qfrc_smooth - qfrc_constraint
+  bindings = None if workspace is None else workspace.bindings
   if m.opt.solver == types.SolverType.CG:
     wp.launch_tiled(
       _update_gradient_grad_tiled,
@@ -3165,24 +3156,22 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       block_dim=m.block_dim.update_gradient_grad,
     )
   else:
-    launch_kernel = _update_gradient_zero_grad_dot(False)
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _update_gradient_zero_grad_dot(False),
       dim=d.nworld,
       inputs=[d.nefc, ctx.alpha, ctx.done],
       outputs=[ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
-    launch_kernel = _update_gradient_grad(False)
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _update_gradient_grad(False),
       dim=(d.nworld, m.nv),
       inputs=[d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, d.nefc, ctx.done],
       outputs=[ctx.grad, ctx.grad_dot],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
   if m.opt.solver == types.SolverType.CG:
     smooth.solve_m(m, d, ctx.Mgrad, ctx.grad)
@@ -3192,15 +3181,14 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
     if m.is_sparse or sc:
       mj = ctx.compact_m_full if sc else m
       dj = ctx.compact_d_full if sc else d
-      launch_kernel = _update_gradient_init_h_sparse(sc)
-      wp.launch(
-        launch_kernel,
+      step_execution.launch_step_kernel(
+        bindings,
+        _update_gradient_init_h_sparse(sc),
         dim=(d.nworld, m.nv_pad, m.nv_pad),
         inputs=[mj.nv, mj.M_elemid, dj.M, dj.cdof_dof, ctx.done],
         outputs=[ctx.h],
+        extent_domain="world",
       )
-      if workspace is not None:
-        step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv_pad, m.nv_pad), "world")
 
       groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax)
       max_condim = 3
@@ -3229,23 +3217,21 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       elliptic = m.opt.cone == types.ConeType.ELLIPTIC
       threads_per_group = 1 if elliptic and wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP
       block_dim = threads_per_group if elliptic else mj.block_dim.update_gradient_JTDAJ_sparse
-      wp.launch(
+      step_execution.launch_step_kernel(
+        bindings,
         jtdaj_kernel,
         dim=(d.nworld, groups_per_world, threads_per_group),
         inputs=jtdaj_inputs,
         outputs=[ctx.h],
         block_dim=block_dim,
+        extent_domain="world",
       )
-      if workspace is not None:
-        step_execution.bind_step_launch(
-          workspace.bindings, jtdaj_kernel, (d.nworld, groups_per_world, threads_per_group), "world"
-        )
     else:
       if compact:
         # compact path: d.M is the dense 3D compact inertia block (nworld, nv_pad, nv_pad)
-        launch_kernel = _update_gradient_JTDAJ_dense_tiled_compact(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax)
-        wp.launch_tiled(
-          launch_kernel,
+        step_execution.launch_step_kernel(
+          bindings,
+          _update_gradient_JTDAJ_dense_tiled_compact(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax),
           dim=d.nworld,
           inputs=[
             d.nefc,
@@ -3257,9 +3243,9 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
           ],
           outputs=[ctx.h],
           block_dim=m.block_dim.update_gradient_JTDAJ_dense,
+          extent_domain="world",
+          tiled=True,
         )
-        if workspace is not None:
-          step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
       else:
         wp.launch_tiled(
           _update_gradient_JTDAJ_dense_tiled(m.nv_pad, types.TILE_SIZE_JTDAJ_DENSE, d.njmax, m.M_colind.shape[0]),
@@ -3339,35 +3325,34 @@ def _update_gradient_incremental(
   Skips the full J^T*D*J rebuild by applying only the delta from constraints
   that changed QUADRATIC state, then re-factorizes and solves.
   """
+  bindings = None if workspace is None else workspace.bindings
   changed = ctx.state_changed_count if stable_fast else d.nefc
-  launch_kernel = _update_gradient_zero_grad_dot(stable_fast)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _update_gradient_zero_grad_dot(stable_fast),
     dim=d.nworld,
     inputs=[changed, ctx.alpha, ctx.done],
     outputs=[ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
 
-  launch_kernel = _update_gradient_grad(stable_fast)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _update_gradient_grad(stable_fast),
     dim=(d.nworld, m.nv),
     inputs=[d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, changed, ctx.done],
     outputs=[ctx.grad, ctx.grad_dot],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
   # Update upper triangle of H with delta from changed constraints.
   sc = _sparse_compact(ctx)
   if m.is_sparse or sc:
     dj = ctx.compact_d_full if sc else d
     slots = _jtdaj_groups_per_world(d.nworld, ctx.quad_changed_ids.shape[1])
-    launch_kernel = _update_gradient_h_incremental_sparse(sc)
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _update_gradient_h_incremental_sparse(sc),
       dim=(d.nworld, slots, _JTDAJ_THREADS_PER_GROUP),
       inputs=[
         dj.efc.J_rownnz,
@@ -3382,12 +3367,12 @@ def _update_gradient_incremental(
         slots,
       ],
       outputs=[ctx.h],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, slots, _JTDAJ_THREADS_PER_GROUP), "world")
   else:
     tri_dim = m.nv * (m.nv + 1) // 2
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _update_gradient_h_incremental,
       dim=(d.nworld, tri_dim),
       inputs=[
@@ -3398,9 +3383,8 @@ def _update_gradient_incremental(
         ctx.quad_changed_count,
       ],
       outputs=[ctx.h],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _update_gradient_h_incremental, (d.nworld, tri_dim), "world")
 
   _cholesky_factorize_solve(m, d, ctx, skip_unchanged=True, skip_noflip=stable_fast, workspace=workspace)
 
@@ -3607,6 +3591,7 @@ def _solver_iteration(
   *,
   workspace=None,
 ):
+  bindings = None if workspace is None else workspace.bindings
   _linesearch(m, d, ctx, workspace=workspace)
 
   # Incremental H is only valid for non-elliptic cones. The elliptic cone
@@ -3617,13 +3602,13 @@ def _solver_iteration(
 
   if incremental:
     # Must complete before _update_constraint_efc which atomically increments.
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _zero_change_counters,
       dim=d.nworld,
       outputs=[ctx.quad_changed_count, ctx.state_changed_count],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _zero_change_counters, d.nworld, "world")
 
   # The tracking also enables the stable-state fast path: worlds with no state
   # flips this iteration were exactly quadratic over the step, so grad/search
@@ -3672,9 +3657,9 @@ def _solver_iteration(
     )
 
   else:
-    launch_kernel = _solve_done(int(m.opt.warn_overflow))
-    wp.launch(
-      launch_kernel,
+    step_execution.launch_step_kernel(
+      bindings,
+      _solve_done(int(m.opt.warn_overflow)),
       dim=d.nworld,
       inputs=[
         m.nv,
@@ -3687,9 +3672,8 @@ def _solver_iteration(
         ctx.done,
       ],
       outputs=[d.solver_niter, d.overflow, nsolving, ctx.done],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
 
 
 def init_context(
@@ -3702,13 +3686,14 @@ def init_context(
   workspace=None,
 ):
   # initialize some efc arrays
-  wp.launch(
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     _solve_init_efc,
     dim=d.nworld,
     outputs=[d.solver_niter, ctx.search_dot, ctx.done],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _solve_init_efc, d.nworld, "world")
 
   # jaref = d.efc_J @ d.qacc - d.efc_aref
 
@@ -3737,15 +3722,14 @@ def init_context(
   if sc:
     dofs_per_thread = m.nv
     threads_per_efc = 1
-  launch_kernel = _solve_init_jaref_kernel(sc or m.is_sparse, m.nv, dofs_per_thread, sc)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _solve_init_jaref_kernel(sc or m.is_sparse, m.nv, dofs_per_thread, sc),
     dim=(d.nworld, d.njmax, threads_per_efc),
     inputs=[d.nefc, d.qacc, dj.efc.J_rownnz, dj.efc.J_rowadr, dj.efc.J_colind, dj.efc.J, d.efc.aref, dj.dof_cdof],
     outputs=[ctx.Jaref],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, d.njmax, threads_per_efc), "world")
 
   # Ma = M @ qacc
   _mul_m_compact_aware(m, d, ctx, d.efc.Ma, d.qacc, ctx.done, workspace=workspace)
@@ -3782,16 +3766,16 @@ def solve(m: types.Model, d: types.Data, *, workspace=None, rebuild_active_dofs:
 
 def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, workspace=None):
   """Finds forces that satisfy constraints."""
+  bindings = None if workspace is None else workspace.bindings
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
-  launch_kernel = _solve_init_dof(warmstart)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _solve_init_dof(warmstart),
     dim=(d.nworld, m.nv),
     inputs=[d.nefc, d.qacc_warmstart, d.qacc_smooth],
     outputs=[d.qacc, d.qfrc_constraint],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
   #  context
   init_context(m, d, ctx, grad=True, compact=compact, workspace=workspace)
@@ -3844,14 +3828,14 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   # the fast path leaves it stale, and the per-iteration zeroing wiped it for
   # worlds that converged early.
   if _use_incremental(m):
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _qfrc_constraint_from_grad,
       dim=(d.nworld, m.nv),
       inputs=[d.qfrc_smooth, d.efc.Ma, ctx.grad, ctx.grad_scale],
       outputs=[d.qfrc_constraint],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _qfrc_constraint_from_grad, (d.nworld, m.nv), "world")
 
 
 # Active-DOF compaction solve (nvmax < nv).
@@ -3924,10 +3908,12 @@ def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
 
 def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, res, vec, skip, *, workspace=None):
   """M @ vec: full-coordinate sparse walk under compact, support.mul_m natively."""
+  bindings = None if workspace is None else workspace.bindings
   dfull = ctx.compact_d_full
   if dfull is not None:
     mfull = ctx.compact_m_full
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _mul_m_sparse_compact,
       dim=(d.nworld, m.nv),
       inputs=[
@@ -3941,9 +3927,8 @@ def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | Inv
         skip,
       ],
       outputs=[res],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _mul_m_sparse_compact, (d.nworld, m.nv), "world")
   else:
     support.mul_m(m, d, res, vec, skip=skip, workspace=workspace)
 
@@ -4014,43 +3999,44 @@ def smooth_solve_compact(m: types.Model, d: types.Data, *, workspace=None):
 
   Inactive DOFs are frozen (qacc_smooth set to 0). Reads the sparse Model inertia.
   """
-  wp.launch(
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     _init_compact_inertia,
     dim=(d.nworld, d.nvmax_pad, d.nvmax_pad),
     inputs=[d.ncdof],
     outputs=[d.cM],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _init_compact_inertia, (d.nworld, d.nvmax_pad, d.nvmax_pad), "world")
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _gather_M_sparse,
     dim=(d.nworld, m.nv),
     inputs=[m.M_rownnz, m.M_rowadr, m.M_colind, d.M, d.dof_cdof],
     outputs=[d.cM],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _gather_M_sparse, (d.nworld, m.nv), "world")
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _gather_rhs_compact,
     dim=(d.nworld, d.nvmax_pad),
     inputs=[d.cdof_dof, d.qfrc_smooth],
     outputs=[d.crhs],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _gather_rhs_compact, (d.nworld, d.nvmax_pad), "world")
-  launch_kernel = _cholesky_factorize_solve_blocked(types.TILE_SIZE_JTDAJ_DENSE, d.nvmax_pad)
-  wp.launch_tiled(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _cholesky_factorize_solve_blocked(types.TILE_SIZE_JTDAJ_DENSE, d.nvmax_pad),
     dim=d.nworld,
     inputs=[d.cM, d.crhs],
     outputs=[d.cqLD, d.cx],
     block_dim=m.block_dim.update_gradient_cholesky_blocked,
+    extent_domain="world",
+    tiled=True,
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.nworld, "world")
-  wp.launch(_scatter_solution, dim=(d.nworld, m.nv), inputs=[d.dof_cdof, d.cx], outputs=[d.qacc_smooth])
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _scatter_solution, (d.nworld, m.nv), "world")
+  step_execution.launch_step_kernel(
+    bindings, _scatter_solution, dim=(d.nworld, m.nv), inputs=[d.dof_cdof, d.cx], outputs=[d.qacc_smooth], extent_domain="world"
+  )
 
 
 @wp.kernel
@@ -4198,40 +4184,42 @@ def solve_compact(m: types.Model, d: types.Data, *, workspace=None):
 
 @event_scope
 def _compact_gather(m: types.Model, d: types.Data, *, workspace=None):
+  bindings = None if workspace is None else workspace.bindings
   nvp = d.nvmax_pad
   # gather compacted dense inertia and Jacobian only for dense models;
   # sparse models read sparse M and J directly through compaction maps
   if not m.is_sparse:
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _init_compact_inertia,
       dim=(d.nworld, nvp, nvp),
       inputs=[d.ncdof],
       outputs=[d.cM],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _init_compact_inertia, (d.nworld, nvp, nvp), "world")
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _gather_M_sparse,
       dim=(d.nworld, m.nv),
       inputs=[m.M_rownnz, m.M_rowadr, m.M_colind, d.M, d.dof_cdof],
       outputs=[d.cM],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _gather_M_sparse, (d.nworld, m.nv), "world")
     if workspace is None:
       d.cJ.zero_()
     else:
       step_execution.fill_step_rows(workspace.bindings, d.cJ, 0, "world")
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _gather_J_dense,
       dim=(d.nworld, d.njmax),
       inputs=[d.nefc, d.dof_cdof, d.efc.J],
       outputs=[d.cJ],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _gather_J_dense, (d.nworld, d.njmax), "world")
   # gather compacted DOF-space vectors in a single launch
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _gather_dof_vecs_compact,
     dim=(d.nworld, nvp),
     inputs=[
@@ -4245,22 +4233,22 @@ def _compact_gather(m: types.Model, d: types.Data, *, workspace=None):
       d.cqacc_smooth,
       d.cqacc_warmstart,
     ],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _gather_dof_vecs_compact, (d.nworld, nvp), "world")
 
 
 @event_scope
 def _compact_scatter(m: types.Model, d: types.Data, *, workspace=None):
   # scatter results back to full DOF space (inactive frozen to 0) in one launch
-  wp.launch(
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     _scatter_dof_vecs,
     dim=(d.nworld, m.nv),
     inputs=[d.dof_cdof, d.cqacc, d.cqfrc_constraint],
     outputs=[d.qacc, d.qfrc_constraint],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _scatter_dof_vecs, (d.nworld, m.nv), "world")
 
   # Refresh full d.efc.Ma = M @ qacc. The integrators (Euler/implicit damping) use Ma as
   # the RHS; the compact solve only populated the compacted Ma, so recompute it in full
