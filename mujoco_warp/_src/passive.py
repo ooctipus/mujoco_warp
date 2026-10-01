@@ -598,7 +598,7 @@ def _fluid_force(
   fluid_applied_out[worldid, bodyid] = wp.spatial_vector(force_global, torque_global)
 
 
-def _fluid(m: Model, d: Data, *, workspace=None):
+def _fluid(m: Model, d: Data):
   fluid_applied = wp.empty((d.nworld, m.nbody), dtype=wp.spatial_vector)
 
   wp.launch(
@@ -627,7 +627,7 @@ def _fluid(m: Model, d: Data, *, workspace=None):
     outputs=[fluid_applied],
   )
 
-  support.apply_ft(m, d, fluid_applied, d.qfrc_fluid, False, workspace=workspace)
+  support.apply_ft(m, d, fluid_applied, d.qfrc_fluid, False)
 
 
 @wp.kernel
@@ -1373,6 +1373,7 @@ def passive(m: Model, d: Data, *, workspace=None):
   """Adds all passive forces."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
   dsbl_spring = m.opt.disableflags & DisableBit.SPRING
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
@@ -1391,7 +1392,8 @@ def passive(m: Model, d: Data, *, workspace=None):
       step_execution.fill_step_rows(workspace.bindings, d.qfrc_passive, 0, "world")
     return
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _spring_damper_dof_passive,
     dim=(d.nworld, m.njnt),
     inputs=[
@@ -1408,9 +1410,8 @@ def passive(m: Model, d: Data, *, workspace=None):
       d.qvel,
     ],
     outputs=[d.qfrc_spring, d.qfrc_damper],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _spring_damper_dof_passive, (d.nworld, m.njnt), "world")
 
   if m.ntendon:
     wp.launch(
@@ -1564,7 +1565,8 @@ def passive(m: Model, d: Data, *, workspace=None):
   else:
     step_execution.fill_step_rows(workspace.bindings, d.qfrc_gravcomp, 0, "world")
   if gravity_enabled:
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _gravity_force,
       dim=(d.nworld, m.nbody - 1, m.nv),
       inputs=[
@@ -1580,9 +1582,8 @@ def passive(m: Model, d: Data, *, workspace=None):
         d.cdof,
       ],
       outputs=[d.qfrc_gravcomp],
+      extent_domain="world",
     )
-    if workspace is not None:
-      step_execution.bind_step_launch(workspace.bindings, _gravity_force, (d.nworld, m.nbody - 1, m.nv), "world")
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
   if m.nflex and m.nflexintcell > 0:
@@ -1623,12 +1624,12 @@ def passive(m: Model, d: Data, *, workspace=None):
 
   if m.nflex > 0:
     if not dsbl_spring:
-      support.apply_ft(m, d, flex_spring_body_force, d.qfrc_spring, True, workspace=workspace)
+      support.apply_ft(m, d, flex_spring_body_force, d.qfrc_spring, True)
     if not dsbl_damper:
-      support.apply_ft(m, d, flex_damper_body_force, d.qfrc_damper, True, workspace=workspace)
+      support.apply_ft(m, d, flex_damper_body_force, d.qfrc_damper, True)
 
   if m.has_fluid:
-    _fluid(m, d, workspace=workspace)
+    _fluid(m, d)
 
   if workspace is None:
     d.qfrc_adhesion.zero_()
@@ -1661,9 +1662,9 @@ def passive(m: Model, d: Data, *, workspace=None):
       ],
     )
 
-  launch_kernel = _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled),
     dim=(d.nworld, m.nv),
     inputs=[
       m.jnt_actgravcomp,
@@ -1677,9 +1678,8 @@ def passive(m: Model, d: Data, *, workspace=None):
     outputs=[
       d.qfrc_passive,
     ],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
   if m.callback.passive:
     m.callback.passive(m, d)

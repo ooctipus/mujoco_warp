@@ -8,6 +8,7 @@ import unittest
 import weakref
 from contextlib import ExitStack
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import PropertyMock
@@ -33,9 +34,8 @@ from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src import workspace as native_workspace
 from mujoco_warp._src.step_execution import StepBindings
-from mujoco_warp._src.step_execution import bind_step_launch
+from mujoco_warp._src.step_execution import _resolve_launch_counts
 from mujoco_warp._src.step_execution import launch_step_kernel
-from mujoco_warp._src.step_execution import validate_step_launch
 from mujoco_warp._src.workspace import WorkspaceFieldSpec
 from mujoco_warp._src.workspace import _StepWorkspace
 from mujoco_warp._src.workspace import make_step_workspace
@@ -154,7 +154,20 @@ def _binding_capture(bindings):
 
   graph = CapturedGraph()
   graph.device = bindings.world_storage.device
+
+  def emit(updates, kernel, dim, **kwargs):
+    if not all((dim,) if isinstance(dim, int) else dim):
+      return None
+    return GraphKernelBinding(
+      123,
+      launch_rank=kernel.adj.kernel_dim,
+      extent_axis=kwargs["extent_axis"],
+      extent_source=kwargs["extent_source"],
+      parameters=kwargs["parameters"],
+    )
+
   with (
+    patch.object(native_execution.graph_ops, "launch", side_effect=emit),
     patch.object(native_execution.graph_ops, "current_capture", return_value=graph),
     patch.object(wp, "get_stream", return_value=None),
     patch.object(native_execution.graph_ops, "register_last_kernel_node", return_value=123) as register,
@@ -163,12 +176,34 @@ def _binding_capture(bindings):
 
 
 class NativeBindingsTest(unittest.TestCase):
+  def test_no_split_launch_binding_or_unsupported_stage_workspace_plumbing(self):
+    """Gate the native execution boundary independently of numerical output parity."""
+    for path in Path(native_execution.__file__).parent.glob("*.py"):
+      if path.name.endswith("_test.py"):
+        continue
+      with self.subTest(module=path.name):
+        tree = ast.parse(path.read_text())
+        self.assertFalse(
+          any(
+            isinstance(node, (ast.FunctionDef, ast.Name, ast.Attribute))
+            and getattr(node, "name", getattr(node, "id", getattr(node, "attr", None))) == "bind_step_launch"
+            for node in ast.walk(tree)
+          )
+        )
+    import mujoco_warp as mjw
+
+    for name in ("euler", "rungekutta4", "rne_postconstraint", "energy_vel", "sensor_pos", "sensor_vel", "sensor_acc"):
+      with self.subTest(operation=name):
+        self.assertNotIn("workspace", inspect.signature(getattr(mjw, name)).parameters)
+
   def test_public_binding_record_is_passive_and_package_resources_are_canonical(self):
     import mujoco_warp as mjw
 
     self.assertIs(mjw.StepBindings, StepBindings)
-    self.assertIs(mjw.validate_step_launch, validate_step_launch)
-    self.assertIs(mjw.bind_step_launch, bind_step_launch)
+    self.assertFalse(hasattr(mjw, "validate_step_launch"))
+    self.assertFalse(hasattr(mjw, "_resolve_launch_counts"))
+    self.assertFalse(hasattr(mjw, "bind_step_launch"))
+    self.assertFalse(hasattr(native_execution, "bind_step_launch"))
     self.assertIs(mjw.launch_step_kernel, launch_step_kernel)
     self.assertEqual(
       [f.name for f in dataclasses.fields(StepBindings) if not f.name.startswith("_")],
@@ -209,8 +244,7 @@ class NativeBindingsTest(unittest.TestCase):
       )
     for name in (
       "StepBindings",
-      "validate_step_launch",
-      "bind_step_launch",
+      "_resolve_launch_counts",
       "launch_step_kernel",
       "_binding_layout",
       "_validate_bindings",
@@ -349,51 +383,6 @@ class NativeBindingsTest(unittest.TestCase):
       None, kernel, (3, 4), inputs=inputs, outputs=outputs, tiled=True, block_dim=32, max_blocks=7, device=device, stream=stream
     )
 
-  def test_explicit_named_count_sources_and_fixed_worker_grid(self):
-    bindings, kernel = _step_bindings(), _native_kernel()
-    with _binding_capture(bindings) as (graph, register):
-      bind_step_launch(
-        bindings,
-        kernel,
-        (17, 17),
-        "world",
-        parameter_domains={
-          "world_live_count": "world",
-          "contact_cap": "candidate",
-        },
-      )
-      binding = bindings.bindings[-1]
-      self.assertIs(binding.extent_source, bindings.world_storage.protected_count)
-      self.assertEqual([parameter.argument_index for parameter in binding.parameters], [2, 3])
-      self.assertIs(binding.parameters[0].source, bindings.world_storage.protected_count)
-      self.assertIs(binding.parameters[1].source, bindings.contact_storage.ready_count)
-      self.assertEqual([parameter.maximum for parameter in binding.parameters], [17, 17])
-      bind_step_launch(bindings, kernel, (17, 17), "candidate")
-      self.assertIs(bindings.bindings[-1].extent_source, bindings.contact_storage.ready_count)
-      bind_step_launch(
-        bindings,
-        kernel,
-        (17, 17),
-        None,
-        extent_axis=None,
-        parameter_domains={
-          "contact_cap": "candidate",
-          "ccd_cap": "ccd",
-        },
-      )
-      binding = bindings.bindings[-1]
-      self.assertIsNone(binding.extent_axis)
-      self.assertIsNone(binding.extent_source)
-      self.assertIs(binding.parameters[1].source, bindings.ccd_storage.ready_count)
-      self.assertNotIn(1, [parameter.argument_index for parameter in binding.parameters])
-      self.assertEqual(register.call_count, 3)
-      self.assertEqual(sum(owner is bindings for owner in graph._resource_owners), 1)
-      self.assertEqual([row["extent_domain"] for row in bindings.operations], ["world", "candidate", None])
-      for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
-        self.assertIn(graph, storage._graphs)
-        with self.assertRaisesRegex(RuntimeError, "retained by graphs"):
-          native_execution.field_ops.close(storage, streams=(0,))
-
   def test_invalid_declarations_preflight_without_emission_or_poisoning(self):
     cases = [
       ("unknown", 0, {}),
@@ -410,27 +399,14 @@ class NativeBindingsTest(unittest.TestCase):
     with patch.object(native_execution.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
       for domain, axis, parameters in cases:
         with self.subTest(domain=domain, axis=axis, parameters=parameters), self.assertRaises(ValueError):
-          validate_step_launch(bindings, kernel, domain, axis, parameters)
+          _resolve_launch_counts(bindings, kernel, domain, axis, parameters)
       kernel.adj.args[1].type = wp.int64
       with self.assertRaisesRegex(ValueError, "int32"):
-        validate_step_launch(bindings, kernel, "world", 0, {"world_live_count": "world"})
+        _resolve_launch_counts(bindings, kernel, "world", 0, {"world_live_count": "world"})
     self.assertFalse(bindings.recording_failed)
     self.assertEqual(bindings.bindings, [])
     self.assertEqual(bindings.operations, [])
     self.assertIsNone(bindings._recording_binding)
-
-  def test_zero_extent_claims_no_previous_node(self):
-    bindings, kernel = _step_bindings(), _native_kernel()
-    with patch.object(native_execution.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
-      bind_step_launch(bindings, kernel, (0, 17), "world")
-    self.assertEqual(bindings.bindings, [])
-    self.assertIsNone(bindings._recording_binding)
-    with _binding_capture(bindings) as (graph, register):
-      with self.assertRaisesRegex(ValueError, "Unknown native extent"):
-        bind_step_launch(bindings, kernel, (0, 17), "unknown")
-      register.assert_not_called()
-      self.assertTrue(bindings.recording_failed)
-      self.assertTrue(graph._preparation_failed)
 
   def test_bounded_memory_operations_use_explicit_native_domain_sources(self):
     bindings = _step_bindings()
@@ -486,14 +462,13 @@ class NativeBindingsTest(unittest.TestCase):
               native_execution.copy_step_rows(bindings, array, source, domain)
 
   def test_post_emission_failures_poison_native_and_shared_graph_without_fallback(self):
-    for name in ("fill", "copy", "bind"):
+    for name in ("fill", "copy"):
       for error in (ArithmeticError, KeyboardInterrupt):
         bindings = _step_bindings()
         array = wp.empty(12, dtype=wp.float32, device="cpu")
         operation = {
           "fill": lambda: native_execution.fill_step_rows(bindings, array, 0, "world"),
           "copy": lambda: native_execution.copy_step_rows(bindings, array, array, "world"),
-          "bind": lambda: bind_step_launch(bindings, _native_kernel(), (17, 17), "world"),
         }[name]
         with (
           self.subTest(operation=name, error=error),
@@ -502,20 +477,18 @@ class NativeBindingsTest(unittest.TestCase):
           patch.object(native_execution.field_ops, "copy", side_effect=error("recording failed")),
           patch.object(wp, "copy", side_effect=AssertionError("Unexpected dense copy")),
         ):
-          if name == "bind":
-            register.side_effect = error("recording failed")
           with self.assertRaisesRegex(error, "recording failed"):
             operation()
           self.assertTrue(bindings.recording_failed)
           self.assertTrue(graph._preparation_failed)
           self.assertTrue(any(owner is bindings for owner in graph._resource_owners))
           with self.assertRaisesRegex(RuntimeError, "failed recording"):
-            validate_step_launch(bindings, _native_kernel(), "world", 0, {})
+            _resolve_launch_counts(bindings, _native_kernel(), "world", 0, {})
 
   def test_recording_rejects_replaced_sources_updater_or_ledgers_but_allows_count_values(self):
     bindings, kernel = _step_bindings(), _native_kernel()
     with _binding_capture(bindings):
-      bind_step_launch(bindings, kernel, (17, 17), "world")
+      launch_step_kernel(bindings, kernel, (17, 17), extent_domain="world")
       for owner, name, value in (
         (bindings, "updates", _update_table(bindings)),
         (bindings, "world_storage", dataclasses.replace(bindings.world_storage)),
@@ -528,12 +501,12 @@ class NativeBindingsTest(unittest.TestCase):
         try:
           setattr(owner, name, value)
           with self.subTest(name=name), self.assertRaisesRegex(ValueError, "recording binding changed"):
-            validate_step_launch(bindings, kernel, "world", 0, {})
+            _resolve_launch_counts(bindings, kernel, "world", 0, {})
         finally:
           setattr(owner, name, original)
       bindings.world_storage.protected_count.fill_(3)
       bindings.contact_storage.ready_count.fill_(5)
-      validate_step_launch(bindings, kernel, "world", 0, {})
+      _resolve_launch_counts(bindings, kernel, "world", 0, {})
       self.assertFalse(bindings.recording_failed)
 
   def test_sources_and_update_enable_count_have_one_bounded_device_contract(self):
@@ -541,17 +514,17 @@ class NativeBindingsTest(unittest.TestCase):
       bindings = _step_bindings()
       setattr(bindings.contact_storage, name, value)
       with self.subTest(name=name), self.assertRaises(ValueError):
-        validate_step_launch(bindings, _native_kernel(), "world", 0, {})
+        _resolve_launch_counts(bindings, _native_kernel(), "world", 0, {})
     for count in (wp.zeros(2, dtype=wp.int32, device="cpu"), wp.zeros(1, dtype=wp.int64, device="cpu")):
       bindings = _step_bindings()
       bindings.ccd_storage.ready_count = count
       with self.assertRaisesRegex(ValueError, "int32 scalars"):
-        validate_step_launch(bindings, _native_kernel(), "world", 0, {})
+        _resolve_launch_counts(bindings, _native_kernel(), "world", 0, {})
     bindings = _step_bindings()
     bindings.updates = _update_table(bindings)
     bindings.updates.enable_count = bindings.world_storage.ready_count
     with self.assertRaisesRegex(ValueError, "exact world protected count"):
-      validate_step_launch(bindings, _native_kernel(), "world", 0, {})
+      _resolve_launch_counts(bindings, _native_kernel(), "world", 0, {})
 
   def test_retired_storage_rejects_before_emission_and_malformed_borrows_preserve_errors(self):
     for domain in ("world_storage", "contact_storage", "ccd_storage"):
@@ -559,20 +532,20 @@ class NativeBindingsTest(unittest.TestCase):
         bindings = _step_bindings()
         setattr(getattr(bindings, domain), flag, True)
         with self.subTest(domain=domain, flag=flag), self.assertRaisesRegex(RuntimeError, "closed or quarantined"):
-          validate_step_launch(bindings, _native_kernel(), "world", 0, {})
+          _resolve_launch_counts(bindings, _native_kernel(), "world", 0, {})
         self.assertFalse(bindings.recording_failed)
     bindings = _step_bindings()
     bindings.world_storage = object()
     with self.assertRaisesRegex(TypeError, "borrow FieldStorage"):
-      bind_step_launch(bindings, _native_kernel(), (17, 17), "world")
-    self.assertTrue(bindings.recording_failed)
+      launch_step_kernel(bindings, _native_kernel(), (17, 17), extent_domain="world")
+    self.assertFalse(bindings.recording_failed)
     bindings = _step_bindings()
     with _binding_capture(bindings) as (graph, _):
-      bind_step_launch(bindings, _native_kernel(), (17, 17), "world")
+      launch_step_kernel(bindings, _native_kernel(), (17, 17), extent_domain="world")
       bindings.world_storage = object()
       with self.assertRaisesRegex(TypeError, "borrow FieldStorage"):
-        bind_step_launch(bindings, _native_kernel(), (17, 17), "world")
-      self.assertTrue(graph._preparation_failed)
+        launch_step_kernel(bindings, _native_kernel(), (17, 17), extent_domain="world")
+      self.assertFalse(getattr(graph, "_preparation_failed", False))
 
 
 class ConvexScratchTest(unittest.TestCase):
@@ -802,16 +775,19 @@ class WorkspaceTest(unittest.TestCase):
     # Sites are allowed in prepared models, even though keyboard fixtures have none.
     model = Mock(nbranch=2, nbody=3, ngeom=4, nsite=2)
     data = Mock(nworld=7)
-    emitted, observed = [], []
     workspace = SimpleNamespace(bindings=object())
     with (
-      patch.object(wp, "launch", side_effect=lambda kernel, dim, **_: emitted.append((kernel, dim, "world"))),
+      patch.object(wp, "launch", side_effect=AssertionError("Unbound launch")),
       patch.object(native_execution, "validate_step_workspace"),
-      patch.object(native_execution, "bind_step_launch", side_effect=lambda _, *args: observed.append(args)),
+      patch.object(native_execution, "launch_step_kernel") as launch,
     ):
       smooth.kinematics(model, data, workspace=workspace)
-    self.assertEqual(observed, emitted)
-    self.assertEqual(observed[-1], (smooth._site_local_to_global, (7, 2), "world"))
+    self.assertEqual(launch.call_count, 5)
+    for call in launch.call_args_list:
+      self.assertIs(call.args[0], workspace.bindings)
+      self.assertEqual(call.kwargs["extent_domain"], "world")
+    self.assertIs(launch.call_args.args[1], smooth._site_local_to_global)
+    self.assertEqual(launch.call_args.kwargs["dim"], (7, 2))
 
   def test_solver_conditional_forwards_prepared_owner_to_iteration(self):
     tree = ast.parse(inspect.getsource(solver._solve))
@@ -876,7 +852,6 @@ class WorkspaceTest(unittest.TestCase):
       "primitive_narrowphase",
       "make_constraint",
       "deriv_smooth_vel",
-      "euler",
       "forward",
       "fwd_acceleration",
       "fwd_actuation",
@@ -884,18 +859,13 @@ class WorkspaceTest(unittest.TestCase):
       "fwd_position",
       "fwd_velocity",
       "implicit",
-      "rungekutta4",
       "island",
       "passive",
-      "energy_vel",
-      "sensor_acc",
-      "sensor_pos",
       "com_pos",
       "com_vel",
       "crb",
       "kinematics",
       "rne",
-      "rne_postconstraint",
       "transmission",
       "solve",
       "mul_m",
@@ -909,7 +879,6 @@ class WorkspaceTest(unittest.TestCase):
       and inspect.signature(function).parameters["workspace"].kind == inspect.Parameter.KEYWORD_ONLY
     }
     self.assertEqual(set(exported), expected)
-    unsupported = {"euler", "rungekutta4", "rne_postconstraint", "energy_vel"}
     for name, program in exported.items():
       validate = Mock(side_effect=ValueError("invalid prepared binding"))
       arguments = [
@@ -922,14 +891,9 @@ class WorkspaceTest(unittest.TestCase):
         stack.enter_context(patch.object(native_execution, "validate_step_workspace", validate))
         for operation in ("launch", "launch_tiled", "empty", "empty_like", "zeros", "clone", "copy"):
           stack.enter_context(patch.object(wp, operation, side_effect=AssertionError("stage work before validation")))
-        if name in unsupported:
-          with self.assertRaisesRegex(NotImplementedError, "Prepared"):
-            program(*arguments, workspace=SimpleNamespace(bindings=None))
-          validate.assert_not_called()
-        else:
-          with self.assertRaisesRegex(ValueError, "invalid prepared binding"):
-            program(*arguments, workspace=SimpleNamespace(bindings=None))
-          validate.assert_called_once()
+        with self.assertRaisesRegex(ValueError, "invalid prepared binding"):
+          program(*arguments, workspace=SimpleNamespace(bindings=None))
+        validate.assert_called_once()
 
   def test_prepared_position_rejects_unprepared_factorization(self):
     """Reject the eager default factorization path before any position work is emitted."""
@@ -941,7 +905,7 @@ class WorkspaceTest(unittest.TestCase):
       with self.assertRaisesRegex(NotImplementedError, "factorize=False"):
         forward.fwd_position(object(), object(), workspace=workspace)
 
-  def test_standalone_stages_reuse_prepared_scratch_when_optional_arguments_omitted(self):
+  def test_standalone_stages_reuse_their_only_prepared_scratch_source(self):
     """Use the workspace's actuator and island scratch without hidden stage allocations."""
     parent, velocity = object(), object()
     workspace = SimpleNamespace(
@@ -958,10 +922,9 @@ class WorkspaceTest(unittest.TestCase):
     model = Mock(opt=SimpleNamespace(disableflags=0, timestep=None), nactuator=2, has_fluid=False)
     data = Mock(nworld=3)
     with (
-      patch.object(wp, "launch") as launch,
+      patch.object(native_execution, "launch_step_kernel") as launch,
       patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
       patch.object(native_execution, "validate_step_workspace"),
-      patch.object(native_execution, "bind_step_launch"),
       patch.object(native_execution, "fill_step_rows"),
     ):
       derivative.deriv_smooth_vel(model, data, object(), workspace=workspace)
@@ -975,7 +938,7 @@ class WorkspaceTest(unittest.TestCase):
       with (
         patch.object(native_execution, "validate_step_workspace"),
         patch.object(native_execution, "fill_step_rows") as fill,
-        patch.object(wp, "launch", side_effect=RuntimeError("first stage launch")) as launch,
+        patch.object(native_execution, "launch_step_kernel", side_effect=RuntimeError("first stage launch")) as launch,
         patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
         patch.object(wp, "zeros", side_effect=AssertionError("scratch allocated")),
         self.assertRaisesRegex(RuntimeError, "first stage launch"),
@@ -994,12 +957,13 @@ class WorkspaceTest(unittest.TestCase):
       (derivative.deriv_smooth_vel, (object(), object(), object()), "actuator_vel", "actuator_vel"),
     ):
       workspace = SimpleNamespace(bindings=object(), arrays={field: object()})
+      self.assertNotIn(parameter, inspect.signature(function).parameters)
       with (
         self.subTest(function=function.__name__),
         patch.object(native_execution, "validate_step_workspace"),
         patch.object(native_execution, "fill_step_rows") as fill,
         patch.object(wp, "launch", side_effect=AssertionError("unadmitted scratch touched")),
-        self.assertRaisesRegex(ValueError, "workspace .* scratch"),
+        self.assertRaisesRegex(TypeError, "unexpected keyword"),
       ):
         function(*arguments, **{parameter: object()}, workspace=workspace)
       fill.assert_not_called()
@@ -1009,24 +973,23 @@ class WorkspaceTest(unittest.TestCase):
     workspace = SimpleNamespace(bindings=object())
     model, data = Mock(nv=2), Mock(nworld=7, M=SimpleNamespace(ndim=2))
     with (
-      patch.object(wp, "launch", side_effect=AssertionError("unbounded dense access")) as launch,
+      patch.object(native_execution, "launch_step_kernel", side_effect=AssertionError("unbounded dense access")) as launch,
       patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")),
       patch.object(native_execution, "validate_step_workspace"),
-      patch.object(native_execution, "bind_step_launch") as bind,
       self.assertRaisesRegex(NotImplementedError, "dense block inertia"),
     ):
       support.mul_m(model, data, object(), object(), M=SimpleNamespace(ndim=3), workspace=workspace)
     launch.assert_not_called()
-    bind.assert_not_called()
     with (
-      patch.object(wp, "launch") as launch,
+      patch.object(native_execution, "launch_step_kernel") as launch,
       patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")),
       patch.object(native_execution, "validate_step_workspace"),
-      patch.object(native_execution, "bind_step_launch") as bind,
     ):
       support.mul_m(model, data, object(), object(), workspace=workspace)
     self.assertIsNone(launch.call_args.kwargs["inputs"][-1])
-    bind.assert_called_once_with(workspace.bindings, launch.call_args.args[0], (7, 2), "world")
+    self.assertIs(launch.call_args.args[0], workspace.bindings)
+    self.assertEqual(launch.call_args.kwargs["dim"], (7, 2))
+    self.assertEqual(launch.call_args.kwargs["extent_domain"], "world")
 
   def test_prepared_execution_binding_cannot_change_mode_count_or_bindings(self):
     """Keep the sole count in the owner record and reject mode or descriptor replacement."""

@@ -4937,23 +4937,21 @@ def _add_surface_vel(is_pyramidal: bool):
 
 
 @event_scope
-def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=None):
+def make_constraint(m: types.Model, d: types.Data, *, workspace=None):
   """Creates constraint jacobians and other supporting data."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-    if efc_nnz is not None and efc_nnz is not workspace.arrays["efc_nnz"]:
-      raise ValueError("Prepared constraints require workspace efc_nnz scratch")
+  bindings = None if workspace is None else workspace.bindings
   newton = m.opt.solver == types.SolverType.NEWTON
-  if efc_nnz is None:
-    efc_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["efc_nnz"]
+  efc_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["efc_nnz"]
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _zero_constraint_counts,
     dim=d.nworld,
     inputs=[d.ne, d.nf, d.nl, d.nefc, d.efc.jtdaj_nblock, efc_nnz],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _zero_constraint_counts, d.nworld, "world")
 
   if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
     if not (m.opt.disableflags & types.DisableBit.EQUALITY):
@@ -5290,9 +5288,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           )
 
     if not (m.opt.disableflags & types.DisableBit.FRICTIONLOSS):
-      launch_kernel = _friction_dof(m.is_sparse, newton)
-      wp.launch(
-        launch_kernel,
+      step_execution.launch_step_kernel(
+        bindings,
+        _friction_dof(m.is_sparse, newton),
         dim=(d.nworld, m.nv),
         inputs=[
           m.nv,
@@ -5326,9 +5324,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           d.efc.frictionloss,
           efc_nnz,
         ],
+        extent_domain="world",
       )
-      if workspace is not None:
-        step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
       wp.launch(
         _friction_tendon(m.is_sparse, newton),
@@ -5415,9 +5412,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
         ],
       )
 
-      launch_kernel = _limit_slide_hinge(m.is_sparse, newton)
-      wp.launch(
-        launch_kernel,
+      step_execution.launch_step_kernel(
+        bindings,
+        _limit_slide_hinge(m.is_sparse, newton),
         dim=(d.nworld, m.jnt_limited_slide_hinge_adr.size),
         inputs=[
           m.nv,
@@ -5456,11 +5453,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           d.efc.frictionloss,
           efc_nnz,
         ],
+        extent_domain="world",
       )
-      if workspace is not None:
-        step_execution.bind_step_launch(
-          workspace.bindings, launch_kernel, (d.nworld, m.jnt_limited_slide_hinge_adr.size), "world"
-        )
 
       wp.launch(
         _limit_tendon(m.is_sparse, newton),
@@ -5582,9 +5576,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           ],
         )
       else:
-        launch_kernel = _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion)
-        wp.launch(
-          launch_kernel,
+        step_execution.launch_step_kernel(
+          bindings,
+          _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion),
           dim=d.naconmax,
           inputs=[
             m.body_weldid,
@@ -5614,9 +5608,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             d.efc.J_rowadr,
             efc_nnz,
           ],
+          extent_domain="candidate",
         )
-        if workspace is not None:
-          step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.naconmax, "candidate")
 
       if m.is_sparse:
         if has_flex:
@@ -5670,9 +5663,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             ],
           )
         else:
-          launch_kernel = _efc_contact_jac_sparse(m.opt.cone)
-          wp.launch(
-            launch_kernel,
+          step_execution.launch_step_kernel(
+            bindings,
+            _efc_contact_jac_sparse(m.opt.cone),
             dim=(d.naconmax, nmaxdim),
             inputs=[
               m.body_parentid,
@@ -5703,9 +5696,8 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
               d.efc.J,
               d.efc.Jqvel,
             ],
+            extent_domain="candidate",
           )
-          if workspace is not None:
-            step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.naconmax, nmaxdim), "candidate")
       else:
         if workspace is None:
           d.efc.Jqvel.zero_()
@@ -5761,9 +5753,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             block_dim=tile_size,
           )
         else:
-          launch_kernel = _efc_contact_jac_dense(tile_size, m.opt.cone)
-          wp.launch_tiled(
-            launch_kernel,
+          step_execution.launch_step_kernel(
+            bindings,
+            _efc_contact_jac_dense(tile_size, m.opt.cone),
             dim=(d.nworld, n_dof_blocks),
             inputs=[
               m.body_rootid,
@@ -5791,9 +5783,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
               d.efc.Jqvel,
             ],
             block_dim=tile_size,
+            extent_domain="world",
+            tiled=True,
           )
-          if workspace is not None:
-            step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, n_dof_blocks), "world")
 
       if m.flg_surfacevel:
         wp.launch(
@@ -5872,9 +5864,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           ],
         )
       else:
-        launch_kernel = _efc_contact_update(m.opt.cone, m.flg_adhesion)
-        wp.launch(
-          launch_kernel,
+        step_execution.launch_step_kernel(
+          bindings,
+          _efc_contact_update(m.opt.cone, m.flg_adhesion),
           dim=(d.naconmax, nmaxdim),
           inputs=[
             m.opt.timestep,
@@ -5907,6 +5899,5 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             d.efc.aref,
             d.efc.frictionloss,
           ],
+          extent_domain="candidate",
         )
-        if workspace is not None:
-          step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.naconmax, nmaxdim), "candidate")

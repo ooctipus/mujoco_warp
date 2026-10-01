@@ -294,10 +294,12 @@ def _next_time_builder(warn_overflow: int):
 
 def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None, *, island_can_sleep=None, workspace=None):
   """Advance state and time given activation derivatives and acceleration."""
+  bindings = None if workspace is None else workspace.bindings
   # TODO(team): can we assume static timesteps?
 
   # advance activations
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _next_activation,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -317,37 +319,36 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
       True,
     ],
     outputs=[d.act],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _next_activation, (d.nworld, m.nactuator), "world")
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _next_velocity,
     dim=(d.nworld, m.nv),
     inputs=[m.opt.timestep, d.qvel, qacc, 1.0],
     outputs=[d.qvel],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _next_velocity, (d.nworld, m.nv), "world")
 
   # advance positions with qvel if given, d.qvel otherwise (semi-implicit)
   qvel_in = qvel or d.qvel
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _next_position,
     dim=(d.nworld, m.njnt),
     inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d.qpos, qvel_in, 1.0],
     outputs=[d.qpos],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _next_position, (d.nworld, m.njnt), "world")
 
   # advance history buffers before time advance
   history.insert_ctrl_history(m, d)
 
-  launch_kernel = _next_time_builder(int(m.opt.warn_overflow))
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _next_time_builder(int(m.opt.warn_overflow)),
     dim=d.nworld,
     inputs=[
       m.opt.timestep,
@@ -364,15 +365,9 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
       d.ncollision,
     ],
     outputs=[d.time, d.overflow],
+    extent_domain="world",
+    parameter_domains={"nworld_in": "world", "naconmax_in": "candidate"},
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(
-      workspace.bindings,
-      launch_kernel,
-      d.nworld,
-      "world",
-      parameter_domains={"nworld_in": "world", "naconmax_in": "candidate"},
-    )
 
   if workspace is None:
     wp.copy(d.qacc_warmstart, d.qacc)
@@ -422,10 +417,8 @@ def _euler_damp_qfrc(
 
 
 @event_scope
-def euler(m: Model, d: Data, *, workspace=None):
+def euler(m: Model, d: Data):
   """Euler integrator, semi-implicit in velocity."""
-  if workspace is not None:
-    raise NotImplementedError("Prepared workspace does not support Euler integration")
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
     qacc = wp.empty((d.nworld, m.nv), dtype=float)
@@ -450,10 +443,10 @@ def euler(m: Model, d: Data, *, workspace=None):
       inputs=[m.opt.timestep, m.M_rownnz, m.M_rowadr, damp_deriv],
       outputs=[M],
     )
-    smooth.factor_solve_i(m, d, M, qLD, qLDiagInv, qacc, d.efc.Ma, workspace=workspace)
-    _advance(m, d, qacc, workspace=workspace)
+    smooth.factor_solve_i(m, d, M, qLD, qLDiagInv, qacc, d.efc.Ma)
+    _advance(m, d, qacc)
   else:
-    _advance(m, d, d.qacc, workspace=workspace)
+    _advance(m, d, d.qacc)
 
 
 def _rk_perturb_state(
@@ -560,10 +553,8 @@ def _rk_accumulate(
 
 
 @event_scope
-def rungekutta4(m: Model, d: Data, *, workspace=None):
+def rungekutta4(m: Model, d: Data):
   """Runge-Kutta explicit order 4 integrator."""
-  if workspace is not None:
-    raise NotImplementedError("Prepared workspace does not support Runge-Kutta integration")
   # RK4 tableau
   A = [0.5, 0.5, 1.0]  # diagonal only
   B = [1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0]
@@ -585,7 +576,7 @@ def rungekutta4(m: Model, d: Data, *, workspace=None):
   for i in range(3):
     a, b = float(A[i]), B[i + 1]
     _rk_perturb_state(m, d, a, qpos_t0, qvel_t0, act_t0)
-    forward(m, d, workspace=workspace)
+    forward(m, d)
     _rk_accumulate(m, d, b, qvel_rk, qacc_rk, act_dot_rk)
 
   wp.copy(d.qpos, qpos_t0)
@@ -595,7 +586,7 @@ def rungekutta4(m: Model, d: Data, *, workspace=None):
     wp.copy(d.act, act_t0)
     wp.copy(d.act_dot, act_dot_rk)
 
-  _advance(m, d, qacc_rk, qvel_rk, workspace=workspace)
+  _advance(m, d, qacc_rk, qvel_rk)
 
 
 @wp.kernel
@@ -1040,9 +1031,7 @@ def implicit(m: Model, d: Data, *, workspace=None):
     qDeriv = wp.empty((d.nworld, m.nC), dtype=float) if workspace is None else workspace.arrays["qDeriv"]
     qLD = wp.empty_like(d.qLD) if workspace is None else workspace.arrays["qLD"]
     qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float) if workspace is None else workspace.arrays["qLDiagInv"]
-    derivative.deriv_smooth_vel(
-      m, d, qDeriv, actuator_vel=None if workspace is None else workspace.arrays["actuator_vel"], workspace=workspace
-    )
+    derivative.deriv_smooth_vel(m, d, qDeriv, workspace=workspace)
     if m.body_freeadr.size > 0:
       wp.launch(
         _implicit_free_body_reset_m,
@@ -1138,7 +1127,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
       else:
         collision(m, d, awake_prev=awake_prev, workspace=workspace)
 
-  constraint.make_constraint(m, d, efc_nnz=None if workspace is None else workspace.arrays["efc_nnz"], workspace=workspace)
+  constraint.make_constraint(m, d, workspace=workspace)
 
   if sleep_enabled:
     if m.neq > 0:
@@ -1146,8 +1135,8 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
     sleep.update_sleep(m, d, workspace=workspace)
 
   if sleep_enabled:
-    island.island(m, d, parent=None if workspace is None else workspace.arrays["island_parent"], workspace=workspace)
-  smooth.transmission(m, d, moment_nnz=None if workspace is None else workspace.arrays["moment_nnz"], workspace=workspace)
+    island.island(m, d, workspace=workspace)
+  smooth.transmission(m, d, workspace=workspace)
 
 
 @wp.kernel
@@ -1207,15 +1196,16 @@ def fwd_velocity(m: Model, d: Data, *, workspace=None):
   """Velocity-dependent computations."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  wp.launch(
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     _actuator_velocity,
     dim=(d.nworld, m.nactuator),
     inputs=[d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
     outputs=[d.actuator_velocity],
     block_dim=m.block_dim.actuator_velocity,
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _actuator_velocity, (d.nworld, m.nactuator), "world")
 
   wp.launch(
     _tendon_velocity,
@@ -1655,6 +1645,7 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
   """Actuation-dependent computations."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
   if not m.nactuator or (m.opt.disableflags & DisableBit.ACTUATION):
     if workspace is None:
       d.act_dot.zero_()
@@ -1673,7 +1664,8 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
   else:
     ctrl = d.ctrl
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _actuator_force,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -1706,9 +1698,8 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
       m.opt.disableflags & DisableBit.CLAMPCTRL,
     ],
     outputs=[d.act_dot, d.actuator_force],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _actuator_force, (d.nworld, m.nactuator), "world")
 
   if m.callback.act_dyn:
     m.callback.act_dyn(m, d)
@@ -1739,7 +1730,8 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
     d.qfrc_actuator.zero_()
   else:
     step_execution.fill_step_rows(workspace.bindings, d.qfrc_actuator, 0, "world")
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _qfrc_actuator,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -1750,11 +1742,11 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
       d.actuator_force,
     ],
     outputs=[d.qfrc_actuator],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _qfrc_actuator, (d.nworld, m.nactuator), "world")
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),
     inputs=[
@@ -1767,9 +1759,8 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
       gravity_enabled,
     ],
     outputs=[d.qfrc_actuator],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, _qfrc_actuator_gravcomp_limits, (d.nworld, m.nv), "world")
 
 
 @cache_kernel
@@ -1819,10 +1810,11 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=No
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
-  launch_kernel = _qfrc_smooth(enable_sleep)
-  wp.launch(
-    launch_kernel,
+  step_execution.launch_step_kernel(
+    bindings,
+    _qfrc_smooth(enable_sleep),
     dim=(d.nworld, m.nv),
     inputs=[
       m.body_treeid,
@@ -1834,9 +1826,8 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=No
       d.qfrc_actuator,
     ],
     outputs=[d.qfrc_smooth],
+    extent_domain="world",
   )
-  if workspace is not None:
-    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
   xfrc_accumulate(m, d, d.qfrc_smooth, workspace=workspace)
 
   if enable_sleep:
@@ -1861,10 +1852,10 @@ def _energy_pos(m: Model, d: Data, *, workspace=None):
       step_execution.fill_step_rows(workspace.bindings, d.energy, 0, "world")
 
 
-def _energy_vel(m: Model, d: Data, *, workspace=None):
+def _energy_vel(m: Model, d: Data):
   if m.opt.enableflags & EnableBit.ENERGY:
     if m.sensor_e_kinetic == 0:  # not computed by sensor
-      sensor.energy_vel(m, d, workspace=workspace)
+      sensor.energy_vel(m, d)
 
 
 @event_scope
@@ -1882,12 +1873,12 @@ def forward(m: Model, d: Data, *, workspace=None):
     d.sensordata.zero_()
   else:
     step_execution.fill_step_rows(workspace.bindings, d.sensordata, 0, "world")
-  sensor.sensor_pos(m, d, workspace=workspace)
+  sensor.sensor_pos(m, d)
   _energy_pos(m, d, workspace=workspace)
 
   fwd_velocity(m, d, workspace=workspace)
   sensor.sensor_vel(m, d)
-  _energy_vel(m, d, workspace=workspace)
+  _energy_vel(m, d)
 
   if not (m.opt.disableflags & DisableBit.ACTUATION):
     if m.callback.control:
@@ -1897,8 +1888,8 @@ def forward(m: Model, d: Data, *, workspace=None):
 
   solver.solve(m, d, workspace=workspace, rebuild_active_dofs=not sleep_enabled)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
-    smooth.rne_postconstraint(m, d, workspace=workspace)
-  sensor.sensor_acc(m, d, skip_rne_postconstraint=True, workspace=workspace)
+    smooth.rne_postconstraint(m, d)
+  sensor.sensor_acc(m, d, skip_rne_postconstraint=True)
 
 
 @event_scope
@@ -1907,9 +1898,9 @@ def step(m: Model, d: Data, *, workspace=None):
   forward(m, d, workspace=workspace)
 
   if m.opt.integrator == IntegratorType.EULER:
-    euler(m, d, workspace=workspace)
+    euler(m, d)
   elif m.opt.integrator == IntegratorType.RK4:
-    rungekutta4(m, d, workspace=workspace)
+    rungekutta4(m, d)
   elif m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
     implicit(m, d, workspace=workspace)
   else:
