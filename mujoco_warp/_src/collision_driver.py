@@ -386,11 +386,11 @@ def _add_geom_pair(
   pairid: wp.vec2i,
   # Data out:
   ncollision_out: wp.array[int],
+  overflow_out: wp.array[int],
   # Out:
   collision_pair_out: wp.array[wp.vec2i],
   collision_pairid_out: wp.array[wp.vec2i],
   collision_worldid_out: wp.array[int],
-  overflow_out: wp.array[int],
 ):
   cid = wp.atomic_add(ncollision_out, 0, 1)
 
@@ -504,11 +504,11 @@ def _sap_broadphase(
     body_awake_prev_in: wp.array2d[int],
     # Data out:
     ncollision_out: wp.array[int],
+    overflow_out: wp.array[int],
     # Out:
     collision_pair_out: wp.array[wp.vec2i],
     collision_pairid_out: wp.array[wp.vec2i],
     collision_worldid_out: wp.array[int],
-    overflow_out: wp.array[int],
   ):
     worldgeomid = wp.tid()
 
@@ -598,10 +598,10 @@ def _sap_broadphase(
           worldid,
           pairid,
           ncollision_out,
+          overflow_out,
           collision_pair_out,
           collision_pairid_out,
           collision_worldid_out,
-          overflow_out,
         )
 
   return kernel
@@ -752,7 +752,7 @@ def sap_broadphase(
       nsweep,
       awake_prev_in,
     ],
-    outputs=[d.ncollision, ctx.collision_pair, ctx.collision_pairid, ctx.collision_worldid, d.overflow],
+    outputs=[d.ncollision, d.overflow, ctx.collision_pair, ctx.collision_pairid, ctx.collision_worldid],
   )
 
 
@@ -790,11 +790,11 @@ def _nxn_broadphase(
     body_awake_prev_in: wp.array2d[int],
     # Data out:
     ncollision_out: wp.array[int],
+    overflow_out: wp.array[int],
     # Out:
     collision_pair_out: wp.array[wp.vec2i],
     collision_pairid_out: wp.array[wp.vec2i],
     collision_worldid_out: wp.array[int],
-    overflow_out: wp.array[int],
   ):
     worldid, elementid = wp.tid()
 
@@ -859,10 +859,10 @@ def _nxn_broadphase(
         worldid,
         pairid,
         ncollision_out,
+        overflow_out,
         collision_pair_out,
         collision_pairid_out,
         collision_worldid_out,
-        overflow_out,
       )
 
   return kernel
@@ -910,6 +910,8 @@ def nxn_broadphase(
   wholesale on steps where nothing woke; otherwise it runs unconditionally and the per-pair filter
   restricts the emitted pairs.
   """
+  if workspace is not None:
+    workspace.validate(m, d)
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP)
   incremental = awake_prev is not None
   awake_prev_in = awake_prev if awake_prev is not None else d.body_awake
@@ -926,7 +928,7 @@ def nxn_broadphase(
       cond.zero_()
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
     if workspace is not None:
-      workspace.observe_launch(_any_awake_changed, (d.nworld, m.nbody), "world")
+      workspace.bind_launch(_any_awake_changed, (d.nworld, m.nbody), "world")
 
   def _launch():
     launch_kernel = _nxn_broadphase(
@@ -962,18 +964,18 @@ def nxn_broadphase(
       ],
       outputs=[
         d.ncollision,
+        d.overflow,
         ctx.collision_pair,
         ctx.collision_pairid,
         ctx.collision_worldid,
-        d.overflow,
       ],
     )
     if workspace is not None:
-      workspace.observe_launch(
+      workspace.bind_launch(
         launch_kernel,
         (d.nworld, m.nxn_geom_pair_filtered.shape[0]),
         "world",
-        parameters={"naconmax_in": "candidate"},
+        parameter_domains={"naconmax_in": "candidate"},
       )
 
   if cond is not None:
@@ -1028,12 +1030,14 @@ def collision(
   incremental sleeping pass: contacts are appended to the existing buffer and only pairs involving
   a newly-awakened body are emitted.
   """
+  if workspace is not None:
+    workspace.validate(m, d)
   if d.naconmax == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
     d.nacon.zero_()
     return
 
   # TODO(team): create context outside collision?
-  ctx = create_collision_context(d.naconmax) if workspace is None else workspace.collision
+  ctx = create_collision_context(d.naconmax) if workspace is None else workspace._collision
 
   incremental = awake_prev is not None
 

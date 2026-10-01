@@ -1535,6 +1535,8 @@ def primitive_narrowphase(
   the specific primitive collision types present in the model, avoiding
   unnecessary checks for non-existent collision pairs.
   """
+  if workspace is not None:
+    workspace.validate(m, d)
   # TODO(team): keep the overhead of this small - not launching anything
   # for pair types without collisions, as well as updating the launch dimensions.
 
@@ -1613,9 +1615,9 @@ def primitive_narrowphase(
     ],
   )
   if workspace is not None:
-    workspace.observe_launch(
+    workspace.bind_launch(
       launch_kernel,
       d.naconmax,
       "candidate",
-      parameters={"naconmax_in": "candidate"},
+      parameter_domains={"naconmax_in": "candidate"},
     )

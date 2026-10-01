@@ -1370,6 +1370,8 @@ def _flex_passive_bend_interp(
 @event_scope
 def passive(m: Model, d: Data, *, workspace=None):
   """Adds all passive forces."""
+  if workspace is not None:
+    workspace.validate(m, d)
   dsbl_spring = m.opt.disableflags & DisableBit.SPRING
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
@@ -1407,7 +1409,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     outputs=[d.qfrc_spring, d.qfrc_damper],
   )
   if workspace is not None:
-    workspace.observe_launch(_spring_damper_dof_passive, (d.nworld, m.njnt), "world")
+    workspace.bind_launch(_spring_damper_dof_passive, (d.nworld, m.njnt), "world")
 
   if m.ntendon:
     wp.launch(
@@ -1579,7 +1581,7 @@ def passive(m: Model, d: Data, *, workspace=None):
       outputs=[d.qfrc_gravcomp],
     )
     if workspace is not None:
-      workspace.observe_launch(_gravity_force, (d.nworld, m.nbody - 1, m.nv), "world")
+      workspace.bind_launch(_gravity_force, (d.nworld, m.nbody - 1, m.nv), "world")
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
   if m.nflex and m.nflexintcell > 0:
@@ -1676,7 +1678,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     ],
   )
   if workspace is not None:
-    workspace.observe_launch(launch_kernel, (d.nworld, m.nv), "world")
+    workspace.bind_launch(launch_kernel, (d.nworld, m.nv), "world")
 
   if m.callback.passive:
     m.callback.passive(m, d)

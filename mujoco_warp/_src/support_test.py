@@ -48,6 +48,9 @@ def _assert_eq(a, b, name):
 
 @wp.kernel
 def _contact_force_direct(
+  # Data in:
+  njmax_in: int,
+  # In:
   cone: int,
   frames: wp.array[wp.mat33],
   friction: wp.array[support.vec5],
@@ -55,15 +58,15 @@ def _contact_force_direct(
   addresses: wp.array2d[int],
   adhesion: wp.array[float],
   force: wp.array2d[float],
-  njmax: int,
   count: wp.array[int],
   worldids: wp.array[int],
   ids: wp.array[int],
+  # Out:
   out: wp.array[wp.spatial_vector],
 ):
   i = wp.tid()
   out[i] = support.contact_force_fn(
-    cone, frames, friction, dims, addresses, adhesion, force, njmax, count, worldids[i], ids[i], True
+    cone, frames, friction, dims, addresses, adhesion, force, njmax_in, count, worldids[i], ids[i], True
   )
 
 
@@ -99,7 +102,7 @@ class SupportTest(parameterized.TestCase):
     wp.launch(
       _contact_force_direct,
       dim=1,
-      inputs=[int(ConeType.PYRAMIDAL), frames, friction, dims, addresses, adhesion, force, 8, count, worldids, ids],
+      inputs=[8, int(ConeType.PYRAMIDAL), frames, friction, dims, addresses, adhesion, force, count, worldids, ids],
       outputs=[output],
     )
     np.testing.assert_array_equal(output.numpy(), np.zeros((1, 6), np.float32))

@@ -810,6 +810,8 @@ def _sensor_collision(
 @event_scope
 def sensor_pos(m: Model, d: Data, *, workspace=None):
   """Compute position-dependent sensor values."""
+  if workspace is not None:
+    workspace.validate(m, d)
   if m.opt.disableflags & DisableBit.SENSOR:
     return
 
@@ -2579,6 +2581,8 @@ def _contact_sort(maxmatch: int):
 @event_scope
 def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False, *, workspace=None):
   """Compute acceleration-dependent sensor values."""
+  if workspace is not None:
+    workspace.validate(m, d)
   if m.opt.disableflags & DisableBit.SENSOR:
     return
 
@@ -3127,6 +3131,8 @@ def _energy_vel_kinetic(nv: int):
 
 def energy_vel(m: Model, d: Data, *, workspace=None):
   """Velocity-dependent energy (kinetic)."""
+  if workspace is not None:
+    raise NotImplementedError("Prepared workspace does not support kinetic energy evaluation")
   # kinetic energy: 0.5 * qvel.T @ M @ qvel
 
   # M @ qvel
