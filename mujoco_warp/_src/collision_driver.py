@@ -17,6 +17,7 @@ from typing import Optional
 
 import warp as wp
 
+from mujoco_warp._src import step_execution
 from mujoco_warp._src.collision_convex import convex_narrowphase
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import create_collision_context
@@ -911,7 +912,7 @@ def nxn_broadphase(
   restricts the emitted pairs.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP)
   incremental = awake_prev is not None
   awake_prev_in = awake_prev if awake_prev is not None else d.body_awake
@@ -928,7 +929,7 @@ def nxn_broadphase(
       cond.zero_()
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
     if workspace is not None:
-      workspace.bind_launch(_any_awake_changed, (d.nworld, m.nbody), "world")
+      step_execution.bind_step_launch(workspace.bindings, _any_awake_changed, (d.nworld, m.nbody), "world")
 
   def _launch():
     launch_kernel = _nxn_broadphase(
@@ -971,7 +972,8 @@ def nxn_broadphase(
       ],
     )
     if workspace is not None:
-      workspace.bind_launch(
+      step_execution.bind_step_launch(
+        workspace.bindings,
         launch_kernel,
         (d.nworld, m.nxn_geom_pair_filtered.shape[0]),
         "world",
@@ -995,7 +997,14 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
 
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
-  convex_narrowphase(m, d, ctx, convex_pairs, workspace=workspace)
+  convex_narrowphase(
+    m,
+    d,
+    ctx,
+    convex_pairs,
+    scratch=None if workspace is None else workspace.convex,
+    bindings=None if workspace is None else workspace.bindings,
+  )
   primitive_narrowphase(m, d, ctx, primitive_pairs, workspace=workspace)
 
   if m.has_sdf_geom:
@@ -1031,7 +1040,7 @@ def collision(
   a newly-awakened body are emitted.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   if d.naconmax == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
     d.nacon.zero_()
     return

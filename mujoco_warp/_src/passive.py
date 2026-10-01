@@ -16,6 +16,7 @@
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MINVAL
@@ -1371,7 +1372,7 @@ def _flex_passive_bend_interp(
 def passive(m: Model, d: Data, *, workspace=None):
   """Adds all passive forces."""
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   dsbl_spring = m.opt.disableflags & DisableBit.SPRING
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
@@ -1383,11 +1384,11 @@ def passive(m: Model, d: Data, *, workspace=None):
       d.qfrc_fluid.zero_()
       d.qfrc_passive.zero_()
     else:
-      workspace.fill(d.qfrc_spring, 0, "world")
-      workspace.fill(d.qfrc_damper, 0, "world")
-      workspace.fill(d.qfrc_gravcomp, 0, "world")
-      workspace.fill(d.qfrc_fluid, 0, "world")
-      workspace.fill(d.qfrc_passive, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, d.qfrc_spring, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, d.qfrc_damper, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, d.qfrc_gravcomp, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, d.qfrc_fluid, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, d.qfrc_passive, 0, "world")
     return
 
   wp.launch(
@@ -1409,7 +1410,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     outputs=[d.qfrc_spring, d.qfrc_damper],
   )
   if workspace is not None:
-    workspace.bind_launch(_spring_damper_dof_passive, (d.nworld, m.njnt), "world")
+    step_execution.bind_step_launch(workspace.bindings, _spring_damper_dof_passive, (d.nworld, m.njnt), "world")
 
   if m.ntendon:
     wp.launch(
@@ -1561,7 +1562,7 @@ def passive(m: Model, d: Data, *, workspace=None):
   if workspace is None:
     d.qfrc_gravcomp.zero_()
   else:
-    workspace.fill(d.qfrc_gravcomp, 0, "world")
+    step_execution.fill_step_rows(workspace.bindings, d.qfrc_gravcomp, 0, "world")
   if gravity_enabled:
     wp.launch(
       _gravity_force,
@@ -1581,7 +1582,7 @@ def passive(m: Model, d: Data, *, workspace=None):
       outputs=[d.qfrc_gravcomp],
     )
     if workspace is not None:
-      workspace.bind_launch(_gravity_force, (d.nworld, m.nbody - 1, m.nv), "world")
+      step_execution.bind_step_launch(workspace.bindings, _gravity_force, (d.nworld, m.nbody - 1, m.nv), "world")
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
   if m.nflex and m.nflexintcell > 0:
@@ -1632,7 +1633,7 @@ def passive(m: Model, d: Data, *, workspace=None):
   if workspace is None:
     d.qfrc_adhesion.zero_()
   else:
-    workspace.fill(d.qfrc_adhesion, 0, "world")
+    step_execution.fill_step_rows(workspace.bindings, d.qfrc_adhesion, 0, "world")
   if m.flg_adhesion and (not (m.opt.disableflags & DisableBit.CONTACT)) and m.nv > 0:
     wp.launch(
       _qfrc_adhesion,
@@ -1678,7 +1679,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     ],
   )
   if workspace is not None:
-    workspace.bind_launch(launch_kernel, (d.nworld, m.nv), "world")
+    step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
   if m.callback.passive:
     m.callback.passive(m, d)

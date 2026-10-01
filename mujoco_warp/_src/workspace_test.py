@@ -3,12 +3,14 @@
 import ast
 import dataclasses
 import inspect
+import typing
 import unittest
 import weakref
 from contextlib import ExitStack
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
+from unittest.mock import PropertyMock
 from unittest.mock import patch
 
 import numpy as np
@@ -64,16 +66,43 @@ def _convex_model(pair=(types.GeomType.BOX, types.GeomType.BOX), *, multiccd=Fal
 
 def _collision_scratch_specs():
   pair = (types.GeomType.BOX, types.GeomType.BOX)
-  convex = collision_convex._convex_scratch_layout(_convex_model(pair), [pair], 2)[2]
+  shapes = collision_convex._convex_scratch_shapes(_convex_model(pair), [pair], 2)[2]
+  hints = typing.get_type_hints(collision_convex._ConvexScratch)
   return (
     WorkspaceFieldSpec("collision_pair", (2,), wp.vec2i, "candidate"),
     WorkspaceFieldSpec("collision_pairid", (2,), wp.vec2i, "candidate"),
     WorkspaceFieldSpec("collision_worldid", (2,), wp.int32, "candidate"),
     *(
-      WorkspaceFieldSpec(name, shape, {int: wp.int32, float: wp.float32}.get(dtype, dtype), domain)
-      for name, shape, dtype, domain in convex
+      WorkspaceFieldSpec(name, shape, hints[name].dtype, "global_counter" if name == "nccd" else "ccd")
+      for name, shape in shapes.items()
     ),
   )
+
+
+@contextmanager
+def _cpu_workspace_preparation(specs):
+  """Exercise real preparation arithmetic, replacing only CUDA admission and topology discovery."""
+  with (
+    patch.object(type(wp.get_device("cpu")), "is_cuda", new_callable=PropertyMock, return_value=True),
+    patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
+    patch.object(native_workspace, "step_workspace_layout", return_value=specs),
+    patch.object(solver, "_compact_solver_views", side_effect=lambda model, data: (model, data)),
+    patch.object(
+      solver,
+      "_solver_context_layout",
+      return_value=tuple(
+        (spec.name.removeprefix("solver."), spec.shape, spec.dtype, False) for spec in specs if spec.name.startswith("solver.")
+      ),
+    ),
+    patch.object(types, "SolverContext", side_effect=lambda **fields: SimpleNamespace(**fields)),
+  ):
+    yield
+
+
+def _workspace_data(qpos):
+  """Supply absent compact-matrix descriptors for CPU preparation fixtures."""
+  empty = wp.empty((1, 0, 0), dtype=wp.float32, device="cpu")
+  return SimpleNamespace(qpos=qpos, cM=empty, cqLD=empty, nworld=17, naconmax=17, naccdmax=17)
 
 
 def _step_bindings():
@@ -126,7 +155,7 @@ def _binding_capture(bindings):
   graph = CapturedGraph()
   graph.device = bindings.world_storage.device
   with (
-    patch.dict(bindings.world_storage.device.captures, {None: graph}),
+    patch.object(native_execution.graph_ops, "current_capture", return_value=graph),
     patch.object(wp, "get_stream", return_value=None),
     patch.object(native_execution.graph_ops, "register_last_kernel_node", return_value=123) as register,
   ):
@@ -188,8 +217,10 @@ class NativeBindingsTest(unittest.TestCase):
       "_begin_recording",
       "_fail_recording",
       "_record_launch",
-      "_fill_step_rows",
-      "_copy_step_rows",
+      "fill_step_rows",
+      "copy_step_rows",
+      "validate_step_workspace",
+      "_layout",
     ):
       self.assertNotIn(
         name, vars(native_workspace), "Preparation must call the execution module without aliases or duplicate owners"
@@ -403,38 +434,65 @@ class NativeBindingsTest(unittest.TestCase):
 
   def test_bounded_memory_operations_use_explicit_native_domain_sources(self):
     bindings = _step_bindings()
-    workspace = _StepWorkspace.__new__(_StepWorkspace)
-    workspace.bindings = bindings
-    array, source = SimpleNamespace(size=12), SimpleNamespace(size=12)
+    array, source = (wp.empty(12, dtype=wp.float32, device="cpu") for _ in range(2))
     with (
       _binding_capture(bindings),
       patch.object(native_execution.field_ops, "fill") as fill,
       patch.object(native_execution.field_ops, "copy") as copy,
       patch.object(native_execution.field_ops, "lookup", return_value=SimpleNamespace(name="field")),
     ):
-      self.assertIs(workspace.fill(array, 1, "world"), array)
-      workspace.fill(array, 0, "candidate")
-      workspace.copy(array, source, "ccd")
+      self.assertIs(native_execution.fill_step_rows(bindings, array, 1, "world"), array)
+      native_execution.fill_step_rows(bindings, array, 0, "candidate")
+      native_execution.copy_step_rows(bindings, array, source, "ccd")
       self.assertIs(fill.call_args_list[0].args[0], bindings.world_storage)
       self.assertIs(fill.call_args_list[0].kwargs["count"], bindings.world_storage.protected_count)
       self.assertIs(fill.call_args_list[1].kwargs["count"], bindings.contact_storage.ready_count)
       self.assertIs(copy.call_args.kwargs["count"], bindings.ccd_storage.ready_count)
       self.assertEqual([row["operation"] for row in bindings.operations], ["fill", "fill", "copy"])
-      workspace.fill(SimpleNamespace(size=0), 0, "world")
-      workspace.copy(SimpleNamespace(size=0), source, "world")
+      empty = wp.empty(0, dtype=wp.float32, device="cpu")
+      native_execution.fill_step_rows(bindings, empty, 0, "world")
+      native_execution.copy_step_rows(bindings, empty, empty, "world")
       self.assertEqual(fill.call_count, 2)
       self.assertEqual(copy.call_count, 1)
+
+  def test_empty_memory_operations_validate_owner_domain_and_descriptor_without_recording(self):
+    """An empty payload is not an escape from ownership admission or descriptor compatibility."""
+    empty = wp.empty(0, dtype=wp.float32, device="cpu")
+    nonleading_empty = wp.empty((17, 0), dtype=wp.float32, device="cpu")
+    bindings = _step_bindings()
+    with (
+      patch.object(native_execution, "_begin_recording", side_effect=AssertionError("Empty operation recorded")),
+      patch.object(native_execution.field_ops, "fill", side_effect=AssertionError("Empty fill emitted")),
+      patch.object(native_execution.field_ops, "copy", side_effect=AssertionError("Empty copy emitted")),
+    ):
+      self.assertIs(native_execution.fill_step_rows(bindings, empty, 0, "world"), empty)
+      native_execution.copy_step_rows(bindings, empty, empty, "world")
+      self.assertEqual(bindings.operations, [])
+      self.assertIsNone(bindings._recording_binding)
+      for operation in ("fill", "copy"):
+        for problem in ("closed", "quarantined", "domain", "unregistered", "source"):
+          if problem == "source" and operation == "fill":
+            continue
+          bindings = _step_bindings()
+          bindings.world_storage.closed = problem == "closed"
+          bindings.world_storage.service_failed = problem == "quarantined"
+          array = nonleading_empty if problem == "unregistered" else empty
+          source = wp.empty(0, dtype=wp.int32, device="cpu") if problem == "source" else array
+          domain = "missing" if problem == "domain" else "world"
+          with self.subTest(operation=operation, problem=problem), self.assertRaises((ValueError, RuntimeError)):
+            if operation == "fill":
+              native_execution.fill_step_rows(bindings, array, 0, domain)
+            else:
+              native_execution.copy_step_rows(bindings, array, source, domain)
 
   def test_post_emission_failures_poison_native_and_shared_graph_without_fallback(self):
     for name in ("fill", "copy", "bind"):
       for error in (ArithmeticError, KeyboardInterrupt):
         bindings = _step_bindings()
-        workspace = _StepWorkspace.__new__(_StepWorkspace)
-        workspace.bindings = bindings
-        array = SimpleNamespace(size=12, fill_=lambda *_: self.fail("Unexpected dense fill"))
+        array = wp.empty(12, dtype=wp.float32, device="cpu")
         operation = {
-          "fill": lambda: workspace.fill(array, 0, "world"),
-          "copy": lambda: workspace.copy(array, array, "world"),
+          "fill": lambda: native_execution.fill_step_rows(bindings, array, 0, "world"),
+          "copy": lambda: native_execution.copy_step_rows(bindings, array, array, "world"),
           "bind": lambda: bind_step_launch(bindings, _native_kernel(), (17, 17), "world"),
         }[name]
         with (
@@ -522,20 +580,23 @@ class ConvexScratchTest(unittest.TestCase):
     pair = (types.GeomType.CYLINDER, types.GeomType.MESH)
     model = _convex_model(pair, multiccd=True)
     with patch.object(wp, "empty", side_effect=AssertionError("Layout allocated")):
-      count, iterations, specs = collision_convex._convex_scratch_layout(model, [pair], 11)
-    fields = {name: (shape, dtype, domain) for name, shape, dtype, domain in specs}
+      count, iterations, shapes = collision_convex._convex_scratch_shapes(model, [pair], 11)
+    hints = typing.get_type_hints(collision_convex._ConvexScratch)
     self.assertEqual((count, iterations), (1, 35))
-    self.assertEqual(fields["multiccd_pdist"], ((11, 16), float, "ccd"))
-    self.assertEqual(fields["multiccd_polygon"][0], (11, 32))
-    self.assertEqual(fields["multiccd_idx1"][0], (11, 5))
-    self.assertEqual(fields["epa_vert"][0], (11, 80))
-    self.assertEqual(fields["nccd"][2], "global_counter")
-    self.assertEqual(set(fields), {field.name for field in dataclasses.fields(collision_convex._ConvexScratch)})
+    self.assertEqual(shapes["multiccd_pdist"], (11, 16))
+    self.assertIs(hints["multiccd_pdist"].dtype, wp.float32)
+    self.assertEqual(shapes["multiccd_polygon"], (11, 32))
+    self.assertEqual(shapes["multiccd_idx1"], (11, 5))
+    self.assertEqual(shapes["epa_vert"], (11, 80))
+    self.assertIs(hints["epa_vert"].dtype, wp.vec3)
+    self.assertIs(hints["nccd"].dtype, wp.int32)
+    self.assertEqual(set(shapes), {field.name for field in dataclasses.fields(collision_convex._ConvexScratch)})
+    for name, shape in shapes.items():
+      self.assertEqual(len(shape), hints[name].ndim)
 
   def test_box_clipping_remains_enabled_when_multiccd_is_disabled(self):
     pair = (types.GeomType.BOX, types.GeomType.BOX)
-    count, iterations, specs = collision_convex._convex_scratch_layout(_convex_model(pair), [pair], 13)
-    fields = {name: shape for name, shape, _, _ in specs}
+    count, iterations, fields = collision_convex._convex_scratch_shapes(_convex_model(pair), [pair], 13)
     self.assertEqual((count, iterations), (1, 16))
     self.assertEqual(fields["epa_vert"], (13, 42))
     self.assertEqual(fields["multiccd_pdist"], (13, 4))
@@ -547,11 +608,9 @@ class ConvexScratchTest(unittest.TestCase):
     stage = ast.parse(inspect.getsource(collision_convex.convex_narrowphase))
     plan = ast.parse(inspect.getsource(step_workspace_layout))
     self.assertTrue(
-      any(isinstance(node, ast.Call) and ast.unparse(node.func) == "_convex_scratch_layout" for node in ast.walk(plan))
+      any(isinstance(node, ast.Call) and ast.unparse(node.func) == "_convex_scratch_shapes" for node in ast.walk(plan))
     )
-    self.assertFalse(
-      any(isinstance(node, ast.Attribute) and ast.unparse(node) == "workspace.arrays" for node in ast.walk(stage))
-    )
+    self.assertFalse(any(isinstance(node, ast.Name) and node.id == "workspace" for node in ast.walk(stage)))
     self.assertFalse(
       any(
         isinstance(node, ast.IfExp)
@@ -562,7 +621,8 @@ class ConvexScratchTest(unittest.TestCase):
     )
     fields = {field.name for field in dataclasses.fields(collision_convex._ConvexScratch)}
     self.assertFalse(
-      fields & {node.value for node in ast.walk(plan) if isinstance(node, ast.Constant) and isinstance(node.value, str)},
+      (fields - {"nccd"})
+      & {node.value for node in ast.walk(plan) if isinstance(node, ast.Constant) and isinstance(node.value, str)},
       "Step preparation must consume the collision schema rather than duplicate its field declarations",
     )
 
@@ -572,10 +632,11 @@ class ConvexScratchTest(unittest.TestCase):
     model = Mock(**vars(metadata))
     model.opt.ccd_tolerance, model.opt.warn_overflow = 1e-6, False
     model.block_dim = SimpleNamespace(convex_ccd=32)
-    data = Mock(naconmax=2, naccdmax=2)
-    specs = collision_convex._convex_scratch_layout(model, [pair], 2)[2]
-    fields = {name: wp.empty(shape, dtype=dtype, device="cpu") for name, shape, dtype, _ in specs}
-    workspace = SimpleNamespace(_convex=collision_convex._ConvexScratch(**fields), bindings=None)
+    data = Mock(naconmax=2, naccdmax=2, ncollision=wp.zeros(1, dtype=wp.int32, device="cpu"))
+    shapes = collision_convex._convex_scratch_shapes(model, [pair], 2)[2]
+    hints = typing.get_type_hints(collision_convex._ConvexScratch)
+    fields = {name: wp.empty(shape, dtype=hints[name].dtype, device="cpu") for name, shape in shapes.items()}
+    scratch = collision_convex._ConvexScratch(**fields)
     allocate = wp.empty
     for prepared in (False, True):
       with (
@@ -588,7 +649,7 @@ class ConvexScratchTest(unittest.TestCase):
       ):
         for _ in range(2):
           fields["nccd"].fill_(9)
-          collision_convex.convex_narrowphase(model, data, Mock(), [pair], workspace=workspace if prepared else None)
+          collision_convex.convex_narrowphase(model, data, Mock(), [pair], scratch=scratch if prepared else None)
           arguments = launch.call_args.kwargs["inputs"]
           np.testing.assert_array_equal(arguments[-1].numpy(), np.zeros(fields["nccd"].shape, dtype=np.int32))
           if prepared:
@@ -598,8 +659,49 @@ class ConvexScratchTest(unittest.TestCase):
             self.assertIsNot(arguments[-1], fields["nccd"])
         self.assertEqual(launch.call_count, 2)
 
+  def test_invalid_binding_rejects_before_zero_work_or_counter_reset(self):
+    """A standalone convex stage must admit its borrowed owners before any write or early return."""
+    pair = (types.GeomType.BOX, types.GeomType.BOX)
+    for has_pairs in (False, True):
+      model = _convex_model(pair)
+      if not has_pairs:
+        model.geom_pair_type_count = [0] * len(model.geom_pair_type_count)
+      data = SimpleNamespace(naccdmax=2)
+      counter = wp.full(4, 9, dtype=wp.int32, device="cpu")
+      scratch = SimpleNamespace(nccd=counter)
+      for failure in ("closed", "quarantined"):
+        bindings = _step_bindings()
+        bindings.world_storage.closed = failure == "closed"
+        bindings.world_storage.service_failed = failure == "quarantined"
+        with self.subTest(has_pairs=has_pairs, failure=failure), self.assertRaisesRegex(RuntimeError, "closed or quarantined"):
+          collision_convex.convex_narrowphase(model, data, None, [pair], scratch=scratch, bindings=bindings)
+        np.testing.assert_array_equal(counter.numpy(), np.full(4, 9, dtype=np.int32))
+
 
 class WorkspaceTest(unittest.TestCase):
+  def setUp(self):
+    # Validation needs no allocated scratch or native topology. This fixture is passive data.
+    model, data = Metadata(), Metadata()
+    self.metadata_workspace = _StepWorkspace(
+      model=model,
+      data=data,
+      bindings=None,
+      device=wp.get_device("cpu"),
+      storage=None,
+      arrays={},
+      convex=None,
+      _collision=None,
+      _solver_model=None,
+      _solver_data=None,
+      _solver_context=None,
+      _ledger=(),
+      _execution_binding=None,
+      _binding_layout=None,
+      _data_layout=native_execution._layout(data),
+      _model_layout=native_execution._layout(model),
+      _scratch_layout=native_execution._layout(((), None, None, None, None, None)),
+    )
+
   def test_prepared_api_names_express_specs_and_execution_contract(self):
     """Keep allocation requirements and recording semantics explicit without legacy aliases."""
     import mujoco_warp as mjw
@@ -612,8 +714,13 @@ class WorkspaceTest(unittest.TestCase):
       [field.name for field in dataclasses.fields(WorkspaceFieldSpec)], ["name", "shape", "dtype", "capacity_domain"]
     )
     self.assertEqual(set(inspect.signature(make_step_workspace).parameters), {"model", "data", "arrays", "bindings"})
-    self.assertFalse(hasattr(_StepWorkspace, "observe_launch"))
-    self.assertIn("parameter_domains", inspect.signature(_StepWorkspace.bind_launch).parameters)
+    self.assertTrue(dataclasses.is_dataclass(_StepWorkspace))
+    record = ast.parse(inspect.getsource(_StepWorkspace))
+    self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(record)))
+    self.assertFalse(
+      {"validate", "memory_report", "bind_launch", "fill", "copy", "world_live_count"} & vars(_StepWorkspace).keys()
+    )
+    self.assertIs(mjw.step_workspace_memory_report, native_workspace.step_workspace_memory_report)
 
   def test_disabled_derivative_copy_preserves_inactive_rows(self):
     """Route derivative fallback through the same bounded native row-copy owner."""
@@ -634,8 +741,12 @@ class WorkspaceTest(unittest.TestCase):
             calls.append((destination, source, domain))
             wp.copy(destination[:live], source[:live])
 
-          workspace = SimpleNamespace(copy=copy, validate=lambda *args: None) if prepared else None
-          with patch.object(wp, "launch", side_effect=AssertionError("Unexpected derivative kernel")):
+          workspace = SimpleNamespace(bindings=object()) if prepared else None
+          with (
+            patch.object(wp, "launch", side_effect=AssertionError("Unexpected derivative kernel")),
+            patch.object(native_execution, "validate_step_workspace"),
+            patch.object(native_execution, "copy_step_rows", side_effect=lambda _, *args: copy(*args)),
+          ):
             derivative.deriv_smooth_vel(model, data, out, workspace=workspace)
           expected = np.full((4, 3), -7.0, np.float32)
           count = live if prepared else 4
@@ -673,8 +784,12 @@ class WorkspaceTest(unittest.TestCase):
               touched.append(array)
               array[:live].fill_(value)
 
-            workspace = SimpleNamespace(fill=fill, validate=lambda *args: None) if prepared else None
-            with patch.object(wp, "launch", side_effect=AssertionError("Unexpected stage work")):
+            workspace = SimpleNamespace(bindings=object()) if prepared else None
+            with (
+              patch.object(wp, "launch", side_effect=AssertionError("Unexpected stage work")),
+              patch.object(native_execution, "validate_step_workspace"),
+              patch.object(native_execution, "fill_step_rows", side_effect=lambda _, *args: fill(*args)),
+            ):
               operation(model, data, workspace=workspace)
             expected = np.full((4, 3), 7, np.float32)
             expected[: live if prepared else 4] = 0
@@ -688,8 +803,12 @@ class WorkspaceTest(unittest.TestCase):
     model = Mock(nbranch=2, nbody=3, ngeom=4, nsite=2)
     data = Mock(nworld=7)
     emitted, observed = [], []
-    workspace = SimpleNamespace(bind_launch=lambda *args: observed.append(args), validate=lambda *args: None)
-    with patch.object(wp, "launch", side_effect=lambda kernel, dim, **_: emitted.append((kernel, dim, "world"))):
+    workspace = SimpleNamespace(bindings=object())
+    with (
+      patch.object(wp, "launch", side_effect=lambda kernel, dim, **_: emitted.append((kernel, dim, "world"))),
+      patch.object(native_execution, "validate_step_workspace"),
+      patch.object(native_execution, "bind_step_launch", side_effect=lambda _, *args: observed.append(args)),
+    ):
       smooth.kinematics(model, data, workspace=workspace)
     self.assertEqual(observed, emitted)
     self.assertEqual(observed[-1], (smooth._site_local_to_global, (7, 2), "world"))
@@ -706,27 +825,12 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(arguments["while_body"], "_solver_iteration")
     self.assertEqual(arguments.get("workspace"), "workspace", "Unbound WHILE nodes can over-decrement live nsolving")
 
-  def test_workspace_launches_call_native_binding_operation(self):
-    workspace = _StepWorkspace.__new__(_StepWorkspace)
-    workspace.bindings = object()
-    kernel = object()
-    with patch.object(native_execution, "bind_step_launch") as bind:
-      workspace.bind_launch(kernel, (31, 4), "world")
-      workspace.bind_launch(kernel, (31, 4), "candidate")
-      workspace.bind_launch(kernel, 256, None, extent_axis=None, parameter_domains={"naccdmax_in": "ccd"})
-      workspace.bind_launch(kernel, (31, 0), "world")
-    self.assertEqual([call.args[3] for call in bind.call_args_list], ["world", "candidate", None])
-    self.assertEqual(bind.call_args.kwargs, {"extent_axis": None, "parameter_domains": {"naccdmax_in": "ccd"}})
-    self.assertTrue(all(call.args[0] is workspace.bindings for call in bind.call_args_list))
-
   def test_explicit_memory_operations_preserve_eager_behavior_without_bindings(self):
-    workspace = _StepWorkspace.__new__(_StepWorkspace)
-    workspace.bindings = None
     source = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), device="cpu")
     destination = wp.zeros((3, 4), dtype=wp.float32, device="cpu")
-    workspace.copy(destination, source, "world")
+    native_execution.copy_step_rows(None, destination, source, "world")
     np.testing.assert_array_equal(destination.numpy(), source.numpy())
-    self.assertIs(workspace.fill(destination, 7, "world"), destination)
+    self.assertIs(native_execution.fill_step_rows(None, destination, 7, "world"), destination)
     np.testing.assert_array_equal(destination.numpy(), np.full((3, 4), 7, np.float32))
 
   def test_callback_recorder_rejected_before_scratch_planning(self):
@@ -737,7 +841,7 @@ class WorkspaceTest(unittest.TestCase):
       patch.object(native_workspace, "step_workspace_layout", side_effect=AssertionError("Unexpected scratch planning")),
       self.assertRaisesRegex(TypeError, "StepBindings"),
     ):
-      make_step_workspace(None, data, bindings=recorder)
+      make_step_workspace(None, data, arrays={}, bindings=recorder)
     for arguments in ({"recorder": recorder}, {"world_live_count": object()}):
       with self.subTest(arguments=arguments), self.assertRaisesRegex(TypeError, "unexpected keyword"):
         make_step_workspace(None, data, **arguments)
@@ -757,7 +861,7 @@ class WorkspaceTest(unittest.TestCase):
         storage.capacity = 18
         try:
           with self.subTest(domain=domain), self.assertRaisesRegex(ValueError, f"Data.{name}"):
-            make_step_workspace(None, data, bindings=bindings)
+            make_step_workspace(None, data, arrays={}, bindings=bindings)
         finally:
           storage.capacity = 17
 
@@ -800,7 +904,9 @@ class WorkspaceTest(unittest.TestCase):
     exported = {
       name: function
       for name, function in vars(mjw).items()
-      if inspect.isfunction(function) and "workspace" in inspect.signature(function).parameters
+      if inspect.isfunction(function)
+      and "workspace" in inspect.signature(function).parameters
+      and inspect.signature(function).parameters["workspace"].kind == inspect.Parameter.KEYWORD_ONLY
     }
     self.assertEqual(set(exported), expected)
     unsupported = {"euler", "rungekutta4", "rne_postconstraint", "energy_vel"}
@@ -813,21 +919,25 @@ class WorkspaceTest(unittest.TestCase):
         and parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
       ]
       with self.subTest(program=name), ExitStack() as stack:
+        stack.enter_context(patch.object(native_execution, "validate_step_workspace", validate))
         for operation in ("launch", "launch_tiled", "empty", "empty_like", "zeros", "clone", "copy"):
           stack.enter_context(patch.object(wp, operation, side_effect=AssertionError("stage work before validation")))
         if name in unsupported:
           with self.assertRaisesRegex(NotImplementedError, "Prepared"):
-            program(*arguments, workspace=SimpleNamespace(validate=validate))
+            program(*arguments, workspace=SimpleNamespace(bindings=None))
           validate.assert_not_called()
         else:
           with self.assertRaisesRegex(ValueError, "invalid prepared binding"):
-            program(*arguments, workspace=SimpleNamespace(validate=validate))
+            program(*arguments, workspace=SimpleNamespace(bindings=None))
           validate.assert_called_once()
 
   def test_prepared_position_rejects_unprepared_factorization(self):
     """Reject the eager default factorization path before any position work is emitted."""
-    workspace = SimpleNamespace(validate=lambda *args: None)
-    with patch.object(wp, "launch", side_effect=AssertionError("work before rejection")):
+    workspace = SimpleNamespace(bindings=None)
+    with (
+      patch.object(wp, "launch", side_effect=AssertionError("work before rejection")),
+      patch.object(native_execution, "validate_step_workspace"),
+    ):
       with self.assertRaisesRegex(NotImplementedError, "factorize=False"):
         forward.fwd_position(object(), object(), workspace=workspace)
 
@@ -836,19 +946,24 @@ class WorkspaceTest(unittest.TestCase):
     parent, velocity = object(), object()
     workspace = SimpleNamespace(
       arrays={"island_parent": parent, "actuator_vel": velocity},
-      validate=lambda *args: None,
-      bind_launch=lambda *args: None,
-      fill=lambda *args: None,
+      bindings=object(),
     )
     with (
       patch.object(island, "direct_dsu") as launch,
       patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
+      patch.object(native_execution, "validate_step_workspace"),
     ):
       island.island(SimpleNamespace(ntree=2), SimpleNamespace(nworld=3), workspace=workspace)
       self.assertIs(launch.call_args.args[2], parent)
     model = Mock(opt=SimpleNamespace(disableflags=0, timestep=None), nactuator=2, has_fluid=False)
     data = Mock(nworld=3)
-    with patch.object(wp, "launch") as launch, patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")):
+    with (
+      patch.object(wp, "launch") as launch,
+      patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
+      patch.object(native_execution, "validate_step_workspace"),
+      patch.object(native_execution, "bind_step_launch"),
+      patch.object(native_execution, "fill_step_rows"),
+    ):
       derivative.deriv_smooth_vel(model, data, object(), workspace=workspace)
       self.assertIs(launch.call_args_list[0].kwargs["outputs"][0], velocity)
     for function, name, position in (
@@ -856,9 +971,10 @@ class WorkspaceTest(unittest.TestCase):
       (smooth.transmission, "moment_nnz", -1),
     ):
       workspace.arrays[name] = object()
-      workspace.fill = Mock()
       model = Mock(opt=SimpleNamespace(solver=types.SolverType.NEWTON, disableflags=types.DisableBit.CONSTRAINT))
       with (
+        patch.object(native_execution, "validate_step_workspace"),
+        patch.object(native_execution, "fill_step_rows") as fill,
         patch.object(wp, "launch", side_effect=RuntimeError("first stage launch")) as launch,
         patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
         patch.object(wp, "zeros", side_effect=AssertionError("scratch allocated")),
@@ -867,7 +983,7 @@ class WorkspaceTest(unittest.TestCase):
         function(model, data, workspace=workspace)
       self.assertIs(launch.call_args.kwargs["inputs"][position], workspace.arrays[name])
       if name == "moment_nnz":
-        workspace.fill.assert_called_once_with(workspace.arrays[name], 0, "world")
+        fill.assert_called_once_with(workspace.bindings, workspace.arrays[name], 0, "world")
 
   def test_prepared_stages_reject_alternate_scratch_before_writing_or_launching(self):
     """One prepared scratch owner cannot be bypassed through an optional eager argument."""
@@ -877,88 +993,85 @@ class WorkspaceTest(unittest.TestCase):
       (island.island, (object(), object()), "parent", "island_parent"),
       (derivative.deriv_smooth_vel, (object(), object(), object()), "actuator_vel", "actuator_vel"),
     ):
-      workspace = SimpleNamespace(validate=lambda *args: None, arrays={field: object()}, fill=Mock())
+      workspace = SimpleNamespace(bindings=object(), arrays={field: object()})
       with (
         self.subTest(function=function.__name__),
+        patch.object(native_execution, "validate_step_workspace"),
+        patch.object(native_execution, "fill_step_rows") as fill,
         patch.object(wp, "launch", side_effect=AssertionError("unadmitted scratch touched")),
         self.assertRaisesRegex(ValueError, "workspace .* scratch"),
       ):
         function(*arguments, **{parameter: object()}, workspace=workspace)
-      workspace.fill.assert_not_called()
+      fill.assert_not_called()
 
   def test_prepared_inertia_multiply_rejects_dense_override_and_does_not_allocate_unused_skip(self):
     """Reject dense overrides before access and bind admitted scalar inertia launches."""
-    workspace = SimpleNamespace(validate=Mock(), bind_launch=Mock())
+    workspace = SimpleNamespace(bindings=object())
     model, data = Mock(nv=2), Mock(nworld=7, M=SimpleNamespace(ndim=2))
     with (
       patch.object(wp, "launch", side_effect=AssertionError("unbounded dense access")) as launch,
       patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")),
+      patch.object(native_execution, "validate_step_workspace"),
+      patch.object(native_execution, "bind_step_launch") as bind,
       self.assertRaisesRegex(NotImplementedError, "dense block inertia"),
     ):
       support.mul_m(model, data, object(), object(), M=SimpleNamespace(ndim=3), workspace=workspace)
     launch.assert_not_called()
-    workspace.bind_launch.assert_not_called()
-    with patch.object(wp, "launch") as launch, patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")):
+    bind.assert_not_called()
+    with (
+      patch.object(wp, "launch") as launch,
+      patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")),
+      patch.object(native_execution, "validate_step_workspace"),
+      patch.object(native_execution, "bind_step_launch") as bind,
+    ):
       support.mul_m(model, data, object(), object(), workspace=workspace)
     self.assertIsNone(launch.call_args.kwargs["inputs"][-1])
-    workspace.bind_launch.assert_called_once_with(launch.call_args.args[0], (7, 2), "world")
+    bind.assert_called_once_with(workspace.bindings, launch.call_args.args[0], (7, 2), "world")
 
   def test_prepared_execution_binding_cannot_change_mode_count_or_bindings(self):
-    """Derive the sole world count and reject dynamic-to-fixed or borrowed-source escape."""
+    """Keep the sole count in the owner record and reject mode or descriptor replacement."""
     bindings = _step_bindings()
     count = bindings.world_storage.protected_count
     specs = _collision_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
-    data = SimpleNamespace(qpos=count)
-    with (
-      patch.object(solver, "_solver_context_layout", return_value=()),
-      patch.object(types, "SolverContext", return_value=SimpleNamespace()),
+    data = _workspace_data(count)
+    with _cpu_workspace_preparation(specs), patch.object(native_workspace.field_ops, "lookup", return_value=0):
+      dynamic = make_step_workspace(Metadata(), data, arrays=arrays, bindings=bindings)
+      fixed = make_step_workspace(Metadata(), data, arrays=arrays)
+    self.assertFalse(hasattr(dynamic, "world_live_count"))
+    for replacement in (None, _step_bindings()):
+      dynamic.bindings = replacement
+      with self.assertRaisesRegex(ValueError, "execution binding changed"):
+        native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+    dynamic.bindings = bindings
+    count.fill_(1)
+    native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+    for name, changed in (("shape", (0,)), ("strides", (8,)), ("dtype", wp.int64)):
+      original = getattr(count, name)
+      try:
+        setattr(count, name, changed)
+        with self.assertRaisesRegex(ValueError, "storage or count descriptors changed"):
+          native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+      finally:
+        setattr(count, name, original)
+    for owner, name, value in (
+      (bindings, "world_storage", _step_bindings().world_storage),
+      (bindings.world_storage, "protected_count", wp.zeros(1, dtype=wp.int32, device="cpu")),
+      (bindings.contact_storage, "ready_count", wp.zeros(1, dtype=wp.int32, device="cpu")),
+      (bindings.ccd_storage, "capacity", 18),
+      (bindings, "bindings", []),
     ):
-      dynamic = _StepWorkspace(Metadata(), data, specs, None, None, arrays=arrays, bindings=bindings)
-      fixed = _StepWorkspace(Metadata(), data, specs, None, None, arrays=arrays)
-    self.assertIs(dynamic.world_live_count, bindings.world_storage.protected_count)
-    with patch.object(wp, "get_stream", return_value=None):
-      for next_count, next_bindings in (
-        (None, None),
-        (wp.zeros(1, dtype=wp.int32, device="cpu"), bindings),
-        (count, _step_bindings()),
-      ):
-        dynamic.world_live_count, dynamic.bindings = next_count, next_bindings
-        with self.assertRaisesRegex(ValueError, "execution binding changed"):
-          dynamic.validate(dynamic.model, data)
-      dynamic.world_live_count, dynamic.bindings = count, bindings
-      count.fill_(1)
-      dynamic.validate(dynamic.model, data)
-      for name, changed in (("shape", (0,)), ("strides", (8,)), ("dtype", wp.int64)):
-        original = getattr(count, name)
-        try:
-          setattr(count, name, changed)
-          with self.assertRaisesRegex(ValueError, "execution binding changed"):
-            dynamic.validate(dynamic.model, data)
-        finally:
-          setattr(count, name, original)
-      for owner, name, value in (
-        (bindings, "world_storage", _step_bindings().world_storage),
-        (bindings.world_storage, "protected_count", wp.zeros(1, dtype=wp.int32, device="cpu")),
-        (bindings.contact_storage, "ready_count", wp.zeros(1, dtype=wp.int32, device="cpu")),
-        (bindings.ccd_storage, "capacity", 18),
-        (bindings, "bindings", []),
-      ):
-        original = getattr(owner, name)
-        try:
-          setattr(owner, name, value)
-          with self.assertRaisesRegex(ValueError, "storage or count descriptors changed"):
-            dynamic.validate(dynamic.model, data)
-        finally:
-          setattr(owner, name, original)
-      dynamic.bindings = None
-      with self.assertRaisesRegex(ValueError, "execution binding changed"):
-        dynamic.validate(dynamic.model, data)
-      dynamic.bindings = bindings
-      dynamic.validate(dynamic.model, data)
-      fixed.world_live_count, fixed.bindings = count, bindings
-      with self.assertRaisesRegex(ValueError, "execution binding changed"):
-        fixed.validate(fixed.model, data)
+      original = getattr(owner, name)
+      try:
+        setattr(owner, name, value)
+        with self.assertRaisesRegex(ValueError, "storage or count descriptors changed"):
+          native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+      finally:
+        setattr(owner, name, original)
+    native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+    fixed.bindings = bindings
+    with self.assertRaisesRegex(ValueError, "execution binding changed"):
+      native_execution.validate_step_workspace(fixed, fixed.model, data)
 
   def test_cpu_template_plans_capacity_without_allocating_or_mutating(self):
     instances = []
@@ -979,7 +1092,7 @@ class WorkspaceTest(unittest.TestCase):
       instances.append((model, data))
     model, template = instances[0]
     real_model, real_data = instances[1]
-    before = _StepWorkspace._layout(model), _StepWorkspace._layout(template)
+    before = native_execution._layout(model), native_execution._layout(template)
     with ExitStack() as stack:
       for name in (
         "empty",
@@ -1012,20 +1125,16 @@ class WorkspaceTest(unittest.TestCase):
       ):
         with self.assertRaises(ValueError):
           step_workspace_layout(model, template, **{name: value})
-    self.assertEqual(before, (_StepWorkspace._layout(model), _StepWorkspace._layout(template)))
+    self.assertEqual(before, (native_execution._layout(model), native_execution._layout(template)))
 
   def test_caller_scratch_binding_owns_no_allocation(self):
     specs = _collision_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
-    data = SimpleNamespace(qpos=arrays["collision_worldid"])
-    with (
-      patch.object(solver, "_solver_context_layout", return_value=()),
-      patch.object(types, "SolverContext", return_value=SimpleNamespace()),
-      patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")),
-    ):
-      workspace = _StepWorkspace(Metadata(), data, specs, None, None, arrays=arrays)
+    data = _workspace_data(arrays["collision_worldid"])
+    with _cpu_workspace_preparation(specs), patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
+      workspace = make_step_workspace(Metadata(), data, arrays=arrays)
     self.assertIsNone(workspace.storage)
-    report = workspace.memory_report()
+    report = native_workspace.step_workspace_memory_report(workspace)
     self.assertEqual(report["allocation_owner"], "caller")
     for name in ("solver_model", "solver_data", "solver_context", "collision"):
       self.assertFalse(hasattr(workspace, name), "Derived stage views belong to the engine, not caller configuration")
@@ -1042,12 +1151,60 @@ class WorkspaceTest(unittest.TestCase):
       self.assertIs(workspace.arrays[name], array)
     arrays["collision_worldid"].shape = (1,)
     with self.assertRaisesRegex(ValueError, "scratch descriptors"):
-      workspace.validate(workspace.model, data)
+      native_execution.validate_step_workspace(workspace, workspace.model, data)
+
+  def test_snapshot_aliases_share_one_traversal_but_later_mutations_remain_visible(self):
+    array = wp.empty(2, dtype=wp.float32, device="cpu")
+    metadata = Metadata(pair_counts=(array,))
+    first = native_execution._layout((metadata, metadata, array))
+    self.assertIs(first[1][0], native_execution._LAYOUT_REFERENCE)
+    self.assertIs(first[2][0], native_execution._LAYOUT_REFERENCE)
+    self.assertNotEqual(first[1], first[2])
+    self.assertEqual(first, native_execution._layout((metadata, metadata, array)))
+    split_alias = dataclasses.replace(metadata)
+    self.assertNotEqual(first, native_execution._layout((metadata, split_alias, array)))
+    metadata.option += 1
+    self.assertNotEqual(first, native_execution._layout((metadata, metadata, array)))
+    metadata.option -= 1
+    array.shape = (1,)
+    self.assertNotEqual(first, native_execution._layout((metadata, metadata, array)))
+    array.shape = (2,)
+    self.assertEqual(first, native_execution._layout((metadata, metadata, array)))
+
+    # A short-lived traversal retains temporary roots, preventing recycled IDs.
+    temporary = Metadata()
+    reference = weakref.ref(temporary)
+    memo = {}
+    native_execution._layout(temporary, memo)
+    del temporary
+    self.assertIsNotNone(reference())
+    del memo
+    self.assertIsNone(reference())
+
+  def test_derived_scratch_record_rebinding_rejected_before_capture(self):
+    """The shared arrays and the stage records must describe the same retained allocations."""
+    specs = _collision_scratch_specs()
+    arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
+    data = _workspace_data(arrays["collision_worldid"])
+    with _cpu_workspace_preparation(specs):
+      workspace = make_step_workspace(Metadata(), data, arrays=arrays)
+    replacement = wp.empty_like(arrays["nccd"])
+    for name, field in (("convex", "nccd"), ("_collision", "collision_worldid")):
+      original = getattr(workspace, name)
+      try:
+        setattr(workspace, name, dataclasses.replace(original, **{field: replacement}))
+        with self.subTest(name=name), self.assertRaisesRegex(ValueError, "scratch descriptors"):
+          native_execution.validate_step_workspace(workspace, workspace.model, data)
+      finally:
+        setattr(workspace, name, original)
+    workspace._solver_context = SimpleNamespace()
+    with self.assertRaisesRegex(ValueError, "scratch descriptors"):
+      native_execution.validate_step_workspace(workspace, workspace.model, data)
 
   def test_caller_scratch_invalid_descriptors_reject_before_allocating(self):
     owner = wp.empty(128, dtype=wp.uint8, device="cpu")
     spec = WorkspaceFieldSpec("scratch", (2, 3), wp.float32, "world")
-    data = SimpleNamespace(qpos=owner)
+    data = _workspace_data(owner)
     valid = wp.array(ptr=owner.ptr, shape=(2, 3), strides=(32, 4), dtype=wp.float32, device="cpu")
     cases = (
       {},
@@ -1057,60 +1214,55 @@ class WorkspaceTest(unittest.TestCase):
       {"scratch": wp.array(ptr=owner.ptr, shape=(2, 3), strides=(32, 8), dtype=wp.float32, device="cpu")},
       {"scratch": wp.array(ptr=owner.ptr, shape=(2, 3), strides=(4, 4), dtype=wp.float32, device="cpu")},
     )
-    with patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
+    with _cpu_workspace_preparation((spec,)), patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
       for arrays in cases:
         with self.assertRaises(ValueError):
-          _StepWorkspace(Metadata(), data, (spec,), None, None, arrays=arrays)
+          make_step_workspace(Metadata(), data, arrays=arrays)
 
   def test_prepared_scalar_mutation_rejected_before_capture(self):
     for owner, field in (("data", "nworld"), ("data", "njmax"), ("data", "naccdmax"), ("model", "nv"), ("model", "option")):
-      with self.subTest(owner=owner, field=field):
-        workspace = _StepWorkspace.__new__(_StepWorkspace)
-        workspace.world_live_count, workspace.bindings = None, None
-        workspace._execution_binding = None, None, None
-        workspace.model, workspace.data = Metadata(), Metadata()
-        workspace._data_layout = workspace._layout(workspace.data)
-        workspace._model_layout = workspace._layout(workspace.model)
-        value = getattr(workspace, owner)
-        setattr(value, field, getattr(value, field) + 1)
-        with self.assertRaisesRegex(ValueError, "scalar metadata"):
-          workspace.validate(workspace.model, workspace.data)
+      model, data = Metadata(), Metadata()
+      workspace = dataclasses.replace(
+        self.metadata_workspace,
+        model=model,
+        data=data,
+        _data_layout=native_execution._layout(data),
+        _model_layout=native_execution._layout(model),
+      )
+      value = getattr(workspace, owner)
+      setattr(value, field, getattr(value, field) + 1)
+      with self.subTest(owner=owner, field=field), self.assertRaisesRegex(ValueError, "scalar metadata"):
+        native_execution.validate_step_workspace(workspace, model, data)
 
   def test_foreign_model_or_data_rejected(self):
-    workspace = _StepWorkspace.__new__(_StepWorkspace)
-    workspace.world_live_count, workspace.bindings = None, None
-    workspace._execution_binding = None, None, None
-    workspace.model, workspace.data = Metadata(), Metadata()
+    workspace = self.metadata_workspace
     for model, data in ((Metadata(), workspace.data), (workspace.model, Metadata())):
       with self.assertRaisesRegex(ValueError, "original model"):
-        workspace.validate(model, data)
+        native_execution.validate_step_workspace(workspace, model, data)
 
   def test_nested_list_array_rebinding_is_part_of_immutable_metadata(self):
     """Inspect supported list containers recursively instead of trusting their Python identity."""
     for owner in ("model", "data"):
-      workspace = _StepWorkspace.__new__(_StepWorkspace)
-      workspace.world_live_count, workspace.bindings = None, None
-      workspace._execution_binding = None, None, None
-      workspace.model, workspace.data = Metadata(), Metadata()
+      model, data = Metadata(), Metadata()
       nested = [wp.zeros(1, dtype=float, device="cpu")]
-      getattr(workspace, owner).pair_counts = [nested]
-      workspace._data_layout = workspace._layout(workspace.data)
-      workspace._model_layout = workspace._layout(workspace.model)
+      setattr(model if owner == "model" else data, "pair_counts", [nested])
+      workspace = dataclasses.replace(
+        self.metadata_workspace,
+        model=model,
+        data=data,
+        _data_layout=native_execution._layout(data),
+        _model_layout=native_execution._layout(model),
+      )
       nested[0] = wp.ones(1, dtype=float, device="cpu")
       with self.subTest(owner=owner), self.assertRaisesRegex(ValueError, "scalar metadata"):
-        workspace.validate(workspace.model, workspace.data)
+        native_execution.validate_step_workspace(workspace, model, data)
 
   def test_prepared_topology_tuple_or_callback_change_rejected(self):
     for field, replacement in (("pair_counts", (2, 2)), ("callback", lambda *_: None)):
-      workspace = _StepWorkspace.__new__(_StepWorkspace)
-      workspace.world_live_count, workspace.bindings = None, None
-      workspace._execution_binding = None, None, None
-      workspace.model, workspace.data = Metadata(), Metadata()
-      workspace._data_layout = workspace._layout(workspace.data)
-      workspace._model_layout = workspace._layout(workspace.model)
+      workspace = dataclasses.replace(self.metadata_workspace, model=Metadata())
       setattr(workspace.model, field, replacement)
       with self.assertRaisesRegex(ValueError, "scalar metadata"):
-        workspace.validate(workspace.model, workspace.data)
+        native_execution.validate_step_workspace(workspace, workspace.model, workspace.data)
 
   def test_blocked_scratch_alignment_rejects_base_and_world_stride(self):
     """Reject misaligned blocked matrices without restricting dense scalar counters."""
@@ -1122,26 +1274,18 @@ class WorkspaceTest(unittest.TestCase):
     )
     owner = wp.empty(65536, dtype=wp.uint8, device="cpu")
     baseline = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
-    data, model = SimpleNamespace(qpos=baseline["moment_nnz"]), Metadata(nv=64)
+    data, model = _workspace_data(baseline["moment_nnz"]), Metadata(nv=64)
     for name in ("solver.h", "solver.hfactor"):
       for base, stride in ((4, 16384), (0, 16388)):
         arrays = dict(baseline)
         arrays[name] = wp.array(
           ptr=owner.ptr + base, shape=(2, 64, 64), strides=(stride, 256, 4), dtype=wp.float32, device="cpu"
         )
-        with (
-          self.subTest(name=name, base=base, stride=stride),
-          patch.object(solver, "_solver_context_layout", return_value=()),
-          patch.object(types, "SolverContext", return_value=SimpleNamespace()),
-          self.assertRaisesRegex(ValueError, "16-byte"),
-        ):
-          _StepWorkspace(model, data, specs, model, None, arrays=arrays)
-    with (
-      patch.object(solver, "_solver_context_layout", return_value=()),
-      patch.object(types, "SolverContext", return_value=SimpleNamespace()),
-      patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")),
-    ):
-      workspace = _StepWorkspace(model, data, specs, model, None, arrays=baseline)
+        with self.subTest(name=name, base=base, stride=stride), _cpu_workspace_preparation(specs):
+          with self.assertRaisesRegex(ValueError, "16-byte"):
+            make_step_workspace(model, data, arrays=arrays)
+    with _cpu_workspace_preparation(specs), patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
+      workspace = make_step_workspace(model, data, arrays=baseline)
     self.assertEqual(workspace.arrays["moment_nnz"].strides, (4,))
     # The nonblocked path does not request aligned=True; an absent hfactor is valid.
     small = (
@@ -1152,23 +1296,16 @@ class WorkspaceTest(unittest.TestCase):
     )
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in small}
     arrays["solver.h"] = wp.array(ptr=owner.ptr + 4, shape=(2, 2, 2), strides=(20, 8, 4), dtype=wp.float32, device="cpu")
-    with (
-      patch.object(solver, "_solver_context_layout", return_value=()),
-      patch.object(types, "SolverContext", return_value=SimpleNamespace()),
-    ):
-      _StepWorkspace(Metadata(nv=2), data, small, Metadata(nv=2), None, arrays=arrays)
+    with _cpu_workspace_preparation(small):
+      make_step_workspace(Metadata(nv=2), data, arrays=arrays)
 
   def test_compact_data_matrix_alignment_rejects_each_address_axis(self):
     """Reject misaligned compact matrix bases/strides before scratch binding."""
     owner = wp.empty(65536, dtype=wp.uint8, device="cpu")
     valid = wp.array(ptr=owner.ptr, shape=(2, 64, 64), strides=(16384, 256, 4), dtype=wp.float32, device="cpu")
-    data = SimpleNamespace(qpos=SimpleNamespace(device=SimpleNamespace(is_cuda=True)), cM=valid, cqLD=valid)
-    with (
-      patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
-      patch("mujoco_warp._src.workspace.step_workspace_layout", return_value=()),
-      patch.object(solver, "_compact_solver_views", return_value=(None, None)),
-      patch("mujoco_warp._src.workspace._StepWorkspace", return_value="bound") as bind,
-    ):
+    data = _workspace_data(owner)
+    data.cM = data.cqLD = valid
+    with _cpu_workspace_preparation(()), patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
       for name in ("cM", "cqLD"):
         for base, world_stride, row_stride in ((4, 16384, 256), (0, 16388, 256), (0, 16640, 260)):
           setattr(
@@ -1178,15 +1315,11 @@ class WorkspaceTest(unittest.TestCase):
               ptr=owner.ptr + base, shape=(2, 64, 64), strides=(world_stride, row_stride, 4), dtype=wp.float32, device="cpu"
             ),
           )
-          with self.subTest(name=name, base=base, stride=world_stride):
-            with self.assertRaisesRegex(ValueError, "16-byte"):
-              make_step_workspace(None, data)
-            bind.assert_not_called()
-          bind.reset_mock()
+          with self.subTest(name=name, base=base, stride=world_stride), self.assertRaisesRegex(ValueError, "16-byte"):
+            make_step_workspace(None, data)
           setattr(data, name, valid)
-      self.assertEqual(make_step_workspace(None, data), "bound")
-      data.cM = data.cqLD = wp.empty((2, 0, 0), dtype=wp.float32, device="cpu")
-      self.assertEqual(make_step_workspace(None, data), "bound")
+    solver.validate_blocked_matrix(valid)
+    solver.validate_blocked_matrix(wp.empty((2, 0, 0), dtype=wp.float32, device="cpu"))
 
   def test_implicit_fast_free_body_path_rejected_before_planning(self):
     """Reject the actual unbound free-body path before scratch planning or allocation."""

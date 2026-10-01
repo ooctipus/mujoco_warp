@@ -54,6 +54,86 @@ class StepBindings:
   _recording_binding: tuple | None = None
 
 
+_LAYOUT_REFERENCE = object()
+
+
+def _layout(value, memo=None):
+  """Snapshot native metadata with local references for repeated borrowed aliases.
+
+  Share a fresh memo across one operation's roots. First occurrences record all
+  descriptors; later occurrences record their traversal ordinal. The memo retains
+  temporary containers and is never reused by a subsequent validation.
+  """
+  if value is None or isinstance(value, (int, float, bool, str)):
+    return value
+  if memo is None:
+    memo = {}
+  identity = id(value)
+  if identity in memo:
+    return memo[identity][1]
+  if isinstance(value, wp.array):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    return value.ptr, value.shape, value.strides, value.dtype, value.device
+  if dataclasses.is_dataclass(value):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    result = []
+    for field in dataclasses.fields(value):
+      child = getattr(value, field.name)
+      cached = memo.get(id(child))
+      result.append((field.name, cached[1] if cached is not None else _layout(child, memo)))
+    return tuple(result)
+  if isinstance(value, (tuple, list)):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    result = []
+    for child in value:
+      cached = memo.get(id(child))
+      result.append(cached[1] if cached is not None else _layout(child, memo))
+    return tuple(result)
+  return identity
+
+
+def validate_step_workspace(workspace, model, data):
+  """Validate prepared binding before emission and pin owners during graph recording."""
+  if workspace.bindings is not workspace._execution_binding:
+    raise ValueError("Prepared execution binding changed; restore its original bindings before recording")
+  if workspace.bindings is not None:
+    if _binding_layout(workspace.bindings) != workspace._binding_layout:
+      raise ValueError("Prepared native storage or count descriptors changed; prepare a new workspace")
+    _validate_bindings(workspace.bindings)
+  if model is not workspace.model or data is not workspace.data:
+    raise ValueError("Prepared workspace requires its original model, data and immutable step options")
+  memo = {}
+  if _layout(data, memo) != workspace._data_layout or _layout(model, memo) != workspace._model_layout:
+    raise ValueError("Prepared Model/Data descriptors or scalar metadata changed; prepare a new workspace")
+  if (
+    _layout(
+      (
+        tuple(workspace.arrays.items()),
+        workspace.convex,
+        workspace._collision,
+        workspace._solver_context,
+        workspace._solver_model,
+        workspace._solver_data,
+      ),
+      memo,
+    )
+    != workspace._scratch_layout
+  ):
+    raise ValueError("Prepared scratch descriptors changed; prepare a new workspace")
+  owner = graph_ops.current_capture(device=workspace.device)
+  if owner is not None:
+    try:
+      if workspace.bindings is not None:
+        for storage in (workspace.bindings.world_storage, workspace.bindings.contact_storage, workspace.bindings.ccd_storage):
+          field_ops.retain_graph(storage, owner)
+      graph_ops.retain(owner, workspace)
+    except BaseException:
+      if workspace.bindings is not None:
+        workspace.bindings.recording_failed = True
+      graph_ops.invalidate(owner)
+      raise
+
+
 def _binding_layout(bindings):
   if bindings is None:
     return None
@@ -144,18 +224,14 @@ def _begin_recording(bindings, stream=None):
   if bindings.updates is None:
     raise RuntimeError("Prepare native graph updates before recording step operations")
   device = bindings.world_storage.device
-  graph = device.captures.get(wp.get_stream(device) if stream is None else stream)
+  graph = graph_ops.current_capture(device=device, stream=stream)
   if graph is None:
     raise RuntimeError("Record native step operations inside a Warp-managed graph capture")
-  if getattr(graph, "_preparation_failed", False):
-    raise RuntimeError("Discard this graph after failed preparation")
   if bindings._recording_binding is None:
-    bindings._recording_binding = _binding_layout(bindings), id(bindings.updates)
-  owners = getattr(graph, "_resource_owners", ())
-  if not any(owner is bindings for owner in owners):
-    graph._resource_owners = (*owners, bindings)
+    graph_ops.retain(graph, bindings)
     for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
       field_ops.retain_graph(storage, graph)
+    bindings._recording_binding = _binding_layout(bindings), id(bindings.updates)
 
 
 def _fail_recording(bindings, stream=None):
@@ -168,9 +244,9 @@ def _fail_recording(bindings, stream=None):
       if isinstance(bindings.updates, GraphUpdateTable)
       else bindings.world_storage.protected_count.device
     )
-    graph = device.captures.get((wp.get_stream(device) if device.is_cuda else None) if stream is None else stream)
+    graph = graph_ops.current_capture(device=device, stream=stream)
     if graph is not None:
-      graph._preparation_failed = True
+      graph_ops.invalidate(graph)
   except BaseException:
     # A malformed borrowed descriptor must not mask the error that poisoned it.
     # The composition root must also reject the native recording_failed latch.
@@ -268,6 +344,8 @@ def bind_step_launch(bindings, kernel, dim, extent_domain, *, extent_axis=0, par
   Zero-sized operations claim no node. Any other failure poisons this binding
   record and the active graph, because a launch may already have been emitted.
   """
+  if bindings is None:
+    return
   try:
     extent, parameters = validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains)
     dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
@@ -287,29 +365,55 @@ def bind_step_launch(bindings, kernel, dim, extent_domain, *, extent_axis=0, par
     raise
 
 
-def _fill_step_rows(bindings, array, value, domain):
+def fill_step_rows(bindings, array, value, domain):
+  """Fill native storage rows using that domain's independent admitted count."""
+  if bindings is None:
+    if array.size:
+      array.fill_(value)
+    return array
   try:
     _validate_bindings(bindings)
-    _begin_recording(bindings)
     owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
     if domain not in owners:
       raise ValueError(f"Unknown native memory domain: {domain!r}")
     owner = owners[domain]
+    if not isinstance(array, wp.array):
+      raise ValueError("Native fill requires a Warp array")
+    if not array.size:
+      field_ops.validate_array(array, dtype=array.dtype, shape=array.shape, device=owner.device)
+      if array.shape[0] and field_ops.lookup(owner, array) is None:
+        raise ValueError("Native fill requires a registered field or absent-leading-axis sentinel")
+      return array
+    _begin_recording(bindings)
     field_ops.fill(owner, array, value, count=owner.protected_count if domain == "world" else owner.ready_count)
     bindings.operations.append({"operation": "fill", "domain": domain, "field": field_ops.lookup(owner, array).name})
+    return array
   except BaseException:
     _fail_recording(bindings)
     raise
 
 
-def _copy_step_rows(bindings, destination, source, domain):
+def copy_step_rows(bindings, destination, source, domain):
+  """Copy native storage rows without accessing the inactive capacity suffix."""
+  if bindings is None:
+    if destination.size:
+      wp.copy(destination, source)
+    return
   try:
     _validate_bindings(bindings)
-    _begin_recording(bindings)
     owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
     if domain not in owners:
       raise ValueError(f"Unknown native memory domain: {domain!r}")
     owner = owners[domain]
+    if not isinstance(destination, wp.array):
+      raise ValueError("Native copy requires Warp arrays")
+    if not destination.size:
+      field_ops.validate_array(destination, dtype=destination.dtype, shape=destination.shape, device=owner.device)
+      field_ops.validate_array(source, dtype=destination.dtype, shape=destination.shape, device=owner.device)
+      if destination.shape[0] and field_ops.lookup(owner, destination) is None and field_ops.lookup(owner, source) is None:
+        raise ValueError("Native copy requires a registered field or absent-leading-axis sentinel")
+      return
+    _begin_recording(bindings)
     field_ops.copy(owner, destination, source, count=owner.protected_count if domain == "world" else owner.ready_count)
     field = field_ops.lookup(owner, destination) or field_ops.lookup(owner, source)
     bindings.operations.append({"operation": "copy", "domain": domain, "field": field.name})

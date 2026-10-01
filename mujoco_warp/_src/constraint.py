@@ -18,6 +18,7 @@ from typing import Tuple
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -4939,7 +4940,7 @@ def _add_surface_vel(is_pyramidal: bool):
 def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=None):
   """Creates constraint jacobians and other supporting data."""
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
     if efc_nnz is not None and efc_nnz is not workspace.arrays["efc_nnz"]:
       raise ValueError("Prepared constraints require workspace efc_nnz scratch")
   newton = m.opt.solver == types.SolverType.NEWTON
@@ -4952,7 +4953,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
     inputs=[d.ne, d.nf, d.nl, d.nefc, d.efc.jtdaj_nblock, efc_nnz],
   )
   if workspace is not None:
-    workspace.bind_launch(_zero_constraint_counts, d.nworld, "world")
+    step_execution.bind_step_launch(workspace.bindings, _zero_constraint_counts, d.nworld, "world")
 
   if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
     if not (m.opt.disableflags & types.DisableBit.EQUALITY):
@@ -5327,7 +5328,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
         ],
       )
       if workspace is not None:
-        workspace.bind_launch(launch_kernel, (d.nworld, m.nv), "world")
+        step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
       wp.launch(
         _friction_tendon(m.is_sparse, newton),
@@ -5457,7 +5458,9 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
         ],
       )
       if workspace is not None:
-        workspace.bind_launch(launch_kernel, (d.nworld, m.jnt_limited_slide_hinge_adr.size), "world")
+        step_execution.bind_step_launch(
+          workspace.bindings, launch_kernel, (d.nworld, m.jnt_limited_slide_hinge_adr.size), "world"
+        )
 
       wp.launch(
         _limit_tendon(m.is_sparse, newton),
@@ -5613,7 +5616,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           ],
         )
         if workspace is not None:
-          workspace.bind_launch(launch_kernel, d.naconmax, "candidate")
+          step_execution.bind_step_launch(workspace.bindings, launch_kernel, d.naconmax, "candidate")
 
       if m.is_sparse:
         if has_flex:
@@ -5702,12 +5705,12 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             ],
           )
           if workspace is not None:
-            workspace.bind_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
+            step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.naconmax, nmaxdim), "candidate")
       else:
         if workspace is None:
           d.efc.Jqvel.zero_()
         else:
-          workspace.fill(d.efc.Jqvel, 0, "world")
+          step_execution.fill_step_rows(workspace.bindings, d.efc.Jqvel, 0, "world")
         tile_size = m.block_dim.contact_jac_tiled
         n_dof_blocks = (m.nv_pad + tile_size - 1) // tile_size
 
@@ -5790,7 +5793,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             block_dim=tile_size,
           )
           if workspace is not None:
-            workspace.bind_launch(launch_kernel, (d.nworld, n_dof_blocks), "world")
+            step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, n_dof_blocks), "world")
 
       if m.flg_surfacevel:
         wp.launch(
@@ -5906,4 +5909,4 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           ],
         )
         if workspace is not None:
-          workspace.bind_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
+          step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.naconmax, nmaxdim), "candidate")

@@ -21,6 +21,7 @@ from mujoco_warp._src import history
 from mujoco_warp._src import math
 from mujoco_warp._src import ray
 from mujoco_warp._src import smooth
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src.collision_sdf import get_sdf_params
 from mujoco_warp._src.collision_sdf import sdf
@@ -811,7 +812,7 @@ def _sensor_collision(
 def sensor_pos(m: Model, d: Data, *, workspace=None):
   """Compute position-dependent sensor values."""
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   if m.opt.disableflags & DisableBit.SENSOR:
     return
 
@@ -2582,7 +2583,7 @@ def _contact_sort(maxmatch: int):
 def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False, *, workspace=None):
   """Compute acceleration-dependent sensor values."""
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   if m.opt.disableflags & DisableBit.SENSOR:
     return
 

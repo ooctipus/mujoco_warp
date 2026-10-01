@@ -17,6 +17,7 @@
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MAXVAL
@@ -423,7 +424,7 @@ def kinematics(m: Model, d: Data, *, workspace=None):
   current joint positions and any attached mocap bodies.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   wp.launch(
     _kinematics_branch,
     dim=(d.nworld, m.nbranch),
@@ -448,7 +449,7 @@ def kinematics(m: Model, d: Data, *, workspace=None):
     outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
   )
   if workspace is not None:
-    workspace.bind_launch(_kinematics_branch, (d.nworld, m.nbranch), "world")
+    step_execution.bind_step_launch(workspace.bindings, _kinematics_branch, (d.nworld, m.nbranch), "world")
 
   wp.launch(
     _compute_body_matrices,
@@ -457,7 +458,7 @@ def kinematics(m: Model, d: Data, *, workspace=None):
     outputs=[d.xmat],
   )
   if workspace is not None:
-    workspace.bind_launch(_compute_body_matrices, (d.nworld, m.nbody), "world")
+    step_execution.bind_step_launch(workspace.bindings, _compute_body_matrices, (d.nworld, m.nbody), "world")
 
   wp.launch(
     _compute_body_inertial_frames,
@@ -466,7 +467,7 @@ def kinematics(m: Model, d: Data, *, workspace=None):
     outputs=[d.xipos, d.ximat],
   )
   if workspace is not None:
-    workspace.bind_launch(_compute_body_inertial_frames, (d.nworld, m.nbody), "world")
+    step_execution.bind_step_launch(workspace.bindings, _compute_body_inertial_frames, (d.nworld, m.nbody), "world")
 
   wp.launch(
     _geom_local_to_global,
@@ -475,7 +476,7 @@ def kinematics(m: Model, d: Data, *, workspace=None):
     outputs=[d.geom_xpos, d.geom_xmat],
   )
   if workspace is not None:
-    workspace.bind_launch(_geom_local_to_global, (d.nworld, m.ngeom), "world")
+    step_execution.bind_step_launch(workspace.bindings, _geom_local_to_global, (d.nworld, m.ngeom), "world")
 
   wp.launch(
     _site_local_to_global,
@@ -484,7 +485,7 @@ def kinematics(m: Model, d: Data, *, workspace=None):
     outputs=[d.site_xpos, d.site_xmat],
   )
   if workspace is not None:
-    workspace.bind_launch(_site_local_to_global, (d.nworld, m.nsite), "world")
+    step_execution.bind_step_launch(workspace.bindings, _site_local_to_global, (d.nworld, m.nsite), "world")
 
 
 @wp.kernel
@@ -810,10 +811,10 @@ def com_pos(m: Model, d: Data, *, workspace=None):
   inertias and motion degrees of freedom in the subtree CoM frame.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
   if workspace is not None:
-    workspace.bind_launch(_subtree_com_init, (d.nworld, m.nbody), "world")
+    step_execution.bind_step_launch(workspace.bindings, _subtree_com_init, (d.nworld, m.nbody), "world")
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
@@ -824,11 +825,11 @@ def com_pos(m: Model, d: Data, *, workspace=None):
       outputs=[d.subtree_com],
     )
     if workspace is not None:
-      workspace.bind_launch(_subtree_com_acc, (d.nworld, body_tree.size), "world")
+      step_execution.bind_step_launch(workspace.bindings, _subtree_com_acc, (d.nworld, body_tree.size), "world")
 
   wp.launch(_subtree_div, dim=(d.nworld, m.nbody), inputs=[m.body_subtreemass, d.subtree_com], outputs=[d.subtree_com])
   if workspace is not None:
-    workspace.bind_launch(_subtree_div, (d.nworld, m.nbody), "world")
+    step_execution.bind_step_launch(workspace.bindings, _subtree_div, (d.nworld, m.nbody), "world")
   wp.launch(
     _cinert,
     dim=(d.nworld, m.nbody),
@@ -836,7 +837,7 @@ def com_pos(m: Model, d: Data, *, workspace=None):
     outputs=[d.cinert],
   )
   if workspace is not None:
-    workspace.bind_launch(_cinert, (d.nworld, m.nbody), "world")
+    step_execution.bind_step_launch(workspace.bindings, _cinert, (d.nworld, m.nbody), "world")
   wp.launch(
     _cdof,
     dim=(d.nworld, m.njnt),
@@ -844,7 +845,7 @@ def com_pos(m: Model, d: Data, *, workspace=None):
     outputs=[d.cdof],
   )
   if workspace is not None:
-    workspace.bind_launch(_cdof, (d.nworld, m.njnt), "world")
+    step_execution.bind_step_launch(workspace.bindings, _cdof, (d.nworld, m.njnt), "world")
 
 
 @wp.kernel
@@ -1076,22 +1077,22 @@ def crb(m: Model, d: Data, *, workspace=None):
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   if workspace is None:
     wp.copy(d.crb, d.cinert)
   else:
-    workspace.copy(d.crb, d.cinert, "world")
+    step_execution.copy_step_rows(workspace.bindings, d.crb, d.cinert, "world")
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
     wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
     if workspace is not None:
-      workspace.bind_launch(_crb_accumulate, (d.nworld, body_tree.size), "world")
+      step_execution.bind_step_launch(workspace.bindings, _crb_accumulate, (d.nworld, body_tree.size), "world")
 
   if workspace is None:
     d.M.zero_()
   else:
-    workspace.fill(d.M, 0, "world")
+    step_execution.fill_step_rows(workspace.bindings, d.M, 0, "world")
   wp.launch(
     _M,
     dim=(d.nworld, m.nv),
@@ -1099,7 +1100,7 @@ def crb(m: Model, d: Data, *, workspace=None):
     outputs=[d.M],
   )
   if workspace is not None:
-    workspace.bind_launch(_M, (d.nworld, m.nv), "world")
+    step_execution.bind_step_launch(workspace.bindings, _M, (d.nworld, m.nv), "world")
 
 
 @wp.kernel
@@ -1370,11 +1371,11 @@ def _rne_cacc_world(m: Model, d: Data, *, workspace=None):
     if workspace is None:
       d.cacc.zero_()
     else:
-      workspace.fill(d.cacc, 0, "world")
+      step_execution.fill_step_rows(workspace.bindings, d.cacc, 0, "world")
   else:
     wp.launch(_cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc])
     if workspace is not None:
-      workspace.bind_launch(_cacc_world, [d.nworld], "world")
+      step_execution.bind_step_launch(workspace.bindings, _cacc_world, [d.nworld], "world")
 
 
 @wp.kernel
@@ -1433,7 +1434,7 @@ def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False, *, workspace=Non
     outputs=[d.cacc],
   )
   if workspace is not None:
-    workspace.bind_launch(_cacc_branch, (d.nworld, m.nbranch), "world")
+    step_execution.bind_step_launch(workspace.bindings, _cacc_branch, (d.nworld, m.nbranch), "world")
 
 
 @wp.kernel
@@ -1466,7 +1467,7 @@ def _cfrc(
 def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False, *, workspace=None):
   wp.launch(_cfrc, dim=[d.nworld, m.nbody], inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext], outputs=[d.cfrc_int])
   if workspace is not None:
-    workspace.bind_launch(_cfrc, [d.nworld, m.nbody], "world")
+    step_execution.bind_step_launch(workspace.bindings, _cfrc, [d.nworld, m.nbody], "world")
 
 
 @wp.kernel
@@ -1493,7 +1494,7 @@ def _rne_cfrc_backward(m: Model, d: Data, *, workspace=None):
       _cfrc_backward, dim=[d.nworld, body_tree.size], inputs=[m.body_parentid, d.cfrc_int, body_tree], outputs=[d.cfrc_int]
     )
     if workspace is not None:
-      workspace.bind_launch(_cfrc_backward, [d.nworld, body_tree.size], "world")
+      step_execution.bind_step_launch(workspace.bindings, _cfrc_backward, [d.nworld, body_tree.size], "world")
 
 
 @wp.kernel
@@ -1525,14 +1526,14 @@ def rne(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
     flg_acc: If True, includes joint accelerations in the computation.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   _rne_cacc_world(m, d, workspace=workspace)
   _rne_cacc_forward(m, d, flg_acc=flg_acc, workspace=workspace)
   _rne_cfrc(m, d, workspace=workspace)
   _rne_cfrc_backward(m, d, workspace=workspace)
   wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, d.cfrc_int], outputs=[d.qfrc_bias])
   if workspace is not None:
-    workspace.bind_launch(_qfrc_bias, [d.nworld, m.nv], "world")
+    step_execution.bind_step_launch(workspace.bindings, _qfrc_bias, [d.nworld, m.nv], "world")
 
 
 @wp.kernel
@@ -2647,10 +2648,10 @@ def com_vel(m: Model, d: Data, *, workspace=None):
   derivative for each body.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
   if workspace is not None:
-    workspace.bind_launch(_comvel_root, (d.nworld, 6), "world")
+    step_execution.bind_step_launch(workspace.bindings, _comvel_root, (d.nworld, 6), "world")
 
   wp.launch(
     _comvel_branch,
@@ -2669,7 +2670,7 @@ def com_vel(m: Model, d: Data, *, workspace=None):
     outputs=[d.cvel, d.cdof_dot],
   )
   if workspace is not None:
-    workspace.bind_launch(_comvel_branch, (d.nworld, m.nbranch), "world")
+    step_execution.bind_step_launch(workspace.bindings, _comvel_branch, (d.nworld, m.nbranch), "world")
 
 
 @wp.kernel
@@ -3282,11 +3283,11 @@ def transmission(m: Model, d: Data, *, moment_nnz=None, workspace=None):
   and tendon transmissions.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
     if moment_nnz is not None and moment_nnz is not workspace.arrays["moment_nnz"]:
       raise ValueError("Prepared transmission requires workspace moment_nnz scratch")
     moment_nnz = workspace.arrays["moment_nnz"]
-    workspace.fill(moment_nnz, 0, "world")
+    step_execution.fill_step_rows(workspace.bindings, moment_nnz, 0, "world")
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
   elif moment_nnz is None:
     moment_nnz = wp.zeros((d.nworld,), dtype=int)
@@ -3331,7 +3332,7 @@ def transmission(m: Model, d: Data, *, moment_nnz=None, workspace=None):
     outputs=[d.actuator_length, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
   )
   if workspace is not None:
-    workspace.bind_launch(_transmission, (d.nworld, m.nactuator), "world")
+    step_execution.bind_step_launch(workspace.bindings, _transmission, (d.nworld, m.nactuator), "world")
 
   if m.nacttrnbody:
     # compute moments
@@ -3741,7 +3742,7 @@ def _factor_solve_blocks(
         block_dim=m.block_dim.small_cholesky,
       )
       if workspace is not None:
-        workspace.bind_launch(launch_kernel, (d.nworld, tile.adr.size), "world")
+        step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, tile.adr.size), "world")
     else:
       wp.launch_tiled(
         _tile_cholesky_factorize_solve_block(tile),

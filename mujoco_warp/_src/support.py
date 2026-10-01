@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 
 import warp as wp
 
+from mujoco_warp._src import step_execution
 from mujoco_warp._src.math import motion_cross
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import ConeType
@@ -237,7 +238,7 @@ def mul_m(
     M: Input matrix: M @ vec.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
     if (d.M if M is None else M).ndim == 3:
       raise NotImplementedError("Prepared mul_m does not admit external dense block inertia")
   check_skip = skip is not None
@@ -264,7 +265,7 @@ def mul_m(
       outputs=[res],
     )
     if workspace is not None:
-      workspace.bind_launch(launch_kernel, (d.nworld, m.nv), "world")
+      step_execution.bind_step_launch(workspace.bindings, launch_kernel, (d.nworld, m.nv), "world")
 
 
 @wp.kernel
@@ -320,7 +321,7 @@ def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.arra
     outputs=[qfrc],
   )
   if workspace is not None:
-    workspace.bind_launch(_apply_ft, (d.nworld, m.nv), "world")
+    step_execution.bind_step_launch(workspace.bindings, _apply_ft, (d.nworld, m.nv), "world")
 
 
 @event_scope
@@ -334,7 +335,7 @@ def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float], *, workspace=Non
     qfrc: Total applied force mapped to dof space.
   """
   if workspace is not None:
-    workspace.validate(m, d)
+    step_execution.validate_step_workspace(workspace, m, d)
   apply_ft(m, d, d.xfrc_applied, qfrc, True, workspace=workspace)
 
 
