@@ -100,6 +100,10 @@ from mujoco_warp._src.smooth import subtree_vel as subtree_vel
 from mujoco_warp._src.smooth import tendon as tendon
 from mujoco_warp._src.smooth import transmission as transmission
 from mujoco_warp._src.solver import solve as solve
+from mujoco_warp._src.step_execution import StepBindings as StepBindings
+from mujoco_warp._src.step_execution import bind_step_launch as bind_step_launch
+from mujoco_warp._src.step_execution import launch_step_kernel as launch_step_kernel
+from mujoco_warp._src.step_execution import validate_step_launch as validate_step_launch
 from mujoco_warp._src.support import contact_force as contact_force
 from mujoco_warp._src.support import get_state as get_state
 from mujoco_warp._src.support import jac as jac
@@ -132,9 +136,6 @@ from mujoco_warp._src.types import SolverType as SolverType
 from mujoco_warp._src.types import State as State
 from mujoco_warp._src.types import Statistic as Statistic
 from mujoco_warp._src.types import TrnType as TrnType
-from mujoco_warp._src.workspace import StepBindings as StepBindings
 from mujoco_warp._src.workspace import WorkspaceFieldSpec as WorkspaceFieldSpec
-from mujoco_warp._src.workspace import bind_step_launch as bind_step_launch
 from mujoco_warp._src.workspace import make_step_workspace as make_step_workspace
 from mujoco_warp._src.workspace import step_workspace_layout as step_workspace_layout
-from mujoco_warp._src.workspace import validate_step_launch as validate_step_launch

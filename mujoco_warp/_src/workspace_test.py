@@ -14,9 +14,11 @@ from unittest.mock import patch
 import numpy as np
 import warp as wp
 from gpu_components.field_data import FieldStorage
+from gpu_components.graph_data import GraphKernelBinding
 from gpu_components.graph_data import GraphUpdateTable
 
 from mujoco_warp import test_data
+from mujoco_warp._src import collision_convex
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
 from mujoco_warp._src import forward
@@ -24,16 +26,18 @@ from mujoco_warp._src import island
 from mujoco_warp._src import passive
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
+from mujoco_warp._src import step_execution as native_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src import workspace as native_workspace
-from mujoco_warp._src.workspace import StepBindings
+from mujoco_warp._src.step_execution import StepBindings
+from mujoco_warp._src.step_execution import bind_step_launch
+from mujoco_warp._src.step_execution import launch_step_kernel
+from mujoco_warp._src.step_execution import validate_step_launch
 from mujoco_warp._src.workspace import WorkspaceFieldSpec
 from mujoco_warp._src.workspace import _StepWorkspace
-from mujoco_warp._src.workspace import bind_step_launch
 from mujoco_warp._src.workspace import make_step_workspace
 from mujoco_warp._src.workspace import step_workspace_layout
-from mujoco_warp._src.workspace import validate_step_launch
 
 
 @dataclasses.dataclass
@@ -45,6 +49,31 @@ class Metadata:
   option: int = 0
   pair_counts: tuple = (1, 2)
   callback: object = None
+
+
+def _convex_model(pair=(types.GeomType.BOX, types.GeomType.BOX), *, multiccd=False):
+  counts = [0] * (len(types.GeomType) * (len(types.GeomType) + 1) // 2)
+  counts[collision_convex.upper_trid_index(len(types.GeomType), *[geom.value for geom in pair])] = 1
+  return SimpleNamespace(
+    geom_pair_type_count=counts,
+    npolygonmax=7,
+    nmeshdegmax=5,
+    opt=SimpleNamespace(ccd_iterations=35, disableflags=0 if multiccd else types.DisableBit.MULTICCD),
+  )
+
+
+def _collision_scratch_specs():
+  pair = (types.GeomType.BOX, types.GeomType.BOX)
+  convex = collision_convex._convex_scratch_layout(_convex_model(pair), [pair], 2)[2]
+  return (
+    WorkspaceFieldSpec("collision_pair", (2,), wp.vec2i, "candidate"),
+    WorkspaceFieldSpec("collision_pairid", (2,), wp.vec2i, "candidate"),
+    WorkspaceFieldSpec("collision_worldid", (2,), wp.int32, "candidate"),
+    *(
+      WorkspaceFieldSpec(name, shape, {int: wp.int32, float: wp.float32}.get(dtype, dtype), domain)
+      for name, shape, dtype, domain in convex
+    ),
+  )
 
 
 def _step_bindings():
@@ -99,7 +128,7 @@ def _binding_capture(bindings):
   with (
     patch.dict(bindings.world_storage.device.captures, {None: graph}),
     patch.object(wp, "get_stream", return_value=None),
-    patch.object(native_workspace.graph_ops, "register_last_kernel_node", return_value=123) as register,
+    patch.object(native_execution.graph_ops, "register_last_kernel_node", return_value=123) as register,
   ):
     yield graph, register
 
@@ -111,6 +140,7 @@ class NativeBindingsTest(unittest.TestCase):
     self.assertIs(mjw.StepBindings, StepBindings)
     self.assertIs(mjw.validate_step_launch, validate_step_launch)
     self.assertIs(mjw.bind_step_launch, bind_step_launch)
+    self.assertIs(mjw.launch_step_kernel, launch_step_kernel)
     self.assertEqual(
       [f.name for f in dataclasses.fields(StepBindings) if not f.name.startswith("_")],
       [
@@ -131,7 +161,162 @@ class NativeBindingsTest(unittest.TestCase):
     self.assertIs(weakref.ref(first)(), first)
     self.assertIs(StepBindings.__annotations__["world_storage"], FieldStorage)
     self.assertEqual(StepBindings.__annotations__["updates"], GraphUpdateTable | None)
-    self.assertFalse(any(name in inspect.getsource(native_workspace) for name in ("import newton", "recorder=")))
+    self.assertFalse(any(name in inspect.getsource(native_execution) for name in ("import newton", "recorder=")))
+
+  def test_execution_dependencies_and_exports_have_one_canonical_owner(self):
+    self.assertEqual(StepBindings.__module__, native_execution.__name__)
+    tree = ast.parse(inspect.getsource(native_execution))
+    for node in ast.walk(tree):
+      if isinstance(node, ast.Import):
+        imports = [alias.name for alias in node.names]
+      elif isinstance(node, ast.ImportFrom):
+        imports = [node.module or ""]
+        self.assertEqual(node.level, 0, "Native execution must not depend on neighboring physics modules")
+      else:
+        continue
+      self.assertFalse(
+        any(name == "mujoco_warp" or name.startswith("mujoco_warp.") for name in imports),
+        "Execution may depend on generic components and Warp, never workspace or physics stages",
+      )
+    for name in (
+      "StepBindings",
+      "validate_step_launch",
+      "bind_step_launch",
+      "launch_step_kernel",
+      "_binding_layout",
+      "_validate_bindings",
+      "_begin_recording",
+      "_fail_recording",
+      "_record_launch",
+      "_fill_step_rows",
+      "_copy_step_rows",
+    ):
+      self.assertNotIn(
+        name, vars(native_workspace), "Preparation must call the execution module without aliases or duplicate owners"
+      )
+    convex_tree = ast.parse(inspect.getsource(collision_convex))
+    imports = set()
+    for node in ast.walk(convex_tree):
+      if isinstance(node, ast.Import):
+        imports.update(alias.name for alias in node.names)
+      elif isinstance(node, ast.ImportFrom):
+        imports.add(node.module)
+        imports.update(f"{node.module}.{alias.name}" for alias in node.names)
+    self.assertNotIn("mujoco_warp._src.workspace", imports)
+    self.assertIn("mujoco_warp._src.step_execution.launch_step_kernel", imports)
+    self.assertIs(collision_convex.launch_step_kernel, native_execution.launch_step_kernel)
+
+  def test_atomic_launch_rejects_invalid_domains_before_generic_dispatch(self):
+    bindings, kernel = _step_bindings(), _native_kernel()
+    bindings.updates = _update_table(bindings)
+    with patch.object(native_execution.graph_ops, "launch", side_effect=AssertionError("Unexpected emission")) as launch:
+      for domain, axis, params in (("bad", 0, {}), (None, 0, {}), ("world", 0, {"ccd_cap": "bad"})):
+        with self.subTest(domain=domain, params=params), self.assertRaises(ValueError):
+          launch_step_kernel(bindings, kernel, (17, 4), extent_domain=domain, extent_axis=axis, parameter_domains=params)
+    launch.assert_not_called()
+    self.assertFalse(bindings.recording_failed)
+    self.assertIsNone(bindings._recording_binding)
+    self.assertEqual(bindings.bindings, [])
+
+  def test_atomic_launch_records_generic_binding_with_independent_native_counts(self):
+    bindings, kernel = _step_bindings(), _native_kernel()
+    inputs, outputs = [object()], [object()]
+
+    def emit(updates, emitted_kernel, dim, **kwargs):
+      self.assertIs(updates, bindings.updates)
+      self.assertIs(emitted_kernel, kernel)
+      self.assertEqual(dim, (17, 4))
+      return GraphKernelBinding(
+        123,
+        launch_rank=2,
+        extent_axis=kwargs["extent_axis"],
+        extent_source=kwargs["extent_source"],
+        parameters=kwargs["parameters"],
+      )
+
+    with (
+      _binding_capture(bindings) as (graph, register),
+      patch.object(native_execution.graph_ops, "launch", side_effect=emit) as launch,
+    ):
+      result = launch_step_kernel(
+        bindings, kernel, (17, 4), inputs=inputs, outputs=outputs, extent_domain="world", parameter_domains={"ccd_cap": "ccd"}
+      )
+      self.assertIs(result, bindings.bindings[0])
+      self.assertIs(result.extent_source, bindings.world_storage.protected_count)
+      self.assertIs(result.parameters[0].source, bindings.ccd_storage.ready_count)
+      self.assertIs(launch.call_args.kwargs["inputs"], inputs)
+      self.assertIs(launch.call_args.kwargs["outputs"], outputs)
+      fixed = launch_step_kernel(
+        bindings,
+        kernel,
+        (17, 4),
+        extent_domain=None,
+        extent_axis=None,
+        parameter_domains={"contact_cap": "candidate", "ccd_cap": "ccd"},
+      )
+      self.assertIsNone(fixed.extent_axis)
+      self.assertIsNone(fixed.extent_source)
+      self.assertIs(fixed.parameters[0].source, bindings.contact_storage.ready_count)
+      self.assertIs(fixed.parameters[1].source, bindings.ccd_storage.ready_count)
+      self.assertIs(fixed, bindings.bindings[1])
+      self.assertEqual([item["extent_domain"] for item in bindings.operations], ["world", None])
+      self.assertEqual(sum(owner is bindings for owner in graph._resource_owners), 1)
+      register.assert_not_called()  # The component owns emission and node registration together.
+      for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
+        self.assertIn(graph, storage._graphs)
+
+  def test_atomic_zero_launch_does_not_freeze_or_retain_sources(self):
+    bindings, kernel = _step_bindings(), _native_kernel()
+    with _binding_capture(bindings) as (graph, _), patch.object(native_execution.graph_ops, "launch", return_value=None):
+      result = launch_step_kernel(bindings, kernel, (0, 4), extent_domain="world")
+      self.assertIsNone(result)
+      self.assertIsNone(bindings._recording_binding)
+      self.assertFalse(getattr(graph, "_resource_owners", ()))
+      self.assertEqual(bindings.bindings, [])
+      self.assertEqual(bindings.operations, [])
+      self.assertFalse(bindings.recording_failed)
+      self.assertTrue(
+        all(not storage._graphs for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage))
+      )
+
+  def test_atomic_dispatch_failure_quarantines_native_and_capture(self):
+    for error in (ArithmeticError, KeyboardInterrupt):
+      bindings, kernel = _step_bindings(), _native_kernel()
+      with (
+        self.subTest(error=error),
+        _binding_capture(bindings) as (graph, _),
+        patch.object(native_execution.graph_ops, "launch", side_effect=error("dispatch failed")),
+      ):
+        with self.assertRaisesRegex(error, "dispatch failed"):
+          launch_step_kernel(bindings, kernel, (17, 4), extent_domain="world")
+        self.assertTrue(bindings.recording_failed)
+        self.assertTrue(graph._preparation_failed)
+        self.assertEqual(bindings.bindings, [])
+        self.assertEqual(bindings.operations, [])
+
+  def test_atomic_ordinary_launch_passes_options_without_resource_ownership(self):
+    kernel, inputs, outputs, device, stream, result = (object() for _ in range(6))
+    with (
+      patch.object(native_execution.graph_ops, "launch", return_value=result) as launch,
+      patch.object(native_execution, "_begin_recording", side_effect=AssertionError("Unexpected resource retention")),
+    ):
+      actual = launch_step_kernel(
+        None,
+        kernel,
+        (3, 4),
+        inputs=inputs,
+        outputs=outputs,
+        extent_domain="world",
+        tiled=True,
+        block_dim=32,
+        max_blocks=7,
+        device=device,
+        stream=stream,
+      )
+    self.assertIs(actual, result)
+    launch.assert_called_once_with(
+      None, kernel, (3, 4), inputs=inputs, outputs=outputs, tiled=True, block_dim=32, max_blocks=7, device=device, stream=stream
+    )
 
   def test_explicit_named_count_sources_and_fixed_worker_grid(self):
     bindings, kernel = _step_bindings(), _native_kernel()
@@ -176,7 +361,7 @@ class NativeBindingsTest(unittest.TestCase):
       for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
         self.assertIn(graph, storage._graphs)
         with self.assertRaisesRegex(RuntimeError, "retained by graphs"):
-          native_workspace.field_ops.close(storage, streams=(0,))
+          native_execution.field_ops.close(storage, streams=(0,))
 
   def test_invalid_declarations_preflight_without_emission_or_poisoning(self):
     cases = [
@@ -191,7 +376,7 @@ class NativeBindingsTest(unittest.TestCase):
       ("world", 0, {str(index): "world" for index in range(5)}),
     ]
     bindings, kernel = _step_bindings(), _native_kernel()
-    with patch.object(native_workspace.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
+    with patch.object(native_execution.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
       for domain, axis, parameters in cases:
         with self.subTest(domain=domain, axis=axis, parameters=parameters), self.assertRaises(ValueError):
           validate_step_launch(bindings, kernel, domain, axis, parameters)
@@ -205,7 +390,7 @@ class NativeBindingsTest(unittest.TestCase):
 
   def test_zero_extent_claims_no_previous_node(self):
     bindings, kernel = _step_bindings(), _native_kernel()
-    with patch.object(native_workspace.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
+    with patch.object(native_execution.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
       bind_step_launch(bindings, kernel, (0, 17), "world")
     self.assertEqual(bindings.bindings, [])
     self.assertIsNone(bindings._recording_binding)
@@ -223,9 +408,9 @@ class NativeBindingsTest(unittest.TestCase):
     array, source = SimpleNamespace(size=12), SimpleNamespace(size=12)
     with (
       _binding_capture(bindings),
-      patch.object(native_workspace.field_ops, "fill") as fill,
-      patch.object(native_workspace.field_ops, "copy") as copy,
-      patch.object(native_workspace.field_ops, "lookup", return_value=SimpleNamespace(name="field")),
+      patch.object(native_execution.field_ops, "fill") as fill,
+      patch.object(native_execution.field_ops, "copy") as copy,
+      patch.object(native_execution.field_ops, "lookup", return_value=SimpleNamespace(name="field")),
     ):
       self.assertIs(workspace.fill(array, 1, "world"), array)
       workspace.fill(array, 0, "candidate")
@@ -255,8 +440,8 @@ class NativeBindingsTest(unittest.TestCase):
         with (
           self.subTest(operation=name, error=error),
           _binding_capture(bindings) as (graph, register),
-          patch.object(native_workspace.field_ops, "fill", side_effect=error("recording failed")),
-          patch.object(native_workspace.field_ops, "copy", side_effect=error("recording failed")),
+          patch.object(native_execution.field_ops, "fill", side_effect=error("recording failed")),
+          patch.object(native_execution.field_ops, "copy", side_effect=error("recording failed")),
           patch.object(wp, "copy", side_effect=AssertionError("Unexpected dense copy")),
         ):
           if name == "bind":
@@ -330,6 +515,88 @@ class NativeBindingsTest(unittest.TestCase):
       with self.assertRaisesRegex(TypeError, "borrow FieldStorage"):
         bind_step_launch(bindings, _native_kernel(), (17, 17), "world")
       self.assertTrue(graph._preparation_failed)
+
+
+class ConvexScratchTest(unittest.TestCase):
+  def test_mesh_cylinder_layout_keeps_unrestricted_eager_requirements(self):
+    pair = (types.GeomType.CYLINDER, types.GeomType.MESH)
+    model = _convex_model(pair, multiccd=True)
+    with patch.object(wp, "empty", side_effect=AssertionError("Layout allocated")):
+      count, iterations, specs = collision_convex._convex_scratch_layout(model, [pair], 11)
+    fields = {name: (shape, dtype, domain) for name, shape, dtype, domain in specs}
+    self.assertEqual((count, iterations), (1, 35))
+    self.assertEqual(fields["multiccd_pdist"], ((11, 16), float, "ccd"))
+    self.assertEqual(fields["multiccd_polygon"][0], (11, 32))
+    self.assertEqual(fields["multiccd_idx1"][0], (11, 5))
+    self.assertEqual(fields["epa_vert"][0], (11, 80))
+    self.assertEqual(fields["nccd"][2], "global_counter")
+    self.assertEqual(set(fields), {field.name for field in dataclasses.fields(collision_convex._ConvexScratch)})
+
+  def test_box_clipping_remains_enabled_when_multiccd_is_disabled(self):
+    pair = (types.GeomType.BOX, types.GeomType.BOX)
+    count, iterations, specs = collision_convex._convex_scratch_layout(_convex_model(pair), [pair], 13)
+    fields = {name: shape for name, shape, _, _ in specs}
+    self.assertEqual((count, iterations), (1, 16))
+    self.assertEqual(fields["epa_vert"], (13, 42))
+    self.assertEqual(fields["multiccd_pdist"], (13, 4))
+    self.assertEqual(fields["multiccd_idx1"], (13, 3))
+
+  def test_scratch_schema_is_shared_and_stage_has_no_per_field_allocation_fallbacks(self):
+    record = ast.parse(inspect.getsource(collision_convex._ConvexScratch))
+    self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(record)))
+    stage = ast.parse(inspect.getsource(collision_convex.convex_narrowphase))
+    plan = ast.parse(inspect.getsource(step_workspace_layout))
+    self.assertTrue(
+      any(isinstance(node, ast.Call) and ast.unparse(node.func) == "_convex_scratch_layout" for node in ast.walk(plan))
+    )
+    self.assertFalse(
+      any(isinstance(node, ast.Attribute) and ast.unparse(node) == "workspace.arrays" for node in ast.walk(stage))
+    )
+    self.assertFalse(
+      any(
+        isinstance(node, ast.IfExp)
+        and isinstance(node.body, ast.Call)
+        and ast.unparse(node.body.func) in ("wp.empty", "wp.zeros")
+        for node in ast.walk(stage)
+      )
+    )
+    fields = {field.name for field in dataclasses.fields(collision_convex._ConvexScratch)}
+    self.assertFalse(
+      fields & {node.value for node in ast.walk(plan) if isinstance(node, ast.Constant) and isinstance(node.value, str)},
+      "Step preparation must consume the collision schema rather than duplicate its field declarations",
+    )
+
+  def test_eager_and_borrowed_scratch_clear_counter_at_each_collision(self):
+    pair = (types.GeomType.BOX, types.GeomType.BOX)
+    metadata = _convex_model(pair)
+    model = Mock(**vars(metadata))
+    model.opt.ccd_tolerance, model.opt.warn_overflow = 1e-6, False
+    model.block_dim = SimpleNamespace(convex_ccd=32)
+    data = Mock(naconmax=2, naccdmax=2)
+    specs = collision_convex._convex_scratch_layout(model, [pair], 2)[2]
+    fields = {name: wp.empty(shape, dtype=dtype, device="cpu") for name, shape, dtype, _ in specs}
+    workspace = SimpleNamespace(_convex=collision_convex._ConvexScratch(**fields), bindings=None)
+    allocate = wp.empty
+    for prepared in (False, True):
+      with (
+        self.subTest(prepared=prepared),
+        wp.ScopedDevice("cpu"),
+        patch.object(collision_convex, "ccd_kernel_builder", return_value=object()),
+        patch.object(collision_convex, "_ccd_grid_size", return_value=2),
+        patch.object(collision_convex, "launch_step_kernel") as launch,
+        patch.object(wp, "empty", side_effect=AssertionError("Borrowed scratch allocated") if prepared else allocate),
+      ):
+        for _ in range(2):
+          fields["nccd"].fill_(9)
+          collision_convex.convex_narrowphase(model, data, Mock(), [pair], workspace=workspace if prepared else None)
+          arguments = launch.call_args.kwargs["inputs"]
+          np.testing.assert_array_equal(arguments[-1].numpy(), np.zeros(fields["nccd"].shape, dtype=np.int32))
+          if prepared:
+            for field in fields.values():
+              self.assertTrue(any(argument is field for argument in arguments))
+          else:
+            self.assertIsNot(arguments[-1], fields["nccd"])
+        self.assertEqual(launch.call_count, 2)
 
 
 class WorkspaceTest(unittest.TestCase):
@@ -443,7 +710,7 @@ class WorkspaceTest(unittest.TestCase):
     workspace = _StepWorkspace.__new__(_StepWorkspace)
     workspace.bindings = object()
     kernel = object()
-    with patch.object(native_workspace, "bind_step_launch") as bind:
+    with patch.object(native_execution, "bind_step_launch") as bind:
       workspace.bind_launch(kernel, (31, 4), "world")
       workspace.bind_launch(kernel, (31, 4), "candidate")
       workspace.bind_launch(kernel, 256, None, extent_axis=None, parameter_domains={"naccdmax_in": "ccd"})
@@ -482,7 +749,7 @@ class WorkspaceTest(unittest.TestCase):
     bindings.world_storage.device = device
     with (
       patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
-      patch.object(native_workspace, "_validate_bindings"),
+      patch.object(native_execution, "_validate_bindings"),
       patch.object(native_workspace, "step_workspace_layout", side_effect=AssertionError("Unexpected scratch planning")),
     ):
       for domain, name in (("world_storage", "nworld"), ("contact_storage", "naconmax"), ("ccd_storage", "naccdmax")):
@@ -640,11 +907,7 @@ class WorkspaceTest(unittest.TestCase):
     """Derive the sole world count and reject dynamic-to-fixed or borrowed-source escape."""
     bindings = _step_bindings()
     count = bindings.world_storage.protected_count
-    specs = (
-      WorkspaceFieldSpec("collision_pair", (2,), wp.vec2i, "candidate"),
-      WorkspaceFieldSpec("collision_pairid", (2,), wp.vec2i, "candidate"),
-      WorkspaceFieldSpec("collision_worldid", (2,), wp.int32, "candidate"),
-    )
+    specs = _collision_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
     data = SimpleNamespace(qpos=count)
     with (
@@ -752,11 +1015,7 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(before, (_StepWorkspace._layout(model), _StepWorkspace._layout(template)))
 
   def test_caller_scratch_binding_owns_no_allocation(self):
-    specs = (
-      WorkspaceFieldSpec("collision_pair", (2,), wp.vec2i, "candidate"),
-      WorkspaceFieldSpec("collision_pairid", (2,), wp.vec2i, "candidate"),
-      WorkspaceFieldSpec("collision_worldid", (2,), wp.int32, "candidate"),
-    )
+    specs = _collision_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
     data = SimpleNamespace(qpos=arrays["collision_worldid"])
     with (
@@ -771,9 +1030,12 @@ class WorkspaceTest(unittest.TestCase):
     for name in ("solver_model", "solver_data", "solver_context", "collision"):
       self.assertFalse(hasattr(workspace, name), "Derived stage views belong to the engine, not caller configuration")
     self.assertIsNone(report["physical_scratch_bytes"])
-    self.assertEqual(report["payload_bytes"], 40)
+    self.assertEqual(
+      report["payload_bytes"], sum(array.size * wp.types.type_size_in_bytes(array.dtype) for array in arrays.values())
+    )
+    domains = {spec.name: spec.capacity_domain for spec in specs}
     for field in report["fields"]:
-      self.assertEqual(field["capacity_domain"], "candidate")
+      self.assertEqual(field["capacity_domain"], domains[field["name"]])
       self.assertIsNone(field["allocation_offset_bytes"])
       self.assertFalse({"scope", "offset", "bytes"} & field.keys())
     for name, array in arrays.items():
@@ -853,9 +1115,7 @@ class WorkspaceTest(unittest.TestCase):
   def test_blocked_scratch_alignment_rejects_base_and_world_stride(self):
     """Reject misaligned blocked matrices without restricting dense scalar counters."""
     specs = (
-      WorkspaceFieldSpec("collision_pair", (2,), wp.vec2i, "candidate"),
-      WorkspaceFieldSpec("collision_pairid", (2,), wp.vec2i, "candidate"),
-      WorkspaceFieldSpec("collision_worldid", (2,), wp.int32, "candidate"),
+      *_collision_scratch_specs(),
       WorkspaceFieldSpec("solver.h", (2, 64, 64), wp.float32, "world"),
       WorkspaceFieldSpec("solver.hfactor", (2, 64, 64), wp.float32, "world"),
       WorkspaceFieldSpec("moment_nnz", (2,), wp.int32, "world"),
@@ -885,7 +1145,7 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(workspace.arrays["moment_nnz"].strides, (4,))
     # The nonblocked path does not request aligned=True; an absent hfactor is valid.
     small = (
-      *specs[:3],
+      *_collision_scratch_specs(),
       WorkspaceFieldSpec("solver.h", (2, 2, 2), wp.float32, "world"),
       WorkspaceFieldSpec("solver.hfactor", (2, 0, 0), wp.float32, "world"),
       specs[-1],

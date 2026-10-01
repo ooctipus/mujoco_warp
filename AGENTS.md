@@ -21,7 +21,9 @@
 
 - Prepared execution borrows one passive native StepBindings record; its world storage protected count is the sole world-live-count source. Fixed workspaces supply no bindings. Native operations own domain declarations and one binding/failure ledger, calling gpu-components directly; reject callback recorders and duplicate count arguments.
 - Schema field names belong to preparation. Numeric identity and membership APIs must not also resolve paths or names.
-- Name allocation specifications separately from allocated views. Native binding operations claim already-emitted launches; their parameter-domain declarations are not kernel argument values. Preflight caller declarations before emission; freeze borrowed source/updater identity during recording and retain bindings through graph retirement.
+- Native step execution belongs to `step_execution.py`; workspace preparation and physics stages depend on it. Execution must not import workspace, solver or collision modules, including through deferred imports. Keep stage scratch schemas with their stages and public execution exports at their canonical owner; do not add workspace compatibility aliases.
+- For adopted native stages, choose allocated or borrowed scratch once per stage from one shared layout; physics reads passive scratch fields. Use `launch_step_kernel` to validate, emit and bind a kernel together instead of repeating its kernel and dimensions after dispatch. Keep domain meanings in MJWarp and generic launch ownership in gpu-components.
+- Name allocation specifications separately from allocated views. The low-level `bind_step_launch` operation claims already-emitted launches; parameter-domain declarations are not kernel argument values. Preflight caller declarations before emission; freeze borrowed source/updater identity during recording and retain bindings through graph retirement.
 - Initialize physical quantities according to their equations, independently of compact/sparse storage flags. Test first-write behavior with poisoned storage and reject nonfinite values in numerical parity checks.
 
 - Line length limit is 128 characters. Docstring length limit is 100 characters.
