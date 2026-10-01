@@ -228,7 +228,7 @@ def mul_m(
   """Multiply vectors by inertia matrix; optionally skip per world.
 
   Args:
-    workspace: Optional prepared step scratch and launch observer.
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     res: Result: M @ vec.
@@ -236,8 +236,13 @@ def mul_m(
     skip: Per-world bitmask to skip computing output.
     M: Input matrix: M @ vec.
   """
+  if workspace is not None:
+    workspace.validate(m, d)
+    if (d.M if M is None else M).ndim == 3:
+      raise NotImplementedError("Prepared mul_m does not admit external dense block inertia")
   check_skip = skip is not None
-  skip = skip or wp.empty(0, dtype=bool)
+  if skip is None and workspace is None:
+    skip = wp.empty(0, dtype=bool)
 
   if M is None:
     M = d.M
@@ -259,7 +264,7 @@ def mul_m(
       outputs=[res],
     )
     if workspace is not None:
-      workspace.observe_launch(launch_kernel, (d.nworld, m.nv), "world")
+      workspace.bind_launch(launch_kernel, (d.nworld, m.nv), "world")
 
 
 @wp.kernel
@@ -315,7 +320,7 @@ def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.arra
     outputs=[qfrc],
   )
   if workspace is not None:
-    workspace.observe_launch(_apply_ft, (d.nworld, m.nv), "world")
+    workspace.bind_launch(_apply_ft, (d.nworld, m.nv), "world")
 
 
 @event_scope
@@ -323,11 +328,13 @@ def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float], *, workspace=Non
   """Map applied forces at each body via Jacobians to dof space and accumulate.
 
   Args:
-    workspace: Optional prepared step scratch and launch observer.
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     qfrc: Total applied force mapped to dof space.
   """
+  if workspace is not None:
+    workspace.validate(m, d)
   apply_ft(m, d, d.xfrc_applied, qfrc, True, workspace=workspace)
 
 

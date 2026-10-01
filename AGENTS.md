@@ -19,8 +19,10 @@
 
 # Code Style
 
-- Prepared execution must keep live counts and launch bindings coherent: dynamic workspaces require both a live-count scalar and the bounded launch/copy/fill observer; fixed workspaces supply neither. Reject incomplete bindings before recording.
+- Prepared execution must keep live counts and launch bindings coherent: dynamic workspaces require both a world-live-count scalar and the bounded launch/copy/fill recorder; fixed workspaces supply neither. Reject incomplete bindings before recording.
 - Schema field names belong to preparation. Numeric identity and membership APIs must not also resolve paths or names.
+- Name allocation specifications separately from allocated views. A recorder binds already-emitted launches; its parameter-domain declarations are not kernel argument values.
+- Initialize physical quantities according to their equations, independently of compact/sparse storage flags. Test first-write behavior with poisoned storage and reject nonfinite values in numerical parity checks.
 
 - Line length limit is 128 characters. Docstring length limit is 100 characters.
 - Prefer targeted, efficient tests over exhaustive edge-case coverage.

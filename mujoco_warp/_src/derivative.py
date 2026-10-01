@@ -1157,23 +1157,31 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
   """Analytical derivative of smooth forces w.r.t. velocities.
 
   Args:
-    workspace: Optional prepared step scratch and launch observer.
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     out: M - dt * qDeriv (derivatives of smooth forces w.r.t velocities).
     actuator_vel: Optional prepared actuator-velocity scratch.
   """
+  if workspace is not None:
+    workspace.validate(m, d)
+    if actuator_vel is not None and actuator_vel is not workspace.arrays["actuator_vel"]:
+      raise ValueError("Prepared derivatives require workspace actuator_vel scratch")
   Mi = m.M_fullm_i
   Mj = m.M_fullm_j
 
-  if not (m.opt.disableflags & (DisableBit.ACTUATION | DisableBit.DAMPER)):
+  velocity_force_flags = DisableBit.ACTUATION | DisableBit.DAMPER
+  if (m.opt.disableflags & velocity_force_flags) != velocity_force_flags:
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
     if workspace is None:
       out.zero_()
     else:
       workspace.fill(out, 0, "world")
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
-      vel = wp.empty((d.nworld, m.nactuator), dtype=float) if actuator_vel is None else actuator_vel
+      if actuator_vel is None:
+        vel = wp.empty((d.nworld, m.nactuator), dtype=float) if workspace is None else workspace.arrays["actuator_vel"]
+      else:
+        vel = actuator_vel
       wp.launch(
         _qderiv_actuator_passive_vel,
         dim=(d.nworld, m.nactuator),
@@ -1201,7 +1209,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
         outputs=[vel],
       )
       if workspace is not None:
-        workspace.observe_launch(_qderiv_actuator_passive_vel, (d.nworld, m.nactuator), "world")
+        workspace.bind_launch(_qderiv_actuator_passive_vel, (d.nworld, m.nactuator), "world")
       # out (qDeriv) is in M-structure.
       wp.launch(
         _qderiv_actuator_passive_actuation_sparse,
@@ -1217,7 +1225,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
         outputs=[out],
       )
       if workspace is not None:
-        workspace.observe_launch(_qderiv_actuator_passive_actuation_sparse, (d.nworld, m.nactuator), "world")
+        workspace.bind_launch(_qderiv_actuator_passive_actuation_sparse, (d.nworld, m.nactuator), "world")
     wp.launch(
       _qderiv_actuator_passive,
       dim=(d.nworld, Mi.size),
@@ -1236,7 +1244,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
       outputs=[out],
     )
     if workspace is not None:
-      workspace.observe_launch(_qderiv_actuator_passive, (d.nworld, Mi.size), "world")
+      workspace.bind_launch(_qderiv_actuator_passive, (d.nworld, Mi.size), "world")
   else:
     # TODO(team): directly utilize M for these settings
     if workspace is None:
@@ -1265,7 +1273,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel=
       outputs=[out],
     )
     if workspace is not None:
-      workspace.observe_launch(_qderiv_tendon_damping, (d.nworld, Mi.size), "world")
+      workspace.bind_launch(_qderiv_tendon_damping, (d.nworld, Mi.size), "world")
   if m.has_fluid:
     if m.body_fluid_ellipsoid_adr.size > 0:
       wp.launch(

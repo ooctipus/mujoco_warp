@@ -212,7 +212,7 @@ def update_sleep(
     outputs=[d.ntree_awake, d.nbody_awake, d.nv_awake],
   )
   if workspace is not None:
-    workspace.observe_launch(_zero_sleep_counters, d.nworld, "world")
+    workspace.bind_launch(_zero_sleep_counters, d.nworld, "world")
 
   wp.launch(
     _update_sleep_trees,
@@ -221,7 +221,7 @@ def update_sleep(
     outputs=[d.ntree_awake, d.tree_awake],
   )
   if workspace is not None:
-    workspace.observe_launch(_update_sleep_trees, (d.nworld, m.ntree), "world")
+    workspace.bind_launch(_update_sleep_trees, (d.nworld, m.ntree), "world")
 
   wp.launch(
     _update_sleep_bodies,
@@ -244,7 +244,7 @@ def update_sleep(
     ],
   )
   if workspace is not None:
-    workspace.observe_launch(_update_sleep_bodies, (d.nworld, m.nbody), "world")
+    workspace.bind_launch(_update_sleep_bodies, (d.nworld, m.nbody), "world")
 
   wp.launch(
     _update_sleep_dofs,
@@ -259,7 +259,7 @@ def update_sleep(
     outputs=[d.nv_awake, d.dof_awake_ind],
   )
   if workspace is not None:
-    workspace.observe_launch(_update_sleep_dofs, (d.nworld, m.nv), "world")
+    workspace.bind_launch(_update_sleep_dofs, (d.nworld, m.nv), "world")
 
 
 @event_scope
@@ -799,7 +799,7 @@ def wake(m: types.Model, d: types.Data, *, workspace=None):
     outputs=[d.qvel, d.qacc_warmstart, d.qfrc_applied, d.qacc],
   )
   if workspace is not None:
-    workspace.observe_launch(_clear_disabled_dofs, (d.nworld, m.nv), "world")
+    workspace.bind_launch(_clear_disabled_dofs, (d.nworld, m.nv), "world")
   wp.launch(
     _wake_kernel,
     dim=(d.nworld, m.ntree),
@@ -819,7 +819,7 @@ def wake(m: types.Model, d: types.Data, *, workspace=None):
     outputs=[d.tree_asleep],
   )
   if workspace is not None:
-    workspace.observe_launch(_wake_kernel, (d.nworld, m.ntree), "world")
+    workspace.bind_launch(_wake_kernel, (d.nworld, m.ntree), "world")
 
 
 @event_scope
@@ -841,7 +841,7 @@ def wake_collision(m: types.Model, d: types.Data, *, workspace=None):
     outputs=[d.tree_asleep],
   )
   if workspace is not None:
-    workspace.observe_launch(_wake_collision_kernel, d.naconmax, "candidate")
+    workspace.bind_launch(_wake_collision_kernel, d.naconmax, "candidate")
 
 
 @wp.kernel
@@ -1259,7 +1259,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     outputs=[d.tree_asleep],
   )
   if workspace is not None:
-    workspace.observe_launch(_sweep_awake_trees, (d.nworld, m.ntree), "world")
+    workspace.bind_launch(_sweep_awake_trees, (d.nworld, m.ntree), "world")
 
   # 2. Check which constraint islands can sleep (all trees in island must be asleep)
   if island_can_sleep is None:
@@ -1281,7 +1281,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     outputs=[island_can_sleep],
   )
   if workspace is not None:
-    workspace.observe_launch(_check_island_can_sleep, (d.nworld, m.ntree), "world")
+    workspace.bind_launch(_check_island_can_sleep, (d.nworld, m.ntree), "world")
 
   # 3. Build sleep cycles for sleeping islands and sleep unconstrained trees
   wp.launch(
@@ -1302,4 +1302,4 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     ],
   )
   if workspace is not None:
-    workspace.observe_launch(_build_cycles, d.nworld, "world")
+    workspace.bind_launch(_build_cycles, d.nworld, "world")

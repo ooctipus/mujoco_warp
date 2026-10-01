@@ -29,36 +29,46 @@ from mujoco_warp._src.math import upper_trid_index
 
 
 @dataclasses.dataclass(frozen=True)
-class WorkspaceField:
-  """One semantic scratch field; domain declares its independent capacity axis."""
+class WorkspaceFieldSpec:
+  """Scratch requirement; capacity_domain declares its independent capacity axis."""
 
   name: str
   shape: tuple[int, ...]
   dtype: type
-  domain: str
+  capacity_domain: str
 
 
-class StepWorkspace:
-  """Own one fixed scratch allocation and borrowed native stage views.
+class _StepWorkspace:
+  """Internal owner of prepared scratch and borrowed native stage views.
 
   Prepare with make_step_workspace. One workspace may serve ordered substeps and
   both collision passes; concurrent steps require separate workspaces. Model and
   Data storage must remain unchanged. Captured steps retain this owner on the graph.
+  Compact solver and collision views are private engine implementation; callers
+  provide only the original Model/Data and declared scratch descriptors.
   """
 
-  def __init__(self, model, data, live_count, specs, solver_model, solver_data, arrays=None, observer=None):
-    self.model, self.data, self.live_count = model, data, live_count
-    self.observer = observer
+  def __init__(self, model, data, world_live_count, specs, solver_model, solver_data, arrays=None, recorder=None):
+    self.model, self.data, self.world_live_count = model, data, world_live_count
+    self.recorder = recorder
+    self._execution_binding = world_live_count, self._layout(world_live_count), recorder
     self.device = data.qpos.device
-    self.solver_model, self.solver_data = solver_model, solver_data
+    self._solver_model, self._solver_data = solver_model, solver_data
     self.arrays, self._ledger = {}, []
     offset = 0
     for spec in specs:
-      name, shape, dtype, scope = spec.name, spec.shape, spec.dtype, spec.domain
+      name, shape, dtype, capacity_domain = spec.name, spec.shape, spec.dtype, spec.capacity_domain
       nbytes = math.prod(shape) * wp.types.type_size_in_bytes(dtype)
       offset = (offset + 127) // 128 * 128
-      field = dict(name=name, shape=shape, dtype=dtype, offset=offset, bytes=nbytes, scope=scope)
-      field["world_axis"] = 0 if scope == "world" else None
+      field = dict(
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        allocation_offset_bytes=offset,
+        payload_bytes=nbytes,
+        capacity_domain=capacity_domain,
+      )
+      field["world_axis"] = 0 if capacity_domain == "world" else None
       self._ledger.append(field)
       offset += nbytes
     self.storage = None
@@ -66,8 +76,13 @@ class StepWorkspace:
       self.storage = wp.empty(offset, dtype=wp.uint8, device=self.device)
       for field in self._ledger:
         array = (
-          wp.array(ptr=self.storage.ptr + field["offset"], shape=field["shape"], dtype=field["dtype"], device=self.device)
-          if field["bytes"]
+          wp.array(
+            ptr=self.storage.ptr + field["allocation_offset_bytes"],
+            shape=field["shape"],
+            dtype=field["dtype"],
+            device=self.device,
+          )
+          if field["payload_bytes"]
           else wp.empty(field["shape"], dtype=field["dtype"], device=self.device)
         )
         array.workspace_storage = self.storage
@@ -93,15 +108,15 @@ class StepWorkspace:
           if array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16:
             raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: {spec.name}")
         self.arrays[spec.name] = array
-        self._ledger[len(self.arrays) - 1]["offset"] = None
-    self.collision = CollisionContext(
+        self._ledger[len(self.arrays) - 1]["allocation_offset_bytes"] = None
+    self._collision = CollisionContext(
       **{name: self.arrays[name] for name in ("collision_pair", "collision_pairid", "collision_worldid")}
     )
-    self.solver_context = types.SolverContext(
+    self._solver_context = types.SolverContext(
       **{name: self.arrays["solver." + name] for name, _, _, _ in solver._solver_context_layout(solver_model, solver_data)}
     )
-    self.solver_context.compact_m_full = model
-    self.solver_context.compact_d_full = data
+    self._solver_context.compact_m_full = model
+    self._solver_context.compact_d_full = data
     self._data_layout = self._layout(data)
     self._model_layout = self._layout(model)
     self._scratch_layout = self._layout(tuple(self.arrays.items()))
@@ -111,16 +126,21 @@ class StepWorkspace:
     if isinstance(value, wp.array):
       return value.ptr, value.shape, value.strides, value.dtype
     if dataclasses.is_dataclass(value):
-      return tuple((field.name, StepWorkspace._layout(getattr(value, field.name))) for field in dataclasses.fields(value))
-    if isinstance(value, tuple):
-      return tuple(StepWorkspace._layout(item) for item in value)
+      return tuple((field.name, _StepWorkspace._layout(getattr(value, field.name))) for field in dataclasses.fields(value))
+    if isinstance(value, (tuple, list)):
+      return tuple(_StepWorkspace._layout(item) for item in value)
     if value is None or isinstance(value, (int, float, bool, str)):
       return value
     return id(value)
 
   def validate(self, model, data):
     """Check binding before recording; GPU replay never calls this host method."""
-    _validate_execution_binding(self.live_count, self.observer)
+    _validate_execution_binding(self.world_live_count, self.recorder)
+    count, count_layout, recorder = self._execution_binding
+    if (
+      self.world_live_count is not count or self._layout(self.world_live_count) != count_layout or self.recorder is not recorder
+    ):
+      raise ValueError("Prepared execution binding changed; restore its original world count and recorder before recording")
     if model is not self.model or data is not self.data:
       raise ValueError("Prepared workspace requires its original model, data and immutable step options")
     if self._layout(data) != self._data_layout or self._layout(model) != self._model_layout:
@@ -133,42 +153,42 @@ class StepWorkspace:
       if self not in owners:
         graph.mjw_workspaces = (*owners, self)
 
-  def observe_launch(self, kernel, dim, extent_domain, *, extent_axis=0, parameters=None):
+  def bind_launch(self, kernel, dim, extent_domain, *, extent_axis=0, parameter_domains=None):
     """Publish explicit count semantics after a native launch, during preparation.
 
     Dim only distinguishes an emitted launch from a zero-sized operation; it does
-    not identify a population domain. The observer owns CUDA node bindings. Model,
+    not identify a population domain. The recorder owns CUDA node bindings. Model,
     Data and this workspace already retain all allocation owners of the step.
     """
-    if self.observer is None:
+    if self.recorder is None:
       return
     dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
     if any(size == 0 for size in dimensions):
       return
-    self.observer.observe_launch(kernel, dim, extent_domain, extent_axis=extent_axis, parameters=parameters or {})
+    self.recorder.bind_launch(kernel, dim, extent_domain, extent_axis=extent_axis, parameter_domains=parameter_domains or {})
 
   def fill(self, array, value, domain):
-    """Fill an explicitly declared row domain, bounded by the observer's count."""
+    """Fill an explicitly declared row domain, bounded by the recorder's count."""
     if array.size:
-      if self.observer is None:
+      if self.recorder is None:
         array.fill_(value)
       else:
-        self.observer.fill(array, value, domain)
+        self.recorder.fill(array, value, domain)
     return array
 
   def copy(self, destination, source, domain):
     """Copy an explicitly declared row domain without touching inactive rows."""
     if destination.size:
-      if self.observer is None:
+      if self.recorder is None:
         wp.copy(destination, source)
       else:
-        self.observer.copy(destination, source, domain)
+        self.recorder.copy(destination, source, domain)
 
   def memory_report(self):
     return {
       "physical_scratch_bytes": None if self.storage is None else self.storage.capacity,
       "allocation_owner": "caller" if self.storage is None else "workspace",
-      "payload_bytes": sum(row["bytes"] for row in self._ledger),
+      "payload_bytes": sum(row["payload_bytes"] for row in self._ledger),
       "fields": [{**row, "dtype": str(row["dtype"]), "pointer": self.arrays[row["name"]].ptr} for row in self._ledger],
       "scope": "scratch payload only; caller-owned physical backing and Model/Data/Contact/graph/context are excluded",
     }
@@ -176,7 +196,7 @@ class StepWorkspace:
 
 def step_workspace_layout(
   model: types.Model, data: types.Data, *, world_capacity=None, contact_capacity=None, ccd_capacity=None
-) -> tuple[WorkspaceField, ...]:
+) -> tuple[WorkspaceFieldSpec, ...]:
   """Describe scratch before allocation for Newton/implicit-fast keyboard execution.
 
   Admits native NxN contacts, sleeping, pyramidal Newton and no optional callbacks,
@@ -189,7 +209,7 @@ def step_workspace_layout(
   At least one dynamic tree is required; the static-only island path is unbound.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
   Every admitted runtime launch and world/candidate/CCD memory operation must
-  declare its observer domain. Route copies/fills through the workspace and reject
+  declare its recorder domain. Route copies/fills through the workspace and reject
   unsupported execution branches here before allocating any scratch.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
@@ -305,19 +325,25 @@ def step_workspace_layout(
   for name, shape, dtype, domain in specs:
     if domain == "world" and shape[0]:
       shape = (nw, *shape[1:])
-    fields.append(WorkspaceField(name, shape, {int: wp.int32, float: wp.float32, bool: wp.bool}.get(dtype, dtype), domain))
+    fields.append(WorkspaceFieldSpec(name, shape, {int: wp.int32, float: wp.float32, bool: wp.bool}.get(dtype, dtype), domain))
   return tuple(fields)
 
 
-def _validate_execution_binding(live_count, observer):
-  if observer is not None and not all(callable(getattr(observer, name, None)) for name in ("observe_launch", "fill", "copy")):
-    raise TypeError("Prepared observer must implement observe_launch, fill and copy")
-  if (live_count is None) != (observer is None):
-    raise ValueError("Dynamic execution requires live_count and observer together; fixed execution supplies neither")
+def _validate_execution_binding(world_live_count, recorder):
+  if recorder is not None and not all(callable(getattr(recorder, name, None)) for name in ("bind_launch", "fill", "copy")):
+    raise TypeError("Prepared recorder must implement bind_launch, fill and copy")
+  if (world_live_count is None) != (recorder is None):
+    raise ValueError("Dynamic execution requires world_live_count and recorder together; fixed execution supplies neither")
 
 
-def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None, arrays=None, observer=None) -> StepWorkspace:
-  """Bind complete caller-owned typed scratch, or allocate fixed scratch by default.
+def make_step_workspace(
+  model: types.Model, data: types.Data, *, world_live_count=None, arrays=None, recorder=None
+) -> _StepWorkspace:
+  """Prepare a workspace with caller-owned typed scratch or fixed scratch allocated here.
+
+  This is the sole public workspace construction operation. The returned owner
+  records bounded scratch operations and retains all borrowed native stage views;
+  its implementation type and derived views are private.
 
   Supplied arrays must cover step_workspace_layout exactly and retain their backing
   owner. Fields must not overlap, and all required rows must be physically ready
@@ -326,32 +352,34 @@ def make_step_workspace(model: types.Model, data: types.Data, *, live_count=None
   Blocked Cholesky matrices (Data.cM/cqLD and solver.h/hfactor on the blocked
   Newton path) require 16-byte-aligned bases and both world and matrix-row strides.
   Scalar counters and nonblocked/empty matrices retain their natural alignment.
-  Fixed execution supplies neither live_count nor observer. Dynamic execution
-  supplies both: live_count is a CUDA int32 scalar in [0, data.nworld], enforced
-  by admission, and observer implements observe_launch, fill and copy. The observer
+  Fixed execution supplies neither world_live_count nor recorder. Dynamic execution
+  supplies both: world_live_count is a CUDA int32 scalar in [0, data.nworld], enforced
+  by admission, and recorder implements bind_launch, fill and copy. The recorder
   must bind every declared world launch to that same count, with independent
   candidate/CCD counts, and bound row operations in the caller's graph program.
-  Both must remain bound while recording steps. The observer runs only at declared
+  The count descriptor, execution mode and recorder identity are fixed at preparation.
+  A temporarily detached recorder must be restored before recording any step.
+  The recorder runs only at declared
   stage sites; no global Warp dispatch is replaced.
   """
   if not data.qpos.device.is_cuda:
     raise ValueError("Prepared step workspace currently requires CUDA")
   if wp.get_stream(data.qpos.device).is_capturing:
     raise RuntimeError("Prepare native step workspace before graph capture")
-  _validate_execution_binding(live_count, observer)
+  _validate_execution_binding(world_live_count, recorder)
   specs = step_workspace_layout(model, data)
   for name in ("cM", "cqLD"):
     array = getattr(data, name)
     # The compact smooth solve always uses explicitly aligned blocked matrices.
     if array.size and (array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16):
       raise ValueError(f"Blocked Cholesky matrix needs 16-byte base and row strides: Data.{name}")
-  if live_count is not None and (
-    not isinstance(live_count, wp.array)
-    or live_count.dtype != wp.int32
-    or live_count.shape != (1,)
-    or not live_count.is_contiguous
-    or live_count.device != data.qpos.device
+  if world_live_count is not None and (
+    not isinstance(world_live_count, wp.array)
+    or world_live_count.dtype != wp.int32
+    or world_live_count.shape != (1,)
+    or not world_live_count.is_contiguous
+    or world_live_count.device != data.qpos.device
   ):
-    raise ValueError("Live count must be one contiguous int32 scalar on the Data device")
+    raise ValueError("World live count must be one contiguous int32 scalar on the Data device")
   m2, d2 = solver._compact_solver_views(model, data)
-  return StepWorkspace(model, data, live_count, specs, m2, d2, arrays=arrays, observer=observer)
+  return _StepWorkspace(model, data, world_live_count, specs, m2, d2, arrays=arrays, recorder=recorder)

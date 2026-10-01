@@ -4938,9 +4938,13 @@ def _add_surface_vel(is_pyramidal: bool):
 @event_scope
 def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=None):
   """Creates constraint jacobians and other supporting data."""
+  if workspace is not None:
+    workspace.validate(m, d)
+    if efc_nnz is not None and efc_nnz is not workspace.arrays["efc_nnz"]:
+      raise ValueError("Prepared constraints require workspace efc_nnz scratch")
   newton = m.opt.solver == types.SolverType.NEWTON
   if efc_nnz is None:
-    efc_nnz = wp.empty((d.nworld,), dtype=int)
+    efc_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["efc_nnz"]
 
   wp.launch(
     _zero_constraint_counts,
@@ -4948,7 +4952,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
     inputs=[d.ne, d.nf, d.nl, d.nefc, d.efc.jtdaj_nblock, efc_nnz],
   )
   if workspace is not None:
-    workspace.observe_launch(_zero_constraint_counts, d.nworld, "world")
+    workspace.bind_launch(_zero_constraint_counts, d.nworld, "world")
 
   if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
     if not (m.opt.disableflags & types.DisableBit.EQUALITY):
@@ -5323,7 +5327,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
         ],
       )
       if workspace is not None:
-        workspace.observe_launch(launch_kernel, (d.nworld, m.nv), "world")
+        workspace.bind_launch(launch_kernel, (d.nworld, m.nv), "world")
 
       wp.launch(
         _friction_tendon(m.is_sparse, newton),
@@ -5453,7 +5457,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
         ],
       )
       if workspace is not None:
-        workspace.observe_launch(launch_kernel, (d.nworld, m.jnt_limited_slide_hinge_adr.size), "world")
+        workspace.bind_launch(launch_kernel, (d.nworld, m.jnt_limited_slide_hinge_adr.size), "world")
 
       wp.launch(
         _limit_tendon(m.is_sparse, newton),
@@ -5609,7 +5613,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           ],
         )
         if workspace is not None:
-          workspace.observe_launch(launch_kernel, d.naconmax, "candidate")
+          workspace.bind_launch(launch_kernel, d.naconmax, "candidate")
 
       if m.is_sparse:
         if has_flex:
@@ -5698,7 +5702,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             ],
           )
           if workspace is not None:
-            workspace.observe_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
+            workspace.bind_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
       else:
         if workspace is None:
           d.efc.Jqvel.zero_()
@@ -5786,7 +5790,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
             block_dim=tile_size,
           )
           if workspace is not None:
-            workspace.observe_launch(launch_kernel, (d.nworld, n_dof_blocks), "world")
+            workspace.bind_launch(launch_kernel, (d.nworld, n_dof_blocks), "world")
 
       if m.flg_surfacevel:
         wp.launch(
@@ -5902,4 +5906,4 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None, workspace=No
           ],
         )
         if workspace is not None:
-          workspace.observe_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
+          workspace.bind_launch(launch_kernel, (d.naconmax, nmaxdim), "candidate")
