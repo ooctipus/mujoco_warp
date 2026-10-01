@@ -19,9 +19,9 @@
 
 # Code Style
 
-- Prepared execution must keep live counts and launch bindings coherent: dynamic workspaces require both a world-live-count scalar and the bounded launch/copy/fill recorder; fixed workspaces supply neither. Reject incomplete bindings before recording.
+- Prepared execution borrows one passive native StepBindings record; its world storage protected count is the sole world-live-count source. Fixed workspaces supply no bindings. Native operations own domain declarations and one binding/failure ledger, calling gpu-components directly; reject callback recorders and duplicate count arguments.
 - Schema field names belong to preparation. Numeric identity and membership APIs must not also resolve paths or names.
-- Name allocation specifications separately from allocated views. A recorder binds already-emitted launches; its parameter-domain declarations are not kernel argument values.
+- Name allocation specifications separately from allocated views. Native binding operations claim already-emitted launches; their parameter-domain declarations are not kernel argument values. Preflight caller declarations before emission; freeze borrowed source/updater identity during recording and retain bindings through graph retirement.
 - Initialize physical quantities according to their equations, independently of compact/sparse storage flags. Test first-write behavior with poisoned storage and reject nonfinite values in numerical parity checks.
 
 - Line length limit is 128 characters. Docstring length limit is 100 characters.
