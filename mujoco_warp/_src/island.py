@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
+
 import warp as wp
 
 from mujoco_warp._src import step_execution
@@ -284,12 +286,11 @@ _DSU_TARGET_BLOCKS = 2048
 
 
 @event_scope
-def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int], *, workspace=None):
+def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int], *, bindings=None):
   """Discover islands with EFC-parallel atomic minimum-root hooks.
 
   `island_parent` is the (nworld, ntree) disjoint-set workspace, owned by the caller.
   """
-  bindings = None if workspace is None else workspace.bindings
   # Discovery blocks are laid out over (world, chunk). A batch large enough to occupy the
   # device keeps one block per world, since extra chunks would mostly launch past the
   # active prefix; a small batch with a long prefix is split until there is resident work.
@@ -370,11 +371,19 @@ def _zero_island_counts(
   nidof_out[worldid] = 0
 
 
-@event_scope
 def island(m: types.Model, d: types.Data, *, workspace=None):
   """Discover constraint islands."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
+  parent = None
+  if m.ntree:
+    parent = wp.empty((d.nworld, m.ntree), dtype=int) if workspace is None else workspace.arrays["island_parent"]
+  _island(m, d, parent, bindings=None if workspace is None else workspace.bindings)
+
+
+@functools.partial(event_scope, name="island")
+def _island(m: types.Model, d: types.Data, parent: wp.array2d[int] | None, *, bindings):
+  """Discover islands using the caller's disjoint-set scratch and execution bindings."""
   if m.ntree == 0:
     wp.launch(
       _zero_island_counts,
@@ -383,8 +392,7 @@ def island(m: types.Model, d: types.Data, *, workspace=None):
     )
     return
 
-  parent = wp.empty((d.nworld, m.ntree), dtype=int) if workspace is None else workspace.arrays["island_parent"]
-  direct_dsu(m, d, parent, workspace=workspace)
+  direct_dsu(m, d, parent, bindings=bindings)
 
 
 @wp.kernel

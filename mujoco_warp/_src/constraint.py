@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
 from typing import Tuple
 
 import warp as wp
@@ -4936,14 +4937,18 @@ def _add_surface_vel(is_pyramidal: bool):
   return kernel
 
 
-@event_scope
 def make_constraint(m: types.Model, d: types.Data, *, workspace=None):
   """Creates constraint jacobians and other supporting data."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
-  newton = m.opt.solver == types.SolverType.NEWTON
   efc_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["efc_nnz"]
+  _make_constraint(m, d, efc_nnz, bindings=None if workspace is None else workspace.bindings)
+
+
+@functools.partial(event_scope, name="make_constraint")
+def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, bindings):
+  """Assemble constraints using the caller's nonzero-count scratch and execution bindings."""
+  newton = m.opt.solver == types.SolverType.NEWTON
 
   step_execution.launch_step_kernel(
     bindings,
@@ -5699,10 +5704,10 @@ def make_constraint(m: types.Model, d: types.Data, *, workspace=None):
             extent_domain="candidate",
           )
       else:
-        if workspace is None:
+        if bindings is None:
           d.efc.Jqvel.zero_()
         else:
-          step_execution.fill_step_rows(workspace.bindings, d.efc.Jqvel, 0, "world")
+          step_execution.fill_step_rows(bindings, d.efc.Jqvel, 0, "world")
         tile_size = m.block_dim.contact_jac_tiled
         n_dof_blocks = (m.nv_pad + tile_size - 1) // tile_size
 
