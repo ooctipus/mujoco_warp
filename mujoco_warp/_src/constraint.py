@@ -18,6 +18,7 @@ from typing import Tuple
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -4936,15 +4937,20 @@ def _add_surface_vel(is_pyramidal: bool):
 
 
 @event_scope
-def make_constraint(m: types.Model, d: types.Data):
+def make_constraint(m: types.Model, d: types.Data, *, workspace=None):
   """Creates constraint jacobians and other supporting data."""
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
   newton = m.opt.solver == types.SolverType.NEWTON
-  efc_nnz = wp.empty((d.nworld,), dtype=int)
+  efc_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["efc_nnz"]
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _zero_constraint_counts,
     dim=d.nworld,
     inputs=[d.ne, d.nf, d.nl, d.nefc, d.efc.jtdaj_nblock, efc_nnz],
+    extent_domain="world",
   )
 
   if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
@@ -5282,7 +5288,8 @@ def make_constraint(m: types.Model, d: types.Data):
           )
 
     if not (m.opt.disableflags & types.DisableBit.FRICTIONLOSS):
-      wp.launch(
+      step_execution.launch_step_kernel(
+        bindings,
         _friction_dof(m.is_sparse, newton),
         dim=(d.nworld, m.nv),
         inputs=[
@@ -5317,6 +5324,7 @@ def make_constraint(m: types.Model, d: types.Data):
           d.efc.frictionloss,
           efc_nnz,
         ],
+        extent_domain="world",
       )
 
       wp.launch(
@@ -5404,7 +5412,8 @@ def make_constraint(m: types.Model, d: types.Data):
         ],
       )
 
-      wp.launch(
+      step_execution.launch_step_kernel(
+        bindings,
         _limit_slide_hinge(m.is_sparse, newton),
         dim=(d.nworld, m.jnt_limited_slide_hinge_adr.size),
         inputs=[
@@ -5444,6 +5453,7 @@ def make_constraint(m: types.Model, d: types.Data):
           d.efc.frictionloss,
           efc_nnz,
         ],
+        extent_domain="world",
       )
 
       wp.launch(
@@ -5499,6 +5509,7 @@ def make_constraint(m: types.Model, d: types.Data):
         ptr=d.contact.frame.ptr,
         dtype=wp.vec3,
         shape=(d.naconmax, 3),
+        strides=(d.contact.frame.strides[0], 12),
         device=d.contact.frame.device,
         copy=False,
       )
@@ -5506,10 +5517,12 @@ def make_constraint(m: types.Model, d: types.Data):
         ptr=d.contact.friction.ptr,
         dtype=float,
         shape=(d.naconmax, 5),
+        strides=(d.contact.friction.strides[0], 4),
         device=d.contact.friction.device,
         copy=False,
       )
 
+      contact_frame_2d._ref, contact_friction_2d._ref = d.contact.frame, d.contact.friction
       has_flex = m.nflex > 0
       if has_flex:
         wp.launch(
@@ -5563,7 +5576,8 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
         )
       else:
-        wp.launch(
+        step_execution.launch_step_kernel(
+          bindings,
           _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion),
           dim=d.naconmax,
           inputs=[
@@ -5594,6 +5608,7 @@ def make_constraint(m: types.Model, d: types.Data):
             d.efc.J_rowadr,
             efc_nnz,
           ],
+          extent_domain="candidate",
         )
 
       if m.is_sparse:
@@ -5648,7 +5663,8 @@ def make_constraint(m: types.Model, d: types.Data):
             ],
           )
         else:
-          wp.launch(
+          step_execution.launch_step_kernel(
+            bindings,
             _efc_contact_jac_sparse(m.opt.cone),
             dim=(d.naconmax, nmaxdim),
             inputs=[
@@ -5680,9 +5696,13 @@ def make_constraint(m: types.Model, d: types.Data):
               d.efc.J,
               d.efc.Jqvel,
             ],
+            extent_domain="candidate",
           )
       else:
-        d.efc.Jqvel.zero_()
+        if workspace is None:
+          d.efc.Jqvel.zero_()
+        else:
+          step_execution.fill_step_rows(workspace.bindings, d.efc.Jqvel, 0, "world")
         tile_size = m.block_dim.contact_jac_tiled
         n_dof_blocks = (m.nv_pad + tile_size - 1) // tile_size
 
@@ -5733,7 +5753,8 @@ def make_constraint(m: types.Model, d: types.Data):
             block_dim=tile_size,
           )
         else:
-          wp.launch_tiled(
+          step_execution.launch_step_kernel(
+            bindings,
             _efc_contact_jac_dense(tile_size, m.opt.cone),
             dim=(d.nworld, n_dof_blocks),
             inputs=[
@@ -5762,6 +5783,8 @@ def make_constraint(m: types.Model, d: types.Data):
               d.efc.Jqvel,
             ],
             block_dim=tile_size,
+            extent_domain="world",
+            tiled=True,
           )
 
       if m.flg_surfacevel:
@@ -5841,7 +5864,8 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
         )
       else:
-        wp.launch(
+        step_execution.launch_step_kernel(
+          bindings,
           _efc_contact_update(m.opt.cone, m.flg_adhesion),
           dim=(d.naconmax, nmaxdim),
           inputs=[
@@ -5875,4 +5899,5 @@ def make_constraint(m: types.Model, d: types.Data):
             d.efc.aref,
             d.efc.frictionloss,
           ],
+          extent_domain="candidate",
         )

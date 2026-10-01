@@ -1573,6 +1573,41 @@ def _put_compact(xml: str, nvmax: int | None = None, sparse: bool = False):
 class CompactSolverTest(parameterized.TestCase):
   """Tests for the compacted smooth and constrained solves (solver.py compact path)."""
 
+  @parameterized.product(poison=(17.0, np.nan), prepared=(False, True), warmstart=(False, True))
+  def test_unconstrained_compact_force_initialization(self, poison, prepared, warmstart):
+    """A compact sparse solve owns its zero-constraint force, including on reused allocations."""
+    bodies = "".join(
+      f'<body pos="{i * 0.1} 0 1"><joint type="slide" axis="0 0 1"/><geom type="sphere" size="0.02" mass="1"/></body>'
+      for i in range(6)
+    )
+    mjm = mujoco.MjModel.from_xml_string(
+      '<mujoco><option solver="Newton" integrator="implicitfast" jacobian="sparse" cone="pyramidal">'
+      f'<flag sleep="enable" multiccd="disable" warmstart="{"enable" if warmstart else "disable"}"/>'
+      f'</option><worldbody><geom type="plane" size="2 2 0.1"/>{bodies}</worldbody></mujoco>'
+    )
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_forward(mjm, mjd)
+    m = mjw.put_model(mjm)
+    m.opt.broadphase = types.BroadphaseType.NXN
+    m.opt.graph_conditional = True
+    d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
+    self.assertTrue(m.is_sparse)
+    workspace = mjw.make_step_workspace(m, d) if prepared else None
+    if prepared:
+      with wp.ScopedCapture() as capture:
+        mjw.forward(m, d, workspace=workspace)
+    for _ in range(2):
+      # This covers both uninitialized nonfinite bytes and stale finite force from an earlier solve.
+      d.cqfrc_constraint.fill_(poison)
+      if prepared:
+        wp.capture_launch(capture.graph)
+      else:
+        mjw.forward(m, d)
+      np.testing.assert_array_equal(d.nefc.numpy(), [0, 0])
+      np.testing.assert_array_equal(d.cqfrc_constraint.numpy(), np.zeros(d.cqfrc_constraint.shape))
+      np.testing.assert_allclose(d.qfrc_constraint.numpy(), 0.0, atol=1e-6, equal_nan=False)
+      np.testing.assert_allclose(d.qacc.numpy(), np.broadcast_to(mjd.qacc, d.qacc.shape), atol=1e-5, equal_nan=False)
+
   def test_smooth_solve_equivalence_all_active(self):
     """With every tree active and nvmax=nv, compacted qacc_smooth matches baseline."""
     _, _, m, d = _put_compact(_COMPACT_ARM_XML, sparse=True)

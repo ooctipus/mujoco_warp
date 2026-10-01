@@ -38,6 +38,40 @@ def _assert_eq(a, b, name):
 
 
 class DerivativeTest(parameterized.TestCase):
+  @parameterized.product(
+    disable_actuation=(False, True), disable_damper=(False, True), disable_spring=(False, True), prepared=(False, True)
+  )
+  def test_independent_actuation_and_damper_flags(self, disable_actuation, disable_damper, disable_spring, prepared):
+    """Disabling either velocity-force source must retain the other source's derivative."""
+    mjm = mujoco.MjModel.from_xml_string(
+      '<mujoco><option timestep="0.005" solver="Newton" integrator="implicitfast" jacobian="sparse">'
+      '<flag sleep="enable" multiccd="disable"/></option><worldbody><body>'
+      '<joint name="slide" type="slide" damping="0.1" stiffness="2"/>'
+      '<geom type="sphere" size="0.02" mass="0.01"/></body></worldbody>'
+      '<actuator><velocity joint="slide" kv="0.3"/></actuator></mujoco>'
+    )
+    if disable_actuation:
+      mjm.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION
+    if disable_damper:
+      mjm.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_DAMPER
+    if disable_spring:
+      mjm.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_SPRING
+    m = mjw.put_model(mjm)
+    m.opt.broadphase = mjw.BroadphaseType.NXN
+    m.opt.graph_conditional = True
+    d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
+    mjw.forward(m, d)
+    workspace = mjw.make_step_workspace(m, d) if prepared else None
+    out = workspace.arrays["qDeriv"] if prepared else wp.empty_like(d.M)
+    if prepared:
+      with wp.ScopedCapture() as capture:
+        mjw.deriv_smooth_vel(m, d, out, workspace=workspace)
+      wp.capture_launch(capture.graph)
+    else:
+      mjw.deriv_smooth_vel(m, d, out)
+    expected = 0.01 + 0.005 * (0.1 * (not disable_damper) + 0.3 * (not disable_actuation))
+    np.testing.assert_allclose(out.numpy(), expected, rtol=1e-6, atol=1e-8, equal_nan=False)
+
   @parameterized.parameters(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE)
   def test_smooth_vel(self, jacobian):
     """Tests qDeriv."""

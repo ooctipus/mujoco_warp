@@ -17,6 +17,7 @@
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MAXVAL
@@ -415,14 +416,18 @@ def _flex_edges(
 
 
 @event_scope
-def kinematics(m: Model, d: Data):
+def kinematics(m: Model, d: Data, *, workspace=None):
   """Computes forward kinematics for all bodies, sites, geoms, and flexible elements.
 
   This function updates the global positions and orientations of all bodies, as well as the
   derived positions and orientations of geoms, sites, and flexible elements, based on the
   current joint positions and any attached mocap bodies.
   """
-  wp.launch(
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     _kinematics_branch,
     dim=(d.nworld, m.nbranch),
     inputs=[
@@ -444,34 +449,43 @@ def kinematics(m: Model, d: Data):
       d.mocap_quat,
     ],
     outputs=[d.xpos, d.xquat, d.xanchor, d.xaxis],
+    extent_domain="world",
   )
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _compute_body_matrices,
     dim=(d.nworld, m.nbody),
     inputs=[d.xquat],
     outputs=[d.xmat],
+    extent_domain="world",
   )
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _compute_body_inertial_frames,
     dim=(d.nworld, m.nbody),
     inputs=[m.body_ipos, m.body_iquat, d.xpos, d.xquat],
     outputs=[d.xipos, d.ximat],
+    extent_domain="world",
   )
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _geom_local_to_global,
     dim=(d.nworld, m.ngeom),
     inputs=[m.body_rootid, m.body_weldid, m.body_mocapid, m.geom_bodyid, m.geom_pos, m.geom_quat, d.xpos, d.xquat],
     outputs=[d.geom_xpos, d.geom_xmat],
+    extent_domain="world",
   )
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _site_local_to_global,
     dim=(d.nworld, m.nsite),
     inputs=[m.site_bodyid, m.site_pos, m.site_quat, d.xpos, d.xquat],
     outputs=[d.site_xpos, d.site_xmat],
+    extent_domain="world",
   )
 
 
@@ -790,36 +804,59 @@ def _cdof(
 
 
 @event_scope
-def com_pos(m: Model, d: Data):
+def com_pos(m: Model, d: Data, *, workspace=None):
   """Computes subtree center of mass positions.
 
   Transforms inertia and motion to global frame centered at subtree CoM. Accumulates the
   mass-weighted positions up the kinematic tree, divides by total mass, and computes composite
   inertias and motion degrees of freedom in the subtree CoM frame.
   """
-  wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
+    _subtree_com_init,
+    dim=(d.nworld, m.nbody),
+    inputs=[m.body_mass, d.xipos],
+    outputs=[d.subtree_com],
+    extent_domain="world",
+  )
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       _subtree_com_acc,
       dim=(d.nworld, body_tree.size),
       inputs=[m.body_parentid, d.subtree_com, body_tree],
       outputs=[d.subtree_com],
+      extent_domain="world",
     )
 
-  wp.launch(_subtree_div, dim=(d.nworld, m.nbody), inputs=[m.body_subtreemass, d.subtree_com], outputs=[d.subtree_com])
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
+    _subtree_div,
+    dim=(d.nworld, m.nbody),
+    inputs=[m.body_subtreemass, d.subtree_com],
+    outputs=[d.subtree_com],
+    extent_domain="world",
+  )
+  step_execution.launch_step_kernel(
+    bindings,
     _cinert,
     dim=(d.nworld, m.nbody),
     inputs=[m.body_rootid, m.body_mass, m.body_inertia, d.xipos, d.ximat, d.subtree_com],
     outputs=[d.cinert],
+    extent_domain="world",
   )
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _cdof,
     dim=(d.nworld, m.njnt),
     inputs=[m.body_rootid, m.jnt_type, m.jnt_dofadr, m.jnt_bodyid, d.xmat, d.xanchor, d.xaxis, d.subtree_com],
     outputs=[d.cdof],
+    extent_domain="world",
   )
 
 
@@ -1045,24 +1082,42 @@ def _M(
 
 
 @event_scope
-def crb(m: Model, d: Data):
+def crb(m: Model, d: Data, *, workspace=None):
   """Computes composite rigid body inertias for each body and the joint-space inertia matrix.
 
   Accumulates composite rigid body inertias up the kinematic tree and computes the
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
-  wp.copy(d.crb, d.cinert)
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
+  if workspace is None:
+    wp.copy(d.crb, d.cinert)
+  else:
+    step_execution.copy_step_rows(workspace.bindings, d.crb, d.cinert, "world")
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
-    wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
+    step_execution.launch_step_kernel(
+      bindings,
+      _crb_accumulate,
+      dim=(d.nworld, body_tree.size),
+      inputs=[m.body_parentid, d.crb, body_tree],
+      outputs=[d.crb],
+      extent_domain="world",
+    )
 
-  d.M.zero_()
-  wp.launch(
+  if workspace is None:
+    d.M.zero_()
+  else:
+    step_execution.fill_step_rows(workspace.bindings, d.M, 0, "world")
+  step_execution.launch_step_kernel(
+    bindings,
     _M,
     dim=(d.nworld, m.nv),
     inputs=[m.dof_bodyid, m.dof_parentid, m.dof_armature, m.M_rownnz, m.M_rowadr, d.cdof, d.crb],
     outputs=[d.M],
+    extent_domain="world",
   )
 
 
@@ -1329,11 +1384,17 @@ def _cacc_world(
   cacc_out[worldid, 0] = wp.spatial_vector(wp.vec3(0.0), -gravity[worldid % gravity.shape[0]])
 
 
-def _rne_cacc_world(m: Model, d: Data):
+def _rne_cacc_world(m: Model, d: Data, *, workspace=None):
+  bindings = None if workspace is None else workspace.bindings
   if m.opt.disableflags & DisableBit.GRAVITY:
-    d.cacc.zero_()
+    if workspace is None:
+      d.cacc.zero_()
+    else:
+      step_execution.fill_step_rows(workspace.bindings, d.cacc, 0, "world")
   else:
-    wp.launch(_cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc])
+    step_execution.launch_step_kernel(
+      bindings, _cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc], extent_domain="world"
+    )
 
 
 @wp.kernel
@@ -1373,8 +1434,10 @@ def _cacc_branch(
     cacc_out[worldid, bodyid] = local_cacc
 
 
-def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False):
-  wp.launch(
+def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     _cacc_branch,
     dim=(d.nworld, m.nbranch),
     inputs=[
@@ -1390,6 +1453,7 @@ def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False):
       flg_acc,
     ],
     outputs=[d.cacc],
+    extent_domain="world",
   )
 
 
@@ -1420,8 +1484,16 @@ def _cfrc(
   cfrc_int_out[worldid, bodyid] = frc
 
 
-def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False):
-  wp.launch(_cfrc, dim=[d.nworld, m.nbody], inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext], outputs=[d.cfrc_int])
+def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False, *, workspace=None):
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
+    _cfrc,
+    dim=[d.nworld, m.nbody],
+    inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext],
+    outputs=[d.cfrc_int],
+    extent_domain="world",
+  )
 
 
 @wp.kernel
@@ -1442,10 +1514,16 @@ def _cfrc_backward(
     wp.atomic_add(cfrc_int_out[worldid], pid, cfrc_int_in[worldid, bodyid])
 
 
-def _rne_cfrc_backward(m: Model, d: Data):
+def _rne_cfrc_backward(m: Model, d: Data, *, workspace=None):
+  bindings = None if workspace is None else workspace.bindings
   for body_tree in reversed(m.body_tree):
-    wp.launch(
-      _cfrc_backward, dim=[d.nworld, body_tree.size], inputs=[m.body_parentid, d.cfrc_int, body_tree], outputs=[d.cfrc_int]
+    step_execution.launch_step_kernel(
+      bindings,
+      _cfrc_backward,
+      dim=[d.nworld, body_tree.size],
+      inputs=[m.body_parentid, d.cfrc_int, body_tree],
+      outputs=[d.cfrc_int],
+      extent_domain="world",
     )
 
 
@@ -1465,22 +1543,33 @@ def _qfrc_bias(
 
 
 @event_scope
-def rne(m: Model, d: Data, flg_acc: bool = False):
+def rne(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
   """Computes inverse dynamics using the recursive Newton-Euler algorithm.
 
   Computes the bias forces (`qfrc_bias`) and internal forces (`cfrc_int`) for the current state,
   including the effects of gravity and optionally joint accelerations.
 
   Args:
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     flg_acc: If True, includes joint accelerations in the computation.
   """
-  _rne_cacc_world(m, d)
-  _rne_cacc_forward(m, d, flg_acc=flg_acc)
-  _rne_cfrc(m, d)
-  _rne_cfrc_backward(m, d)
-  wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, d.cfrc_int], outputs=[d.qfrc_bias])
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
+  _rne_cacc_world(m, d, workspace=workspace)
+  _rne_cacc_forward(m, d, flg_acc=flg_acc, workspace=workspace)
+  _rne_cfrc(m, d, workspace=workspace)
+  _rne_cfrc_backward(m, d, workspace=workspace)
+  step_execution.launch_step_kernel(
+    bindings,
+    _qfrc_bias,
+    dim=[d.nworld, m.nv],
+    inputs=[m.dof_bodyid, d.cdof, d.cfrc_int],
+    outputs=[d.qfrc_bias],
+    extent_domain="world",
+  )
 
 
 @wp.kernel
@@ -2586,15 +2675,21 @@ def _comvel_branch(
 
 
 @event_scope
-def com_vel(m: Model, d: Data):
+def com_vel(m: Model, d: Data, *, workspace=None):
   """Computes the spatial velocities (cvel) and the derivative `cdof_dot` for all bodies.
 
   Propagates velocities down the kinematic tree, updating the spatial velocity and
   derivative for each body.
   """
-  wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings, _comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel], extent_domain="world"
+  )
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _comvel_branch,
     dim=(d.nworld, m.nbranch),
     inputs=[
@@ -2609,6 +2704,7 @@ def com_vel(m: Model, d: Data):
       d.cdof,
     ],
     outputs=[d.cvel, d.cdof_dot],
+    extent_domain="world",
   )
 
 
@@ -3215,16 +3311,23 @@ def _transmission_body_moment_scale(
 
 
 @event_scope
-def transmission(m: Model, d: Data):
+def transmission(m: Model, d: Data, *, workspace=None):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  moment_nnz = wp.zeros((d.nworld,), dtype=int)
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+    moment_nnz = workspace.arrays["moment_nnz"]
+    step_execution.fill_step_rows(workspace.bindings, moment_nnz, 0, "world")
+  else:
+    moment_nnz = wp.zeros((d.nworld,), dtype=int)
+  bindings = None if workspace is None else workspace.bindings
 
-  wp.launch(
+  step_execution.launch_step_kernel(
+    bindings,
     _transmission,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -3260,6 +3363,7 @@ def transmission(m: Model, d: Data):
       moment_nnz,
     ],
     outputs=[d.actuator_length, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
+    extent_domain="world",
   )
 
   if m.nacttrnbody:
@@ -3656,15 +3760,20 @@ def _factor_solve_blocks(
   D: wp.array2d[float],
   x: wp.array2d[float],
   y: wp.array2d[float],
+  *,
+  workspace=None,
 ):
+  bindings = None if workspace is None else workspace.bindings
   for tile in m.M_tiles:
     if tile.elemid.size == 0:
-      wp.launch(
+      step_execution.launch_step_kernel(
+        bindings,
         _small_cholesky_factorize_solve_block(tile.size),
         dim=(d.nworld, tile.adr.size),
         inputs=[m.M_rowadr, m.qLD_block_adr, M, tile.adr, y],
         outputs=[D, x, L],
         block_dim=m.block_dim.small_cholesky,
+        extent_domain="world",
       )
     else:
       wp.launch_tiled(
@@ -3676,13 +3785,14 @@ def _factor_solve_blocks(
       )
 
 
-def factor_solve_i(m, d, M, L, D, x, y):
+def factor_solve_i(m, d, M, L, D, x, y, *, workspace=None):
   """Factorizes and solves the inertia-like linear system.
 
   Compact blocks use reciprocal diagonals, full small blocks use scalar Cholesky, dense blocks use
   tile Cholesky, and sparse blocks use LDL. Factorizes M and solves for x.
 
   Args:
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing factorization and sparsity information.
     d: The data object containing workspace and factorization results.
     M: The inertia-like matrix to factorize (CSR, length nC).
@@ -3692,7 +3802,7 @@ def factor_solve_i(m, d, M, L, D, x, y):
     y: Input right-hand side array.
   """
   if m.M_tiles:
-    _factor_solve_blocks(m, d, M, L, D, x, y)
+    _factor_solve_blocks(m, d, M, L, D, x, y, workspace=workspace)
   if L.shape[1] > m.qLD_block_total:
     L_ldl = L[:, m.qLD_block_total :]
     _factor_i_sparse(m, d, M, L_ldl, D)

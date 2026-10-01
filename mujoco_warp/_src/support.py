@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 
 import warp as wp
 
+from mujoco_warp._src import step_execution
 from mujoco_warp._src.math import motion_cross
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import ConeType
@@ -222,10 +223,13 @@ def mul_m(
   vec: wp.array2d[float],
   skip: Optional[wp.array] = None,
   M: Optional[wp.array] = None,
+  *,
+  workspace=None,
 ):
   """Multiply vectors by inertia matrix; optionally skip per world.
 
   Args:
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     res: Result: M @ vec.
@@ -233,8 +237,14 @@ def mul_m(
     skip: Per-world bitmask to skip computing output.
     M: Input matrix: M @ vec.
   """
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+    if (d.M if M is None else M).ndim == 3:
+      raise NotImplementedError("Prepared mul_m does not admit external dense block inertia")
+  bindings = None if workspace is None else workspace.bindings
   check_skip = skip is not None
-  skip = skip or wp.empty(0, dtype=bool)
+  if skip is None and workspace is None:
+    skip = wp.empty(0, dtype=bool)
 
   if M is None:
     M = d.M
@@ -248,11 +258,13 @@ def mul_m(
       outputs=[res],
     )
   else:
-    wp.launch(
+    step_execution.launch_step_kernel(
+      bindings,
       mul_m_kernel(check_skip),
       dim=(d.nworld, m.nv),
       inputs=[m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, M, vec, skip],
       outputs=[res],
+      extent_domain="world",
     )
 
 
@@ -301,25 +313,31 @@ def _apply_ft(
     qfrc_out[worldid, dofid] = accumul
 
 
-def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool):
-  wp.launch(
+def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool, *, workspace=None):
+  bindings = None if workspace is None else workspace.bindings
+  step_execution.launch_step_kernel(
+    bindings,
     kernel=_apply_ft,
     dim=(d.nworld, m.nv),
     inputs=[m.nbody, m.body_parentid, m.body_rootid, m.dof_bodyid, d.xipos, d.subtree_com, d.cdof, ft, flg_add],
     outputs=[qfrc],
+    extent_domain="world",
   )
 
 
 @event_scope
-def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float]):
+def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float], *, workspace=None):
   """Map applied forces at each body via Jacobians to dof space and accumulate.
 
   Args:
+    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     qfrc: Total applied force mapped to dof space.
   """
-  apply_ft(m, d, d.xfrc_applied, qfrc, True)
+  if workspace is not None:
+    step_execution.validate_step_workspace(workspace, m, d)
+  apply_ft(m, d, d.xfrc_applied, qfrc, True, workspace=workspace)
 
 
 @wp.func
@@ -366,27 +384,43 @@ def contact_force_fn(
   contact_id: int,
   to_world_frame: bool,
 ) -> wp.spatial_vector:
-  """Extract 6D force:torque for one contact, in contact frame by default."""
+  """Extract force:torque, or zero for an invalid contact/world/constraint index.
+
+  Array extents bound readable storage. Callers using partially backed reservations
+  must supply views trimmed to their readable contact and world prefixes.
+  """
   force = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  if (
+    contact_id < 0
+    or contact_id >= nacon_in[0]
+    or contact_id >= contact_frame_in.shape[0]
+    or contact_id >= contact_friction_in.shape[0]
+    or contact_id >= contact_dim_in.shape[0]
+    or contact_id >= contact_efc_address_in.shape[0]
+    or contact_id >= contact_adhesion_in.shape[0]
+    or contact_efc_address_in.shape[1] == 0
+    or worldid < 0
+    or worldid >= efc_force_in.shape[0]
+  ):
+    return force
+
+  njmax = wp.min(njmax_in, efc_force_in.shape[1])
   condim = contact_dim_in[contact_id]
   efc_address = contact_efc_address_in[contact_id, 0]
+  if (condim != 1 and condim != 3 and condim != 4 and condim != 6) or efc_address < 0 or efc_address >= njmax:
+    return force
 
-  if contact_id >= 0 and contact_id <= nacon_in[0] and efc_address >= 0:
-    if opt_cone == ConeType.PYRAMIDAL:
-      force = _decode_pyramid(
-        njmax_in,
-        efc_force_in[worldid],
-        efc_address,
-        contact_friction_in[contact_id],
-        condim,
-      )
-    else:
-      for i in range(condim):
-        if contact_efc_address_in[contact_id, i] < njmax_in:
-          force[i] = efc_force_in[worldid, contact_efc_address_in[contact_id, i]]
+  if opt_cone == ConeType.PYRAMIDAL:
+    force = _decode_pyramid(njmax, efc_force_in[worldid], efc_address, contact_friction_in[contact_id], condim)
+  else:
+    for i in range(condim):
+      if i < contact_efc_address_in.shape[1]:
+        address = contact_efc_address_in[contact_id, i]
+        if address >= 0 and address < njmax:
+          force[i] = efc_force_in[worldid, address]
 
-    # report net interface force: solver cone force minus adhesive pull
-    force[0] -= contact_adhesion_in[contact_id]
+  # report net interface force: solver cone force minus adhesive pull
+  force[0] -= contact_adhesion_in[contact_id]
 
   if to_world_frame:
     # Transform both top and bottom parts of spatial vector by the full contact frame matrix
@@ -421,7 +455,8 @@ def contact_force_kernel(
 
   contactid = contact_ids[tid]
 
-  if contactid >= nacon_in[0]:
+  out[tid] = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+  if contactid < 0 or contactid >= nacon_in[0] or contactid >= contact_worldid_in.shape[0]:
     return
 
   worldid = contact_worldid_in[contactid]
@@ -444,6 +479,9 @@ def contact_force_kernel(
 
 def contact_force(m: Model, d: Data, contact_ids: wp.array[int], to_world_frame: bool, force: wp.array[wp.spatial_vector]):
   """Compute forces for contacts in Data.
+
+  Invalid contact/world/constraint indices produce zero. Array descriptors must
+  cover readable storage; use live-prefix views for partially backed reservations.
 
   Args:
     m: The model containing kinematic and dynamic information (device).
