@@ -710,7 +710,10 @@ class WorkspaceTest(unittest.TestCase):
           out = wp.full((4, 3), -7.0, device="cpu")
           calls = []
 
-          def copy(destination, source, domain):
+          def copy(bindings, destination, source, domain):
+            if bindings is None:
+              wp.copy(destination, source)
+              return
             calls.append((destination, source, domain))
             wp.copy(destination[:live], source[:live])
 
@@ -718,7 +721,7 @@ class WorkspaceTest(unittest.TestCase):
           with (
             patch.object(wp, "launch", side_effect=AssertionError("Unexpected derivative kernel")),
             patch.object(native_execution, "validate_step_workspace"),
-            patch.object(native_execution, "copy_step_rows", side_effect=lambda _, *args: copy(*args)),
+            patch.object(native_execution, "copy_step_rows", side_effect=copy),
           ):
             derivative.deriv_smooth_vel(model, data, out, workspace=workspace)
           expected = np.full((4, 3), -7.0, np.float32)
@@ -934,7 +937,7 @@ class WorkspaceTest(unittest.TestCase):
       (smooth.transmission, "moment_nnz", -1),
     ):
       workspace.arrays[name] = object()
-      model = Mock(opt=SimpleNamespace(solver=types.SolverType.NEWTON, disableflags=types.DisableBit.CONSTRAINT))
+      model = Mock(opt=SimpleNamespace(solver=types.SolverType.NEWTON, disableflags=types.DisableBit.CONSTRAINT), nacttrnbody=0)
       with (
         patch.object(native_execution, "validate_step_workspace"),
         patch.object(native_execution, "fill_step_rows") as fill,
@@ -947,6 +950,112 @@ class WorkspaceTest(unittest.TestCase):
       self.assertIs(launch.call_args.kwargs["inputs"][position], workspace.arrays[name])
       if name == "moment_nnz":
         fill.assert_called_once_with(workspace.bindings, workspace.arrays[name], 0, "world")
+
+  def test_shared_computations_have_explicit_operands_without_storage_or_validation(self):
+    """Keep computation independent of its eager or prepared allocation boundary."""
+    for operation in (
+      constraint._make_constraint,
+      island._island,
+      island.direct_dsu,
+      smooth._compute_transmission,
+      derivative._deriv_smooth_vel,
+    ):
+      with self.subTest(operation=operation.__name__):
+        tree = ast.parse(inspect.getsource(operation))
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        calls = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        self.assertFalse({"workspace", "validated", "skip_validation"} & names)
+        self.assertFalse(
+          {"wp.empty", "wp.zeros", "wp.empty_like", "wp.clone", "step_execution.validate_step_workspace"} & calls
+        )
+        self.assertIn("bindings", inspect.signature(operation).parameters)
+
+  def test_prepared_composition_passes_scratch_without_reentering_public_stages(self):
+    """Validate each composing entry, then call computations with the exact borrowed arrays."""
+    model = Mock(
+      opt=SimpleNamespace(
+        enableflags=types.EnableBit.SLEEP,
+        disableflags=0,
+        run_collision_detection=False,
+        integrator=types.IntegratorType.IMPLICITFAST,
+      ),
+      callback=SimpleNamespace(collision=None),
+      neq=0,
+      body_freeadr=SimpleNamespace(size=0),
+    )
+    data = Mock()
+    workspace = SimpleNamespace(
+      bindings=object(),
+      arrays={
+        name: object()
+        for name in (
+          "efc_nnz",
+          "island_parent",
+          "moment_nnz",
+          "actuator_vel",
+          "qDeriv",
+          "qLD",
+          "qLDiagInv",
+          "qacc",
+          "island_can_sleep",
+        )
+      },
+    )
+    with ExitStack() as stack:
+      validate = stack.enter_context(patch.object(native_execution, "validate_step_workspace"))
+      for module, name in (
+        (constraint, "make_constraint"),
+        (island, "island"),
+        (smooth, "transmission"),
+        (derivative, "deriv_smooth_vel"),
+      ):
+        stack.enter_context(patch.object(module, name, side_effect=AssertionError("Repeated public stage boundary")))
+      for module, name in (
+        (forward, "fwd_kinematics"),
+        (smooth, "crb"),
+        (smooth, "tendon_armature"),
+        (forward.sleep, "wake_collision"),
+        (forward.sleep, "update_sleep"),
+        (smooth, "factor_solve_i"),
+        (forward, "_launch_implicit_free_body_solve"),
+        (forward, "_advance"),
+      ):
+        stack.enter_context(patch.object(module, name))
+      operations = [
+        stack.enter_context(patch.object(module, name))
+        for module, name in (
+          (constraint, "_make_constraint"),
+          (island, "_island"),
+          (smooth, "_compute_transmission"),
+          (derivative, "_deriv_smooth_vel"),
+        )
+      ]
+      forward.fwd_position(model, data, factorize=False, workspace=workspace)
+      validate.assert_called_once_with(workspace, model, data)
+      for operation, field in zip(operations[:2], ("efc_nnz", "island_parent")):
+        operation.assert_called_once_with(model, data, workspace.arrays[field], bindings=workspace.bindings)
+      operations[2].assert_called_once_with(
+        model, data, workspace.arrays["moment_nnz"], body_ncon=None, bindings=workspace.bindings
+      )
+      validate.reset_mock()
+      forward.implicit(model, data, workspace=workspace)
+      validate.assert_called_once_with(workspace, model, data)
+      operations[3].assert_called_once_with(
+        model, data, workspace.arrays["qDeriv"], workspace.arrays["actuator_vel"], bindings=workspace.bindings
+      )
+
+  def test_transmission_initializes_supplied_counters_on_every_execution(self):
+    """Retain first-write semantics when allocation moves outside the numerical body."""
+    model, data = Mock(nacttrnbody=2), Mock(nworld=3)
+    moment_nnz = wp.empty(3, dtype=int, device="cpu")
+    body_ncon = wp.empty((3, 2), dtype=int, device="cpu")
+    with patch.object(wp, "launch"), patch.object(native_execution, "launch_step_kernel"):
+      for poison in (17, -91):
+        moment_nnz.fill_(poison)
+        body_ncon.fill_(poison)
+        smooth._compute_transmission(model, data, moment_nnz, body_ncon=body_ncon, bindings=None)
+        np.testing.assert_array_equal(moment_nnz.numpy(), 0)
+        np.testing.assert_array_equal(body_ncon.numpy(), 0)
 
   def test_prepared_stages_reject_alternate_scratch_before_writing_or_launching(self):
     """One prepared scratch owner cannot be bypassed through an optional eager argument."""

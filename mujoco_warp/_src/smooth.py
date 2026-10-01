@@ -14,6 +14,8 @@
 # ==============================================================================
 
 
+import functools
+
 import warp as wp
 
 from mujoco_warp._src import math
@@ -3310,22 +3312,24 @@ def _transmission_body_moment_scale(
     actuator_moment_out[worldid, rowadr + dofid] /= -float(ncon)
 
 
-@event_scope
 def transmission(m: Model, d: Data, *, workspace=None):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
-  # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-    moment_nnz = workspace.arrays["moment_nnz"]
-    step_execution.fill_step_rows(workspace.bindings, moment_nnz, 0, "world")
-  else:
-    moment_nnz = wp.zeros((d.nworld,), dtype=int)
-  bindings = None if workspace is None else workspace.bindings
+  moment_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["moment_nnz"]
+  body_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int) if m.nacttrnbody else None
+  _compute_transmission(m, d, moment_nnz, bindings=None if workspace is None else workspace.bindings, body_ncon=body_ncon)
 
+
+@functools.partial(event_scope, name="transmission")
+def _compute_transmission(m: Model, d: Data, moment_nnz, *, body_ncon, bindings):
+  """Compute transmissions from explicit counter scratch and native count bindings."""
+  # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
+  step_execution.fill_step_rows(bindings, moment_nnz, 0, "world")
   step_execution.launch_step_kernel(
     bindings,
     _transmission,
@@ -3368,7 +3372,7 @@ def transmission(m: Model, d: Data, *, workspace=None):
 
   if m.nacttrnbody:
     # compute moments
-    ncon = wp.zeros((d.nworld, m.nacttrnbody), dtype=int)
+    body_ncon.zero_()
 
     wp.launch(
       _transmission_body_moment,
@@ -3400,14 +3404,14 @@ def transmission(m: Model, d: Data, *, workspace=None):
         d.nacon,
         m.is_sparse,
       ],
-      outputs=[d.actuator_moment, ncon],
+      outputs=[d.actuator_moment, body_ncon],
     )
 
     # scale moments
     wp.launch(
       _transmission_body_moment_scale,
       dim=(d.nworld, m.nacttrnbody, m.nv),
-      inputs=[m.actuator_trntype_body_adr, d.moment_rowadr, ncon],
+      inputs=[m.actuator_trntype_body_adr, d.moment_rowadr, body_ncon],
       outputs=[d.actuator_moment],
     )
 

@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
+
 import warp as wp
 
 from mujoco_warp._src import math
@@ -1153,7 +1155,6 @@ def _qderiv_box_fluid(
     wp.atomic_add(qDeriv_out[worldid], madr, -contrib)
 
 
-@event_scope
 def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, workspace=None):
   """Analytical derivative of smooth forces w.r.t. velocities.
 
@@ -1165,19 +1166,23 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, workspace=Non
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
+  actuator_vel = None
+  if not (m.opt.disableflags & DisableBit.ACTUATION) and m.nactuator > 0:
+    actuator_vel = wp.empty((d.nworld, m.nactuator), dtype=float) if workspace is None else workspace.arrays["actuator_vel"]
+  _deriv_smooth_vel(m, d, out, actuator_vel, bindings=None if workspace is None else workspace.bindings)
+
+
+@functools.partial(event_scope, name="deriv_smooth_vel")
+def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *, bindings):
+  """Evaluate velocity derivatives using selected scratch and native count bindings."""
   Mi = m.M_fullm_i
   Mj = m.M_fullm_j
 
   velocity_force_flags = DisableBit.ACTUATION | DisableBit.DAMPER
   if (m.opt.disableflags & velocity_force_flags) != velocity_force_flags:
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
-    if workspace is None:
-      out.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, out, 0, "world")
+    step_execution.fill_step_rows(bindings, out, 0, "world")
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
-      vel = wp.empty((d.nworld, m.nactuator), dtype=float) if workspace is None else workspace.arrays["actuator_vel"]
       step_execution.launch_step_kernel(
         bindings,
         _qderiv_actuator_passive_vel,
@@ -1203,7 +1208,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, workspace=Non
           d.act_dot,
           d.actuator_force,
         ],
-        outputs=[vel],
+        outputs=[actuator_vel],
         extent_domain="world",
       )
       # out (qDeriv) is in M-structure.
@@ -1217,7 +1222,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, workspace=Non
           d.moment_rowadr,
           d.moment_colind,
           d.actuator_moment,
-          vel,
+          actuator_vel,
         ],
         outputs=[out],
         extent_domain="world",
@@ -1243,10 +1248,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, workspace=Non
     )
   else:
     # TODO(team): directly utilize M for these settings
-    if workspace is None:
-      wp.copy(out, d.M)
-    else:
-      step_execution.copy_step_rows(workspace.bindings, out, d.M, "world")
+    step_execution.copy_step_rows(bindings, out, d.M, "world")
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
     step_execution.launch_step_kernel(
