@@ -19,19 +19,15 @@ import dataclasses
 import math
 
 import warp as wp
-from gpu_components import fields as field_ops
-from gpu_components import graph as graph_ops
-from gpu_components.field_data import FieldStorage
-from gpu_components.graph_data import GraphKernelBinding
-from gpu_components.graph_data import GraphUpdateTable
-from gpu_components.graph_data import KernelParameterBinding
 
 from mujoco_warp._src import solver
+from mujoco_warp._src import step_execution
 from mujoco_warp._src import types
+from mujoco_warp._src.collision_convex import _convex_scratch_layout
+from mujoco_warp._src.collision_convex import _ConvexScratch
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
-from mujoco_warp._src.collision_driver import CollisionType
-from mujoco_warp._src.math import upper_trid_index
+from mujoco_warp._src.types import CollisionType
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,223 +38,6 @@ class WorkspaceFieldSpec:
   shape: tuple[int, ...]
   dtype: type
   capacity_domain: str
-
-
-@dataclasses.dataclass(eq=False)
-class StepBindings:
-  """Borrowed native capacity domains and their single captured binding ledger.
-
-  Keep all three storage owners alive through graph retirement. World launches use
-  world_storage.protected_count; candidate and CCD launches use their ready_count.
-  Admission must keep those counts within physically ready rows. Set updates before
-  the first recorded operation. Only native binding operations mutate the ledgers
-  and recording snapshot; do not replace their storage or count sources. A composing
-  engine also sets recording_failed on application or capture failure. Never clear
-  this latch or publish a graph after it becomes true.
-  """
-
-  world_storage: FieldStorage
-  contact_storage: FieldStorage
-  ccd_storage: FieldStorage
-  updates: GraphUpdateTable | None = None
-  recording_failed: bool = False
-  bindings: list[GraphKernelBinding] = dataclasses.field(default_factory=list)
-  operations: list[dict] = dataclasses.field(default_factory=list)
-  _recording_binding: tuple | None = None
-
-
-def _binding_layout(bindings):
-  if bindings is None:
-    return None
-  return tuple(
-    (id(storage), storage.capacity, id(storage.device), id(count), _StepWorkspace._layout(count))
-    for storage, count in (
-      (bindings.world_storage, bindings.world_storage.protected_count),
-      (bindings.contact_storage, bindings.contact_storage.ready_count),
-      (bindings.ccd_storage, bindings.ccd_storage.ready_count),
-    )
-  ) + (id(bindings.bindings), id(bindings.operations))
-
-
-def _validate_bindings(bindings):
-  if not isinstance(bindings, StepBindings):
-    raise TypeError("Prepared bindings must be a native StepBindings record")
-  if bindings.recording_failed:
-    raise RuntimeError("The native step program has a failed recording")
-  if not all(
-    isinstance(storage, FieldStorage) for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
-  ):
-    raise TypeError("Native capacity domains must borrow FieldStorage records")
-  device = bindings.world_storage.device
-  for storage, count in (
-    (bindings.world_storage, bindings.world_storage.protected_count),
-    (bindings.contact_storage, bindings.contact_storage.ready_count),
-    (bindings.ccd_storage, bindings.ccd_storage.ready_count),
-  ):
-    if storage.closed or storage.service_failed:
-      raise RuntimeError("Native step storage is closed or quarantined")
-    if type(storage.capacity) is not int or not 0 < storage.capacity <= 2**31 - 1:
-      raise ValueError("Native storage capacity must be a positive int32 count")
-    if (
-      storage.device != device
-      or not isinstance(count, wp.array)
-      or count.device != device
-      or count.dtype != wp.int32
-      or count.shape != (1,)
-      or not count.is_contiguous
-    ):
-      raise ValueError("Native counts must be contiguous int32 scalars on the storage device")
-  updates = bindings.updates
-  if updates is not None and (
-    not isinstance(updates, GraphUpdateTable)
-    or updates.device != device
-    or updates.enable_count is not bindings.world_storage.protected_count
-    or updates.enable_count_maximum != bindings.world_storage.capacity
-  ):
-    raise ValueError("Native updates must use the exact world protected count and capacity")
-  if bindings._recording_binding is not None and bindings._recording_binding != (_binding_layout(bindings), id(updates)):
-    raise ValueError("Native recording binding changed; restore its original storage, counts, updates and ledgers")
-
-
-def validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains):
-  """Resolve native count declarations before emitting a launch; mutate no recording state.
-
-  A dynamic extent is the leading axis of world, candidate or CCD storage. Fixed
-  worker grids explicitly use extent_domain=None and extent_axis=None. Named int32
-  scalar arguments may independently use any of those domains. Returned descriptors
-  borrow their exact count arrays; parameter indices include Warp's launch bounds.
-  """
-  _validate_bindings(bindings)
-  owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
-  if extent_domain is not None and extent_domain not in owners:
-    raise ValueError(f"Unknown native extent domain: {extent_domain!r}")
-  if extent_domain is None and extent_axis is not None:
-    raise ValueError("A fixed worker grid must explicitly omit its extent axis")
-  if extent_domain is not None and (type(extent_axis) is not int or extent_axis != 0):
-    raise ValueError("Native dynamic extents require explicit leading axis zero")
-  if parameter_domains is not None and len(parameter_domains) > 4:
-    raise ValueError("A native launch supports at most four count parameters")
-  sources = {
-    name: (owner.protected_count if name == "world" else owner.ready_count, owner.capacity) for name, owner in owners.items()
-  }
-  labels = {argument.label: (index + 1, argument.type) for index, argument in enumerate(kernel.adj.args)}
-  parameters = []
-  for name, domain in (parameter_domains or {}).items():
-    if name not in labels or domain not in sources:
-      raise ValueError(f"Unknown native count argument or domain: {name!r}, {domain!r}")
-    index, dtype = labels[name]
-    if dtype not in (int, wp.int32):
-      raise ValueError(f"Native count argument must be int32: {name!r}")
-    parameters.append(KernelParameterBinding(index, *sources[domain]))
-  return sources[extent_domain][0] if extent_domain is not None else None, tuple(parameters)
-
-
-def _begin_recording(bindings):
-  if bindings.updates is None:
-    raise RuntimeError("Prepare native graph updates before recording step operations")
-  device = bindings.world_storage.device
-  graph = device.captures.get(wp.get_stream(device))
-  if graph is None:
-    raise RuntimeError("Record native step operations inside a Warp-managed graph capture")
-  if getattr(graph, "_preparation_failed", False):
-    raise RuntimeError("Discard this graph after failed preparation")
-  if bindings._recording_binding is None:
-    bindings._recording_binding = _binding_layout(bindings), id(bindings.updates)
-  owners = getattr(graph, "_resource_owners", ())
-  if not any(owner is bindings for owner in owners):
-    graph._resource_owners = (*owners, bindings)
-    for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
-      field_ops.retain_graph(storage, graph)
-
-
-def _fail_recording(bindings):
-  if not isinstance(bindings, StepBindings):
-    return
-  bindings.recording_failed = True
-  try:
-    device = (
-      bindings.updates.device
-      if isinstance(bindings.updates, GraphUpdateTable)
-      else bindings.world_storage.protected_count.device
-    )
-    graph = device.captures.get(wp.get_stream(device) if device.is_cuda else None)
-    if graph is not None:
-      graph._preparation_failed = True
-  except BaseException:
-    # A malformed borrowed descriptor must not mask the error that poisoned it.
-    # The composition root must also reject the native recording_failed latch.
-    pass
-
-
-def bind_step_launch(bindings, kernel, dim, extent_domain, *, extent_axis=0, parameter_domains=None):
-  """Bind the just-emitted native kernel and retain its explicit count sources.
-
-  Call validate_step_launch before emission when declarations come from callers.
-  Zero-sized operations claim no node. Any other failure poisons this binding
-  record and the active graph, because a launch may already have been emitted.
-  """
-  try:
-    extent, parameters = validate_step_launch(bindings, kernel, extent_domain, extent_axis, parameter_domains)
-    dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
-    if not all(dimensions):
-      return
-    _begin_recording(bindings)
-    binding = GraphKernelBinding(
-      graph_ops.register_last_kernel_node(bindings.updates),
-      launch_rank=kernel.adj.kernel_dim,
-      extent_axis=extent_axis,
-      extent_source=extent,
-      parameters=parameters,
-    )
-    bindings.bindings.append(binding)
-    bindings.operations.append(
-      {
-        "operation": "launch",
-        "kernel": kernel.key,
-        "module": kernel.func.__module__,
-        "function": kernel.func.__qualname__,
-        "dim": list(dimensions),
-        "extent_domain": extent_domain,
-        "extent_axis": extent_axis,
-        "parameter_domains": dict(parameter_domains or {}),
-        "launch_rank": binding.launch_rank,
-        "node": binding.node,
-      }
-    )
-  except BaseException:
-    _fail_recording(bindings)
-    raise
-
-
-def _fill_step_rows(bindings, array, value, domain):
-  try:
-    _validate_bindings(bindings)
-    _begin_recording(bindings)
-    owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
-    if domain not in owners:
-      raise ValueError(f"Unknown native memory domain: {domain!r}")
-    owner = owners[domain]
-    field_ops.fill(owner, array, value, count=owner.protected_count if domain == "world" else owner.ready_count)
-    bindings.operations.append({"operation": "fill", "domain": domain, "field": field_ops.lookup(owner, array).name})
-  except BaseException:
-    _fail_recording(bindings)
-    raise
-
-
-def _copy_step_rows(bindings, destination, source, domain):
-  try:
-    _validate_bindings(bindings)
-    _begin_recording(bindings)
-    owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
-    if domain not in owners:
-      raise ValueError(f"Unknown native memory domain: {domain!r}")
-    owner = owners[domain]
-    field_ops.copy(owner, destination, source, count=owner.protected_count if domain == "world" else owner.ready_count)
-    field = field_ops.lookup(owner, destination) or field_ops.lookup(owner, source)
-    bindings.operations.append({"operation": "copy", "domain": domain, "field": field.name})
-  except BaseException:
-    _fail_recording(bindings)
-    raise
 
 
 class _StepWorkspace:
@@ -276,7 +55,7 @@ class _StepWorkspace:
     self.world_live_count = None if bindings is None else bindings.world_storage.protected_count
     self.bindings = bindings
     self._execution_binding = self.world_live_count, self._layout(self.world_live_count), bindings
-    self._binding_layout = _binding_layout(bindings)
+    self._binding_layout = step_execution._binding_layout(bindings)
     self.device = data.qpos.device
     self._solver_model, self._solver_data = solver_model, solver_data
     self.arrays, self._ledger = {}, []
@@ -337,6 +116,7 @@ class _StepWorkspace:
     self._collision = CollisionContext(
       **{name: self.arrays[name] for name in ("collision_pair", "collision_pairid", "collision_worldid")}
     )
+    self._convex = _ConvexScratch(**{field.name: self.arrays[field.name] for field in dataclasses.fields(_ConvexScratch)})
     self._solver_context = types.SolverContext(
       **{name: self.arrays["solver." + name] for name, _, _, _ in solver._solver_context_layout(solver_model, solver_data)}
     )
@@ -366,8 +146,8 @@ class _StepWorkspace:
     ):
       raise ValueError("Prepared execution binding changed; restore its original count and bindings before recording")
     if self.bindings is not None:
-      _validate_bindings(self.bindings)
-      if _binding_layout(self.bindings) != self._binding_layout:
+      step_execution._validate_bindings(self.bindings)
+      if step_execution._binding_layout(self.bindings) != self._binding_layout:
         raise ValueError("Prepared native storage or count descriptors changed; prepare a new workspace")
     if model is not self.model or data is not self.data:
       raise ValueError("Prepared workspace requires its original model, data and immutable step options")
@@ -393,7 +173,9 @@ class _StepWorkspace:
     dimensions = (dim,) if isinstance(dim, int) else tuple(dim)
     if any(size == 0 for size in dimensions):
       return
-    bind_step_launch(self.bindings, kernel, dim, extent_domain, extent_axis=extent_axis, parameter_domains=parameter_domains)
+    step_execution.bind_step_launch(
+      self.bindings, kernel, dim, extent_domain, extent_axis=extent_axis, parameter_domains=parameter_domains
+    )
 
   def fill(self, array, value, domain):
     """Fill an explicitly declared row domain, bounded by its native count source."""
@@ -401,7 +183,7 @@ class _StepWorkspace:
       if self.bindings is None:
         array.fill_(value)
       else:
-        _fill_step_rows(self.bindings, array, value, domain)
+        step_execution._fill_step_rows(self.bindings, array, value, domain)
     return array
 
   def copy(self, destination, source, domain):
@@ -410,7 +192,7 @@ class _StepWorkspace:
       if self.bindings is None:
         wp.copy(destination, source)
       else:
-        _copy_step_rows(self.bindings, destination, source, domain)
+        step_execution._copy_step_rows(self.bindings, destination, source, domain)
 
   def memory_report(self):
     return {
@@ -502,11 +284,6 @@ def step_workspace_layout(
   if m.opt.disableflags & types.DisableBit.NATIVECCD:
     table[(types.GeomType.BOX, types.GeomType.BOX)] = CollisionType.PRIMITIVE
   pairs = [pair for pair, kind in table.items() if kind == CollisionType.CONVEX]
-  pair_count = lambda pair: m.geom_pair_type_count[upper_trid_index(len(types.GeomType), pair[0].value, pair[1].value)]
-  box = (types.GeomType.BOX, types.GeomType.BOX)
-  boxes = pair_count(box) if box in pairs else 0
-  iterations = 16 if boxes == sum(pair_count(pair) for pair in pairs) else m.opt.ccd_iterations
-  polygon, degree = (4, 3) if boxes > 0 else (0, 0)
   nw = d.nworld if world_capacity is None else world_capacity
   candidates = d.naconmax if contact_capacity is None else contact_capacity
   nc = d.naccdmax if ccd_capacity is None else ccd_capacity
@@ -516,24 +293,7 @@ def step_workspace_layout(
     ("collision_pair", (candidates,), wp.vec2i, "candidate"),
     ("collision_pairid", (candidates,), wp.vec2i, "candidate"),
     ("collision_worldid", (candidates,), int, "candidate"),
-    ("nccd", (len(types.GeomType) * (len(types.GeomType) + 1) // 2,), int, "global_counter"),
-    ("epa_vert", (nc, 10 + 2 * iterations), wp.vec3, "ccd"),
-    ("epa_vert_index", (nc, 10 + 2 * iterations), int, "ccd"),
-    ("epa_face", (nc, 6 + types.MJ_MAX_EPAFACES * iterations), int, "ccd"),
-    ("epa_pr", (nc, 6 + types.MJ_MAX_EPAFACES * iterations), wp.vec3, "ccd"),
-    ("epa_norm2", (nc, 6 + types.MJ_MAX_EPAFACES * iterations), float, "ccd"),
-    ("epa_horizon", (nc, types.MJ_MAX_EPAHORIZON), int, "ccd"),
-    ("multiccd_polygon", (nc, 2 * polygon), wp.vec3, "ccd"),
-    ("multiccd_clipped", (nc, 2 * polygon), wp.vec3, "ccd"),
-    ("multiccd_pnormal", (nc, polygon), wp.vec3, "ccd"),
-    ("multiccd_pdist", (nc, polygon), float, "ccd"),
-    ("multiccd_idx1", (nc, degree), int, "ccd"),
-    ("multiccd_idx2", (nc, degree), int, "ccd"),
-    ("multiccd_n1", (nc, degree), wp.vec3, "ccd"),
-    ("multiccd_n2", (nc, degree), wp.vec3, "ccd"),
-    ("multiccd_endvert", (nc, degree), wp.vec3, "ccd"),
-    ("multiccd_face1", (nc, polygon), wp.vec3, "ccd"),
-    ("multiccd_face2", (nc, polygon), wp.vec3, "ccd"),
+    *_convex_scratch_layout(m, pairs, nc)[2],
     ("awake_prev", d.body_awake.shape, int, "world"),
     ("awake_changed", (1,), int, "global_counter"),
     ("efc_nnz", (nw,), int, "world"),
@@ -587,7 +347,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   if wp.get_stream(data.qpos.device).is_capturing:
     raise RuntimeError("Prepare native step workspace before graph capture")
   if bindings is not None:
-    _validate_bindings(bindings)
+    step_execution._validate_bindings(bindings)
     if bindings.world_storage.device != data.qpos.device:
       raise ValueError("Native storage must use the Data device")
     for storage, name in (
