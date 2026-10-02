@@ -804,12 +804,7 @@ def com_pos(m: Model, d: Data, *, workspace=None):
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  wp.launch(
-    _subtree_com_init,
-    dim=(d.nworld, m.nbody),
-    inputs=[m.body_mass, d.xipos],
-    outputs=[d.subtree_com],
-  )
+  wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
@@ -820,12 +815,7 @@ def com_pos(m: Model, d: Data, *, workspace=None):
       outputs=[d.subtree_com],
     )
 
-  wp.launch(
-    _subtree_div,
-    dim=(d.nworld, m.nbody),
-    inputs=[m.body_subtreemass, d.subtree_com],
-    outputs=[d.subtree_com],
-  )
+  wp.launch(_subtree_div, dim=(d.nworld, m.nbody), inputs=[m.body_subtreemass, d.subtree_com], outputs=[d.subtree_com])
   wp.launch(
     _cinert,
     dim=(d.nworld, m.nbody),
@@ -1075,12 +1065,7 @@ def crb(m: Model, d: Data, *, workspace=None):
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
-    wp.launch(
-      _crb_accumulate,
-      dim=(d.nworld, body_tree.size),
-      inputs=[m.body_parentid, d.crb, body_tree],
-      outputs=[d.crb],
-    )
+    wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
 
   step_execution.fill_step_rows(bindings, d.M, 0, "world")
   wp.launch(
@@ -1358,12 +1343,7 @@ def _rne_cacc_world(m: Model, d: Data, *, bindings):
   if m.opt.disableflags & DisableBit.GRAVITY:
     step_execution.fill_step_rows(bindings, d.cacc, 0, "world")
   else:
-    wp.launch(
-      _cacc_world,
-      dim=[d.nworld],
-      inputs=[m.opt.gravity],
-      outputs=[d.cacc],
-    )
+    wp.launch(_cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc])
 
 
 @wp.kernel
@@ -1451,12 +1431,7 @@ def _cfrc(
 
 
 def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False):
-  wp.launch(
-    _cfrc,
-    dim=[d.nworld, m.nbody],
-    inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext],
-    outputs=[d.cfrc_int],
-  )
+  wp.launch(_cfrc, dim=[d.nworld, m.nbody], inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext], outputs=[d.cfrc_int])
 
 
 @wp.kernel
@@ -1480,10 +1455,7 @@ def _cfrc_backward(
 def _rne_cfrc_backward(m: Model, d: Data):
   for body_tree in reversed(m.body_tree):
     wp.launch(
-      _cfrc_backward,
-      dim=[d.nworld, body_tree.size],
-      inputs=[m.body_parentid, d.cfrc_int, body_tree],
-      outputs=[d.cfrc_int],
+      _cfrc_backward, dim=[d.nworld, body_tree.size], inputs=[m.body_parentid, d.cfrc_int, body_tree], outputs=[d.cfrc_int]
     )
 
 
@@ -1522,12 +1494,7 @@ def rne(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
   _rne_cacc_forward(m, d, flg_acc=flg_acc)
   _rne_cfrc(m, d)
   _rne_cfrc_backward(m, d)
-  wp.launch(
-    _qfrc_bias,
-    dim=[d.nworld, m.nv],
-    inputs=[m.dof_bodyid, d.cdof, d.cfrc_int],
-    outputs=[d.qfrc_bias],
-  )
+  wp.launch(_qfrc_bias, dim=[d.nworld, m.nv], inputs=[m.dof_bodyid, d.cdof, d.cfrc_int], outputs=[d.qfrc_bias])
 
 
 @wp.kernel
@@ -2641,12 +2608,7 @@ def com_vel(m: Model, d: Data, *, workspace=None):
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  wp.launch(
-    _comvel_root,
-    dim=(d.nworld, 6),
-    inputs=[],
-    outputs=[d.cvel],
-  )
+  wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
 
   wp.launch(
     _comvel_branch,

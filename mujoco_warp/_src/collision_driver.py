@@ -927,12 +927,7 @@ def nxn_broadphase(
     else:
       cond = workspace.arrays["awake_changed"]
       cond.zero_()
-    wp.launch(
-      _any_awake_changed,
-      dim=(d.nworld, m.nbody),
-      inputs=[d.body_awake, awake_prev],
-      outputs=[cond],
-    )
+    wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
 
   def _launch():
     wp.launch(

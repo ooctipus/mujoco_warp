@@ -3947,12 +3947,7 @@ def smooth_solve_compact(m: types.Model, d: types.Data):
     outputs=[d.cqLD, d.cx],
     block_dim=m.block_dim.update_gradient_cholesky_blocked,
   )
-  wp.launch(
-    _scatter_solution,
-    dim=(d.nworld, m.nv),
-    inputs=[d.dof_cdof, d.cx],
-    outputs=[d.qacc_smooth],
-  )
+  wp.launch(_scatter_solution, dim=(d.nworld, m.nv), inputs=[d.dof_cdof, d.cx], outputs=[d.qacc_smooth])
 
 
 @wp.kernel

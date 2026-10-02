@@ -36,4 +36,5 @@
 - Initialize physical quantities according to their equations, independently of compact/sparse storage flags. Test first-write behavior with poisoned storage and reject nonfinite values in numerical parity checks.
 
 - Line length limit is 128 characters. Docstring length limit is 100 characters.
+- Avoid formatting-only edits in integration diffs. Preserve the original layout of unchanged numerical calls when it fits the line limit. Remove trailing commas left by deleted wrappers when they force unnecessary argument-per-line formatting; manually review formatter output.
 - Prefer targeted, efficient tests over exhaustive edge-case coverage.
