@@ -16,7 +16,6 @@
 import warp as wp
 
 from mujoco_warp._src import math
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MINVAL
@@ -1369,20 +1368,17 @@ def _flex_passive_bend_interp(
 
 
 @event_scope
-def passive(m: Model, d: Data, *, workspace=None):
+def passive(m: Model, d: Data):
   """Adds all passive forces."""
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
   dsbl_spring = m.opt.disableflags & DisableBit.SPRING
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
   if dsbl_spring and dsbl_damper:
-    step_execution.fill_step_rows(bindings, d.qfrc_spring, 0, "world")
-    step_execution.fill_step_rows(bindings, d.qfrc_damper, 0, "world")
-    step_execution.fill_step_rows(bindings, d.qfrc_gravcomp, 0, "world")
-    step_execution.fill_step_rows(bindings, d.qfrc_fluid, 0, "world")
-    step_execution.fill_step_rows(bindings, d.qfrc_passive, 0, "world")
+    d.qfrc_spring.zero_()
+    d.qfrc_damper.zero_()
+    d.qfrc_gravcomp.zero_()
+    d.qfrc_fluid.zero_()
+    d.qfrc_passive.zero_()
     return
 
   wp.launch(
@@ -1551,7 +1547,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     )
 
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-  step_execution.fill_step_rows(bindings, d.qfrc_gravcomp, 0, "world")
+  d.qfrc_gravcomp.zero_()
   if gravity_enabled:
     wp.launch(
       _gravity_force,
@@ -1617,7 +1613,7 @@ def passive(m: Model, d: Data, *, workspace=None):
   if m.has_fluid:
     _fluid(m, d)
 
-  step_execution.fill_step_rows(bindings, d.qfrc_adhesion, 0, "world")
+  d.qfrc_adhesion.zero_()
   if m.flg_adhesion and (not (m.opt.disableflags & DisableBit.CONTACT)) and m.nv > 0:
     wp.launch(
       _qfrc_adhesion,

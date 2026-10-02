@@ -272,7 +272,7 @@ wheels = [
 [[package]]
 name = "gpu-components"
 version = "0.1.0"
-source = { editable = "../../gpu-components" }
+source = { editable = "../../gpu-components.wt/warp-capture" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -282,7 +282,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy" },
-    { name = "warp-lang", specifier = ">=1.17.0,<1.18" },
+    { name = "warp-lang", editable = "../../warp.wt/capture-launches" },
 ]
 
 [package.metadata.requires-dev]
@@ -810,7 +810,7 @@ dev = [
 requires-dist = [
     { name = "absl-py" },
     { name = "etils", extras = ["epath"] },
-    { name = "gpu-components", editable = "../../gpu-components" },
+    { name = "gpu-components", editable = "../../gpu-components.wt/warp-capture" },
     { name = "jax", marker = "extra == 'cpu'" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
     { name = "lsprotocol", marker = "extra == 'dev'", specifier = ">=2023.0.1,<2024.0.0" },
@@ -824,8 +824,8 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "warp-lang", specifier = ">=1.15", index = "https://pypi.nvidia.com/" },
-    { name = "warp-lang", marker = "extra == 'dev'", specifier = ">=1.15", index = "https://pypi.nvidia.com/" },
+    { name = "warp-lang", editable = "../../warp.wt/capture-launches" },
+    { name = "warp-lang", marker = "extra == 'dev'", editable = "../../warp.wt/capture-launches" },
 ]
 provides-extras = ["dev", "cpu", "cuda"]
 
@@ -1713,18 +1713,39 @@ wheels = [
 
 [[package]]
 name = "warp-lang"
-version = "1.17.0"
-source = { registry = "https://pypi.nvidia.com/" }
+source = { editable = "../../warp.wt/capture-launches" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-wheels = [
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:f2fec43afb81caa2190c0b7fa3aaf4d869f3599839f0c40b9ead84331f91e993" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:47cd93636828dd16e55eeb4e77a0e3547b5fb0f383000a3d228629df68f28fd8" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:5051271048da956a8b94e2db9771ce60ce9591a3ac5bb49037f3d6812d1eea00" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.17.0-py3-none-win_amd64.whl", hash = "sha256:ca35c82242a7553046f09023bbe56750b5c3d9af72625bd1a905a56d3189771d" },
+
+[package.metadata]
+requires-dist = [
+    { name = "blosc", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and extra == 'examples') or (sys_platform != 'win32' and extra == 'examples')", specifier = ">=1.11.1" },
+    { name = "coverage", extras = ["toml"], marker = "extra == 'dev'" },
+    { name = "matplotlib", marker = "extra == 'examples'", specifier = ">=3.7.5" },
+    { name = "ml-dtypes", marker = "extra == 'dev'", specifier = ">=0.5.4" },
+    { name = "myst-parser", marker = "extra == 'docs'" },
+    { name = "numpy" },
+    { name = "nvidia-sphinx-theme", marker = "extra == 'docs'" },
+    { name = "nvtx", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and extra == 'dev') or (sys_platform != 'win32' and extra == 'dev')" },
+    { name = "pillow", marker = "extra == 'examples'", specifier = ">=10.4.0" },
+    { name = "pre-commit", marker = "extra == 'docs'" },
+    { name = "psutil", marker = "extra == 'examples'", specifier = ">=7.1.0" },
+    { name = "pyglet", marker = "extra == 'examples'", specifier = ">=2.1.9" },
+    { name = "sphinx-copybutton", marker = "extra == 'docs'" },
+    { name = "torch", marker = "extra == 'torch-cu12'", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "warp-lang", extra = "torch-cu12" } },
+    { name = "torch", marker = "extra == 'torch-cu13'", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "warp-lang", extra = "torch-cu13" } },
+    { name = "usd-core", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'win32' and extra == 'benchmark') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'benchmark') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'benchmark')", specifier = ">=25.5" },
+    { name = "usd-core", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'win32' and extra == 'examples') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'examples') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'examples')", specifier = ">=25.5" },
+    { name = "usd-exchange", marker = "python_full_version >= '3.10' and python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'benchmark'", specifier = ">=2.2" },
+    { name = "usd-exchange", marker = "python_full_version >= '3.10' and python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'examples'", specifier = ">=2.2" },
+    { name = "warp-lang", extras = ["docs"], marker = "extra == 'dev'" },
+    { name = "warp-lang", extras = ["examples"], marker = "extra == 'dev'" },
+    { name = "warp-lang", extras = ["examples"], marker = "extra == 'torch-cu12'" },
+    { name = "warp-lang", extras = ["examples"], marker = "extra == 'torch-cu13'" },
 ]
+provides-extras = ["docs", "benchmark", "examples", "torch-cu12", "torch-cu13", "dev"]
 
 [[package]]
 name = "websockets"

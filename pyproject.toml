@@ -47,8 +47,8 @@ explicit = true
 
 [tool.uv.sources]
 # Development checkout for the unpublished component extraction.
-gpu-components = {path = "../../gpu-components", editable = true}
-warp-lang = {index = "nvidia"}
+gpu-components = {path = "../../gpu-components.wt/warp-capture", editable = true}
+warp-lang = {path = "../../warp.wt/capture-launches", editable = true}
 mujoco = {index = "mujoco"}
 
 [project.optional-dependencies]

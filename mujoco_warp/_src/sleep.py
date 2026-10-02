@@ -15,7 +15,6 @@
 
 import warp as wp
 
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import types
 from mujoco_warp._src.types import EqType
 from mujoco_warp._src.types import ObjType
@@ -1223,9 +1222,8 @@ def _build_cycles(  # kernel_analyzer: ignore
 
 
 @event_scope
-def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=None):
+def sleep(m: types.Model, d: types.Data, *, island_can_sleep: wp.array2d[int] | None = None):
   """Puts trees to sleep according to velocity tolerance."""
-  bindings = None if workspace is None else workspace.bindings
   # 1. Sweep over awake trees and increment counter if they can sleep
   wp.launch(
     _sweep_awake_trees,
@@ -1249,7 +1247,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
   if island_can_sleep is None:
     island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
   else:
-    step_execution.fill_step_rows(bindings, island_can_sleep, 1, "world")
+    island_can_sleep.fill_(1)
   wp.launch(
     _check_island_can_sleep,
     dim=(d.nworld, m.ntree),

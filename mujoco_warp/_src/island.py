@@ -13,11 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
-
 import warp as wp
 
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import EqType
@@ -360,19 +357,9 @@ def _zero_island_counts(
   nidof_out[worldid] = 0
 
 
-def island(m: types.Model, d: types.Data, *, workspace=None):
+@event_scope
+def island(m: types.Model, d: types.Data, *, parent: wp.array2d[int] | None = None):
   """Discover constraint islands."""
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  parent = None
-  if m.ntree:
-    parent = wp.empty((d.nworld, m.ntree), dtype=int) if workspace is None else workspace.arrays["island_parent"]
-  _island(m, d, parent)
-
-
-@functools.partial(event_scope, name="island")
-def _island(m: types.Model, d: types.Data, parent: wp.array2d[int] | None):
-  """Discover islands using the caller's disjoint-set scratch."""
   if m.ntree == 0:
     wp.launch(
       _zero_island_counts,
@@ -381,7 +368,7 @@ def _island(m: types.Model, d: types.Data, parent: wp.array2d[int] | None):
     )
     return
 
-  direct_dsu(m, d, parent)
+  direct_dsu(m, d, wp.empty((d.nworld, m.ntree), dtype=int) if parent is None else parent)
 
 
 @wp.kernel
@@ -754,7 +741,7 @@ def _init_efc_arrays(
 
 
 @event_scope
-def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, workspace=None):
+def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree: wp.array2d[int] | None = None):
   """Compute DOF/constraint island mappings after island discovery.
 
   Populates d.dof_island, d.efc.island, d.island_idofadr, d.island_dofadr,
@@ -763,12 +750,10 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, work
   d.map_iefc2efc, d.efc_islandid.
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
     m: Model.
     d: Data.
     efc_tree: Optional prepared constraint-to-tree scratch.
   """
-  bindings = None if workspace is None else workspace.bindings
   # Ensure dof_islandid / efc_islandid are allocated at the right shape
   if d.dof_islandid.shape[1] != m.nv:
     d.dof_islandid = wp.empty((d.nworld, m.nv), dtype=int)
@@ -851,7 +836,7 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, work
   )
 
   # 4. Map DOFs
-  step_execution.fill_step_rows(bindings, d.island_dofadr, m.nv, "world")
+  d.island_dofadr.fill_(m.nv)
   wp.launch(
     _island_map_dofs,
     dim=(d.nworld, m.nv),

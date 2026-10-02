@@ -13,11 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 
+import dataclasses
 from typing import Optional
 
 import warp as wp
 
-from mujoco_warp._src import step_execution
+from mujoco_warp._src.collision_convex import _ConvexScratch
 from mujoco_warp._src.collision_convex import convex_narrowphase
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import create_collision_context
@@ -891,7 +892,7 @@ def nxn_broadphase(
   ctx: CollisionContext,
   awake_prev: Optional[wp.array] = None,
   *,
-  workspace=None,
+  awake_changed: wp.array[int] | None = None,
 ):
   """Runs broadphase collision detection using a brute-force N-squared approach.
 
@@ -911,8 +912,6 @@ def nxn_broadphase(
   wholesale on steps where nothing woke; otherwise it runs unconditionally and the per-pair filter
   restricts the emitted pairs.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP)
   incremental = awake_prev is not None
   awake_prev_in = awake_prev if awake_prev is not None else d.body_awake
@@ -922,11 +921,8 @@ def nxn_broadphase(
   # (nothing sleeps between the passes), so the condition is derived here rather than threaded in.
   cond = None
   if incremental and m.opt.graph_conditional:
-    if workspace is None:
-      cond = wp.zeros(1, dtype=int)
-    else:
-      cond = workspace.arrays["awake_changed"]
-      cond.zero_()
+    cond = wp.empty(1, dtype=int) if awake_changed is None else awake_changed
+    cond.zero_()
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
 
   def _launch():
@@ -975,7 +971,7 @@ def nxn_broadphase(
     _launch()
 
 
-def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
+def _narrowphase(m: Model, d: Data, ctx: CollisionContext, convex_scratch: _ConvexScratch | None = None):
   collision_table = MJ_COLLISION_TABLE
   if m.opt.disableflags & DisableBit.NATIVECCD:
     collision_table = collision_table.copy()
@@ -986,17 +982,20 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
 
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
-  convex_narrowphase(
-    m,
-    d,
-    ctx,
-    convex_pairs,
-    scratch=None if workspace is None else workspace.convex,
-  )
+  convex_narrowphase(m, d, ctx, convex_pairs, scratch=convex_scratch)
   primitive_narrowphase(m, d, ctx, primitive_pairs)
 
   if m.has_sdf_geom:
     sdf_narrowphase(m, d, ctx)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _CollisionScratch:
+  """Borrowed broadphase candidates, convex scratch and wake-change counter."""
+
+  context: CollisionContext
+  convex: _ConvexScratch
+  awake_changed: wp.array[int]
 
 
 @event_scope
@@ -1005,7 +1004,7 @@ def collision(
   d: Data,
   awake_prev: Optional[wp.array] = None,
   *,
-  workspace=None,
+  scratch: _CollisionScratch | None = None,
 ):
   """Runs the full collision detection pipeline.
 
@@ -1027,14 +1026,12 @@ def collision(
   incremental sleeping pass: contacts are appended to the existing buffer and only pairs involving
   a newly-awakened body are emitted.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
   if d.naconmax == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
     d.nacon.zero_()
     return
 
   # TODO(team): create context outside collision?
-  ctx = create_collision_context(d.naconmax) if workspace is None else workspace._collision
+  ctx = create_collision_context(d.naconmax) if scratch is None else scratch.context
 
   incremental = awake_prev is not None
 
@@ -1048,11 +1045,11 @@ def collision(
     d.nacon.zero_()
 
   if m.opt.broadphase == BroadphaseType.NXN:
-    nxn_broadphase(m, d, ctx, awake_prev, workspace=workspace)
+    nxn_broadphase(m, d, ctx, awake_prev, awake_changed=None if scratch is None else scratch.awake_changed)
   else:
     sap_broadphase(m, d, ctx, awake_prev)
 
-  _narrowphase(m, d, ctx, workspace=workspace)
+  _narrowphase(m, d, ctx, convex_scratch=None if scratch is None else scratch.convex)
 
   # Flex collision is not sleeping-aware: pass 1 emits every flex contact regardless of awake state,
   # so the incremental pass has nothing to add (and re-running it would duplicate those contacts).

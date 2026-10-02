@@ -30,14 +30,13 @@ from mujoco_warp._src import passive
 from mujoco_warp._src import sleep
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
-from mujoco_warp._src import step_execution as native_execution
 from mujoco_warp._src import step_program
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src import warp_util
 from mujoco_warp._src import workspace as native_workspace
-from mujoco_warp._src.step_execution import StepBindings
-from mujoco_warp._src.step_execution import resolve_step_counts
+from mujoco_warp._src.step_program import StepBindings
+from mujoco_warp._src.step_program import resolve_step_counts
 from mujoco_warp._src.workspace import WorkspaceFieldSpec
 from mujoco_warp._src.workspace import _StepWorkspace
 from mujoco_warp._src.workspace import make_step_workspace
@@ -66,7 +65,7 @@ def _convex_model(pair=(types.GeomType.BOX, types.GeomType.BOX), *, multiccd=Fal
   )
 
 
-def _collision_scratch_specs():
+def _minimal_scratch_specs():
   pair = (types.GeomType.BOX, types.GeomType.BOX)
   shapes = collision_convex._convex_scratch_shapes(_convex_model(pair), [pair], 2)[2]
   hints = typing.get_type_hints(collision_convex._ConvexScratch)
@@ -77,6 +76,16 @@ def _collision_scratch_specs():
     *(
       WorkspaceFieldSpec(name, shape, hints[name].dtype, "global_counter" if name == "nccd" else "ccd")
       for name, shape in shapes.items()
+    ),
+    WorkspaceFieldSpec("awake_changed", (1,), wp.int32, "global_counter"),
+    WorkspaceFieldSpec("nsolving", (1,), wp.int32, "global_counter"),
+    *(WorkspaceFieldSpec(name, (17,), wp.int32, "world") for name in ("efc_nnz", "moment_nnz")),
+    *(
+      WorkspaceFieldSpec(name, (17, 1), wp.int32, "world")
+      for name in ("awake_prev", "island_parent", "island_can_sleep", "efc_tree")
+    ),
+    *(
+      WorkspaceFieldSpec(name, (17, 1), wp.float32, "world") for name in ("qDeriv", "qLD", "qLDiagInv", "qacc", "actuator_vel")
     ),
   )
 
@@ -147,6 +156,11 @@ def _native_kernel():
   )
 
 
+def _program_workspace(bindings):
+  data = SimpleNamespace(nacon=wp.zeros(1, dtype=int, device="cpu"), ncollision=wp.zeros(1, dtype=int, device="cpu"))
+  return SimpleNamespace(bindings=bindings, model=Metadata(), data=data, arrays={}, _specs=())
+
+
 @contextmanager
 def _binding_capture(bindings):
   bindings.updates = _update_table(bindings)
@@ -158,7 +172,7 @@ def _binding_capture(bindings):
   graph.device = bindings.world_storage.device
 
   with (
-    patch.object(native_execution.graph_ops, "current_capture", return_value=graph),
+    patch.object(step_program.graph_ops, "current_capture", return_value=graph),
     patch.object(wp, "get_stream", return_value=None),
   ):
     yield graph
@@ -167,7 +181,7 @@ def _binding_capture(bindings):
 class NativeBindingsTest(unittest.TestCase):
   def test_physics_launches_stay_plain_and_prepared_signatures_have_resource_purpose(self):
     """Gate the native execution boundary independently of numerical output parity."""
-    for path in Path(native_execution.__file__).parent.glob("*.py"):
+    for path in Path(step_program.__file__).parent.glob("*.py"):
       if path.name.endswith("_test.py"):
         continue
       with self.subTest(module=path.name):
@@ -224,8 +238,8 @@ class NativeBindingsTest(unittest.TestCase):
     self.assertFalse(hasattr(mjw, "validate_step_launch"))
     self.assertFalse(hasattr(mjw, "_resolve_launch_counts"))
     self.assertFalse(hasattr(mjw, "bind_step_launch"))
-    self.assertFalse(hasattr(native_execution, "bind_step_launch"))
-    self.assertFalse(hasattr(native_execution, "_record_launch"))
+    self.assertFalse(hasattr(step_program, "bind_step_launch"))
+    self.assertFalse(hasattr(step_program, "_record_launch"))
     self.assertFalse(hasattr(mjw, "launch_step_kernel"))
     self.assertIs(mjw.resolve_step_counts, resolve_step_counts)
     self.assertIs(mjw.bind_step_program, step_program.bind_step_program)
@@ -246,63 +260,42 @@ class NativeBindingsTest(unittest.TestCase):
     second = dataclasses.replace(first)
     self.assertNotEqual(first, second)
     self.assertIs(weakref.ref(first)(), first)
-    self.assertIs(StepBindings.__annotations__["world_storage"], FieldStorage)
-    self.assertEqual(StepBindings.__annotations__["updates"], GraphUpdateTable | None)
-    self.assertFalse(any(name in inspect.getsource(native_execution) for name in ("import newton", "recorder=")))
+    self.assertIs(typing.get_type_hints(StepBindings)["world_storage"], FieldStorage)
+    self.assertEqual(typing.get_type_hints(StepBindings)["updates"], GraphUpdateTable | None)
+    self.assertFalse(any(name in inspect.getsource(step_program) for name in ("import newton", "recorder=")))
 
-  def test_numerical_helpers_borrow_only_resources_they_use(self):
-    for operation in (
-      solver._linesearch_iterative,
-      solver._update_constraint,
-      solver._cholesky_factorize_solve,
-      solver._compact_gather,
-      forward._energy_pos,
-      smooth._rne_cacc_world,
-      smooth._rne_cacc_forward,
-      smooth._rne_cfrc,
-      smooth._rne_cfrc_backward,
-      smooth._factor_solve_blocks,
+  def test_numerical_modules_have_no_execution_or_workspace_coupling(self):
+    for module in (forward.collision_driver, constraint, derivative, forward, island, passive, sleep, smooth, solver):
+      with self.subTest(module=module.__name__):
+        tree = ast.parse(inspect.getsource(module))
+        for node in ast.walk(tree):
+          if isinstance(node, ast.Name):
+            self.assertNotIn(node.id, ("workspace", "bindings", "step_execution", "step_program", "gpu_components"))
+          elif isinstance(node, ast.ImportFrom):
+            self.assertFalse((node.module or "").startswith("gpu_components"))
+            self.assertFalse(any(alias.name in ("workspace", "step_execution", "step_program") for alias in node.names))
+    for name in ("fill_step_rows", "copy_step_rows", "_begin_recording"):
+      self.assertFalse(hasattr(step_program, name))
+    for module, name in (
+      (constraint, "_make_constraint"),
+      (derivative, "_deriv_smooth_vel"),
+      (island, "_island"),
+      (smooth, "_compute_transmission"),
     ):
-      with self.subTest(operation=operation.__name__):
-        parameters = inspect.signature(operation).parameters
-        needs_bounded_memory = operation in (solver._compact_gather, forward._energy_pos, smooth._rne_cacc_world)
-        self.assertEqual("bindings" in parameters, needs_bounded_memory)
-        self.assertNotIn("workspace", parameters)
-        self.assertFalse(
-          any(
-            isinstance(node, ast.Name) and node.id == "workspace" for node in ast.walk(ast.parse(inspect.getsource(operation)))
-          )
-        )
-    for module in (solver, passive, island, forward, smooth, sleep):
-      for node in ast.walk(ast.parse(inspect.getsource(module))):
-        if not isinstance(node, ast.If) or not node.orelse:
-          continue
-        eager_calls = [item.value for item in node.body if isinstance(item, ast.Expr) and isinstance(item.value, ast.Call)]
-        bounded_calls = [item.value for item in node.orelse if isinstance(item, ast.Expr) and isinstance(item.value, ast.Call)]
-        if len(eager_calls) != len(node.body) or len(bounded_calls) != len(node.orelse):
-          continue
-        duplicate = all(
-          isinstance(call.func, ast.Attribute) and call.func.attr in ("zero_", "fill_", "copy") for call in eager_calls
-        ) and all(
-          ast.unparse(call.func) in ("step_execution.fill_step_rows", "step_execution.copy_step_rows") for call in bounded_calls
-        )
-        self.assertFalse(duplicate, f"{module.__name__}:{node.lineno}: memory operations already support eager bindings")
+      self.assertFalse(hasattr(module, name), "Allocation-only wrappers must not survive as compatibility layers")
 
   def test_execution_dependencies_and_exports_have_one_canonical_owner(self):
-    self.assertEqual(StepBindings.__module__, native_execution.__name__)
-    tree = ast.parse(inspect.getsource(native_execution))
+    self.assertEqual(StepBindings.__module__, step_program.__name__)
+    self.assertFalse(Path(step_program.__file__).with_name("step_execution.py").exists())
+    tree = ast.parse(inspect.getsource(step_program))
     for node in ast.walk(tree):
       if isinstance(node, ast.Import):
         imports = [alias.name for alias in node.names]
       elif isinstance(node, ast.ImportFrom):
-        imports = [node.module or ""]
-        self.assertEqual(node.level, 0, "Native execution must not depend on neighboring physics modules")
+        imports = [node.module or "", *(f"{node.module}.{alias.name}" for alias in node.names)]
       else:
         continue
-      self.assertFalse(
-        any(name == "mujoco_warp" or name.startswith("mujoco_warp.") for name in imports),
-        "Execution may depend on generic components and Warp, never workspace or physics stages",
-      )
+      self.assertNotIn("mujoco_warp._src.workspace", imports, "Preparation depends on program declarations, never the reverse")
     for name in (
       "StepBindings",
       "resolve_step_counts",
@@ -327,7 +320,7 @@ class NativeBindingsTest(unittest.TestCase):
         imports.add(node.module)
         imports.update(f"{node.module}.{alias.name}" for alias in node.names)
     self.assertNotIn("mujoco_warp._src.workspace", imports)
-    self.assertNotIn("mujoco_warp._src.step_execution", imports)
+    self.assertNotIn("mujoco_warp._src.step_program", imports)
 
   def test_invalid_declarations_preflight_without_emission_or_poisoning(self):
     cases = [
@@ -342,7 +335,7 @@ class NativeBindingsTest(unittest.TestCase):
       ("world", 0, {str(index): "world" for index in range(5)}),
     ]
     bindings, kernel = _step_bindings(), _native_kernel()
-    with patch.object(native_execution.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
+    with patch.object(step_program.graph_ops, "register_last_kernel_node", side_effect=AssertionError("node claimed")):
       for domain, axis, parameters in cases:
         with self.subTest(domain=domain, axis=axis, parameters=parameters), self.assertRaises(ValueError):
           resolve_step_counts(bindings, kernel, domain, axis, parameters)
@@ -353,94 +346,10 @@ class NativeBindingsTest(unittest.TestCase):
     self.assertEqual(bindings.bindings, [])
     self.assertIsNone(bindings._recording_binding)
 
-  def test_bounded_memory_operations_use_explicit_native_domain_sources(self):
-    bindings = _step_bindings()
-    array, source = (wp.empty(12, dtype=wp.float32, device="cpu") for _ in range(2))
-    with (
-      _binding_capture(bindings),
-      patch.object(native_execution.field_ops, "fill") as fill,
-      patch.object(native_execution.field_ops, "copy") as copy,
-      patch.object(native_execution.field_ops, "lookup", return_value=SimpleNamespace(name="field")),
-    ):
-      self.assertIs(native_execution.fill_step_rows(bindings, array, 1, "world"), array)
-      native_execution.fill_step_rows(bindings, array, 0, "candidate")
-      native_execution.copy_step_rows(bindings, array, source, "ccd")
-      self.assertIs(fill.call_args_list[0].args[0], bindings.world_storage)
-      self.assertIs(fill.call_args_list[0].kwargs["count"], bindings.world_storage.protected_count)
-      self.assertIs(fill.call_args_list[1].kwargs["count"], bindings.contact_storage.ready_count)
-      self.assertIs(copy.call_args.kwargs["count"], bindings.ccd_storage.ready_count)
-      empty = wp.empty(0, dtype=wp.float32, device="cpu")
-      native_execution.fill_step_rows(bindings, empty, 0, "world")
-      native_execution.copy_step_rows(bindings, empty, empty, "world")
-      self.assertEqual(fill.call_count, 2)
-      self.assertEqual(copy.call_count, 1)
-
-  def test_eager_zero_uses_memset_path_and_negative_zero_keeps_its_bits(self):
-    array = wp.full(4, 7.0, dtype=wp.float32, device="cpu")
-    with patch.object(array, "fill_", side_effect=AssertionError("Zeroing must keep Warp's zero_ fast path")):
-      self.assertIs(native_execution.fill_step_rows(None, array, 0, "world"), array)
-    np.testing.assert_array_equal(array.numpy().view(np.uint32), np.zeros(4, dtype=np.uint32))
-    native_execution.fill_step_rows(None, array, -0.0, "world")
-    np.testing.assert_array_equal(array.numpy().view(np.uint32), np.full(4, 0x80000000, dtype=np.uint32))
-
-  def test_empty_memory_operations_validate_owner_domain_and_descriptor_without_recording(self):
-    """An empty payload is not an escape from ownership admission or descriptor compatibility."""
-    empty = wp.empty(0, dtype=wp.float32, device="cpu")
-    nonleading_empty = wp.empty((17, 0), dtype=wp.float32, device="cpu")
-    bindings = _step_bindings()
-    with (
-      patch.object(native_execution, "_begin_recording", side_effect=AssertionError("Empty operation recorded")),
-      patch.object(native_execution.field_ops, "fill", side_effect=AssertionError("Empty fill emitted")),
-      patch.object(native_execution.field_ops, "copy", side_effect=AssertionError("Empty copy emitted")),
-    ):
-      self.assertIs(native_execution.fill_step_rows(bindings, empty, 0, "world"), empty)
-      native_execution.copy_step_rows(bindings, empty, empty, "world")
-      self.assertIsNone(bindings._recording_binding)
-      for operation in ("fill", "copy"):
-        for problem in ("closed", "quarantined", "domain", "unregistered", "source"):
-          if problem == "source" and operation == "fill":
-            continue
-          bindings = _step_bindings()
-          bindings.world_storage.closed = problem == "closed"
-          bindings.world_storage.service_failed = problem == "quarantined"
-          array = nonleading_empty if problem == "unregistered" else empty
-          source = wp.empty(0, dtype=wp.int32, device="cpu") if problem == "source" else array
-          domain = "missing" if problem == "domain" else "world"
-          with self.subTest(operation=operation, problem=problem), self.assertRaises((ValueError, RuntimeError)):
-            if operation == "fill":
-              native_execution.fill_step_rows(bindings, array, 0, domain)
-            else:
-              native_execution.copy_step_rows(bindings, array, source, domain)
-
-  def test_post_emission_failures_poison_native_and_shared_graph_without_fallback(self):
-    for name in ("fill", "copy"):
-      for error in (ArithmeticError, KeyboardInterrupt):
-        bindings = _step_bindings()
-        array = wp.empty(12, dtype=wp.float32, device="cpu")
-        operation = {
-          "fill": lambda: native_execution.fill_step_rows(bindings, array, 0, "world"),
-          "copy": lambda: native_execution.copy_step_rows(bindings, array, array, "world"),
-        }[name]
-        with (
-          self.subTest(operation=name, error=error),
-          _binding_capture(bindings) as graph,
-          patch.object(native_execution.field_ops, "fill", side_effect=error("recording failed")),
-          patch.object(native_execution.field_ops, "copy", side_effect=error("recording failed")),
-          patch.object(wp, "copy", side_effect=AssertionError("Unexpected dense copy")),
-        ):
-          with self.assertRaisesRegex(error, "recording failed"):
-            operation()
-          self.assertTrue(bindings.recording_failed)
-          self.assertTrue(graph._preparation_failed)
-          self.assertTrue(any(owner is bindings for owner in graph._resource_owners))
-          with self.assertRaisesRegex(RuntimeError, "failed recording"):
-            resolve_step_counts(bindings, _native_kernel(), "world", 0, {})
-
   def test_recording_rejects_replaced_sources_updater_or_bindings_but_allows_count_values(self):
     bindings, kernel = _step_bindings(), _native_kernel()
-    with _binding_capture(bindings):
-      with patch.object(native_execution.field_ops, "fill"):
-        native_execution.fill_step_rows(bindings, wp.empty(1, device="cpu"), 0, "world")
+    with _binding_capture(bindings) as graph:
+      step_program._retain_bindings(bindings, graph)
       for owner, name, value in (
         (bindings, "updates", _update_table(bindings)),
         (bindings, "world_storage", dataclasses.replace(bindings.world_storage)),
@@ -492,8 +401,7 @@ class NativeBindingsTest(unittest.TestCase):
     self.assertFalse(bindings.recording_failed)
     bindings = _step_bindings()
     with _binding_capture(bindings) as graph:
-      with patch.object(native_execution.field_ops, "fill"):
-        native_execution.fill_step_rows(bindings, wp.empty(1, device="cpu"), 0, "world")
+      step_program._retain_bindings(bindings, graph)
       bindings.world_storage = object()
       with self.assertRaisesRegex(TypeError, "borrow FieldStorage"):
         resolve_step_counts(bindings, _native_kernel(), "world", 0, {})
@@ -501,112 +409,113 @@ class NativeBindingsTest(unittest.TestCase):
 
 
 class StepProgramTest(unittest.TestCase):
-  def test_native_domains_resolve_independent_sources_at_composition(self):
+  def test_native_domains_resolve_independent_sources_in_one_batch(self):
     bindings = _step_bindings()
     bindings.contact_storage.capacity, bindings.ccd_storage.capacity = 19, 23
-    ccd = collision_convex.ccd_kernel_builder(6, 6, 35, 16, False, 0, 32, 0)
-    kernels = (smooth._kinematics_branch, sleep._wake_collision_kernel, ccd, forward._next_time_builder(0))
+    kernels = (
+      smooth._kinematics_branch,
+      sleep._wake_collision_kernel,
+      collision_convex.ccd_kernel_builder(6, 6, 35, 16, False, 0, 32, 0),
+      forward._next_time_builder(0),
+    )
     records = tuple(
       wp.CapturedLaunch(kernel, dim, index + 1, 120, (), (), 128, 0, False)
       for index, (kernel, dim) in enumerate(zip(kernels, ((17, 4), (19,), (8192,), (17,))))
     )
-    # Preparation may regenerate future factories after a module option change.
-    # The captured records must still identify their old, retained kernels.
     warp_util.clear_kernel_cache()
     with (
       _binding_capture(bindings) as graph,
-      patch.object(wp, "capture_get_launches", return_value=records),
-      patch.object(step_program.field_ops, "validate_captured_operation", return_value=False),
-      patch.object(step_program.graph_ops, "adopt_launch", side_effect=[object() for _ in records]) as adopt,
+      patch.object(step_program, "validate_step_workspace"),
+      patch.object(wp, "capture_get_memory_operations", return_value=()),
+      patch.object(step_program.graph_ops, "adopt_launches", return_value=(object(),) * 4) as adopt,
     ):
-      step_program.bind_step_program(bindings, graph, records)
+      workspace = _program_workspace(bindings)
+      step_program.bind_step_program(workspace, graph, records)
+      adopt.assert_called_once()
+      self.assertEqual(adopt.call_args.args, (bindings.updates, graph, records))
+      extents = adopt.call_args.kwargs["extents"]
+      self.assertEqual([(index, axis) for index, axis, _ in extents], [(0, 0), (1, 0), (3, 0)])
+      self.assertIs(extents[0][2], bindings.world_storage.protected_count)
+      self.assertIs(extents[1][2], bindings.contact_storage.ready_count)
+      for index, parameter in adopt.call_args.kwargs["parameters"]:
+        self.assertIn(index, (2, 3))
+        label = records[index].kernel.adj.args[parameter.argument_index - 1].label
+        expected = {
+          "nworld_in": bindings.world_storage.protected_count,
+          "naconmax_in": bindings.contact_storage.ready_count,
+          "naccdmax_in": bindings.ccd_storage.ready_count,
+        }
+        self.assertIs(parameter.source, expected[label])
       self.assertEqual(len(bindings.bindings), 4)
-      calls = adopt.call_args_list
-      for call, record in zip(calls, records):
-        self.assertIs(call.args[0], bindings.updates)
-        self.assertIs(call.args[1], graph)
-        self.assertIs(call.args[2], record)
-      self.assertIs(calls[0].kwargs["extent_source"], bindings.world_storage.protected_count)
-      self.assertIs(calls[1].kwargs["extent_source"], bindings.contact_storage.ready_count)
-      self.assertIsNone(calls[2].kwargs["extent_source"])
-      self.assertIsNone(calls[2].kwargs["extent_axis"])
-      for call, expected in (
-        (calls[2], (("naconmax_in", bindings.contact_storage), ("naccdmax_in", bindings.ccd_storage))),
-        (calls[3], (("nworld_in", bindings.world_storage), ("naconmax_in", bindings.contact_storage))),
-      ):
-        labels = [argument.label for argument in call.args[2].kernel.adj.args]
-        for parameter, (label, storage) in zip(call.kwargs["parameters"], expected):
-          self.assertEqual(parameter.argument_index, labels.index(label) + 1)
-          count = storage.protected_count if storage is bindings.world_storage else storage.ready_count
-          self.assertIs(parameter.source, count)
-          self.assertEqual(parameter.maximum, storage.capacity)
-      self.assertEqual(sum(owner is bindings for owner in graph._resource_owners), 1)
-      for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
-        self.assertIn(graph, storage._graphs)
+      self.assertEqual(adopt.call_args.kwargs["fixed"], [])
 
-  def test_unknown_or_foreign_records_fail_before_publication(self):
+  def test_native_declaration_or_adoption_failures_prevent_publication(self):
     kernel = smooth._kinematics_branch
     record = wp.CapturedLaunch(kernel, (17, 4), 1, 120, (), (), 128, 0, False)
-    for problem in ("unknown", "copied", "duplicate", "capacity", "mutable_sequence", "adoption"):
+    for problem in ("unknown", "capacity", "mutable_sequence", "adoption"):
       bindings = _step_bindings()
       launches = (record,)
       if problem == "unknown":
         launches = (dataclasses.replace(record, kernel=Mock(key=kernel.key)),)
-      elif problem == "copied":
-        launches = (dataclasses.replace(record),)
-      elif problem == "duplicate":
-        launches = (record, record)
       elif problem == "capacity":
         launches = (dataclasses.replace(record, dim=(16, 4)),)
       elif problem == "mutable_sequence":
         launches = [record]
-      captured = (record,) if problem == "copied" else tuple(launches)
       with (
         self.subTest(problem=problem),
         _binding_capture(bindings) as graph,
-        patch.object(wp, "capture_get_launches", return_value=captured),
-        patch.object(step_program.field_ops, "validate_captured_operation", return_value=False),
-        patch.object(step_program.graph_ops, "adopt_launch", side_effect=ArithmeticError("failed adoption")) as adopt,
+        patch.object(step_program, "validate_step_workspace"),
+        patch.object(wp, "capture_get_memory_operations", return_value=()),
+        patch.object(step_program.graph_ops, "adopt_launches", side_effect=ArithmeticError("failed adoption")) as adopt,
       ):
         with self.assertRaises((ValueError, TypeError, ArithmeticError)):
-          step_program.bind_step_program(bindings, graph, launches)
+          step_program.bind_step_program(_program_workspace(bindings), graph, launches)
         self.assertTrue(bindings.recording_failed)
         self.assertTrue(graph._preparation_failed)
         self.assertEqual(bindings.bindings, [])
         self.assertEqual(adopt.call_count, int(problem == "adoption"))
 
-  def test_field_operations_require_validated_storage_and_count_operands(self):
-    record = wp.CapturedLaunch(Mock(key="field_operation"), (17,), 1, 120, (), (), 128, 0, False)
-    for valid in (False, True):
+  def test_memory_records_require_exact_domains_and_explicit_global_operands(self):
+    record = wp.CapturedLaunch(Mock(key="memory_operation"), (17,), 1, 120, (), (), 128, 0, False)
+    operation = SimpleNamespace(launch=record)
+    for mode in ("dynamic", "fixed", "invalid"):
       bindings = _step_bindings()
+      workspace = _program_workspace(bindings)
+      counter = wp.zeros(1, dtype=int, device="cpu")
+      workspace.arrays = {"nsolving": counter}
+      workspace._specs = (WorkspaceFieldSpec("nsolving", (1,), wp.int32, "global_counter"),)
       with (
-        self.subTest(valid=valid),
+        self.subTest(mode=mode),
         _binding_capture(bindings) as graph,
-        patch.object(wp, "capture_get_launches", return_value=(record,)),
+        patch.object(step_program, "validate_step_workspace"),
+        patch.object(wp, "capture_get_memory_operations", return_value=(operation,)),
         patch.object(
           step_program.field_ops,
-          "validate_captured_operation",
-          return_value=True,
-          side_effect=None if valid else ValueError("foreign count"),
-        ) as validate,
-        patch.object(step_program.graph_ops, "adopt_launch") as adopt,
+          "memory_operation_extents",
+          return_value=((0, bindings.world_storage.protected_count),) if mode == "dynamic" else ((None, None),),
+          side_effect=ValueError("foreign operand") if mode == "invalid" else None,
+        ) as extent,
+        patch.object(step_program.graph_ops, "adopt_launches", return_value=(object(),)) as adopt,
       ):
-        if valid:
-          step_program.bind_step_program(bindings, graph, (record,))
-          self.assertFalse(bindings.recording_failed)
-        else:
-          with self.assertRaisesRegex(ValueError, "foreign count"):
-            step_program.bind_step_program(bindings, graph, (record,))
+        if mode == "invalid":
+          with self.assertRaisesRegex(ValueError, "foreign operand"):
+            step_program.bind_step_program(workspace, graph, (record,))
+          adopt.assert_not_called()
           self.assertTrue(graph._preparation_failed)
-        sources = validate.call_args.args[1]
+        else:
+          step_program.bind_step_program(workspace, graph, (record,))
+          self.assertEqual(adopt.call_args.kwargs["fixed"], [0] if mode == "fixed" else [])
+        args = extent.call_args
+        self.assertIs(args.args[0], graph)
+        self.assertEqual(args.args[1], (operation,))
         self.assertEqual(
-          [id(owner) for owner, _ in sources],
+          [id(owner) for owner, _ in args.args[2]],
           [id(bindings.world_storage), id(bindings.contact_storage), id(bindings.ccd_storage)],
         )
-        self.assertIs(sources[0][1], bindings.world_storage.protected_count)
-        self.assertIs(sources[1][1], bindings.contact_storage.ready_count)
-        self.assertIs(sources[2][1], bindings.ccd_storage.ready_count)
-        adopt.assert_not_called()
+        self.assertEqual(
+          {id(array) for array in args.kwargs["fixed_arrays"]},
+          {id(workspace.data.nacon), id(workspace.data.ncollision), id(bindings.world_storage.protected_count), id(counter)},
+        )
 
   def test_same_factory_name_does_not_merge_kernel_identities(self):
     def same_name(_):
@@ -742,18 +651,14 @@ class WorkspaceTest(unittest.TestCase):
       device=wp.get_device("cpu"),
       storage=None,
       arrays={},
-      convex=None,
-      _collision=None,
-      _solver_model=None,
-      _solver_data=None,
-      _solver_context=None,
+      scratch=None,
       _specs=(),
       _allocation_offsets_bytes=None,
       _execution_binding=None,
       _binding_layout=None,
-      _data_layout=native_execution._layout(data),
-      _model_layout=native_execution._layout(model),
-      _scratch_layout=native_execution._layout(((), None, None, None, None, None)),
+      _data_layout=step_program._layout(data),
+      _model_layout=step_program._layout(model),
+      _scratch_layout=step_program._layout(((), None)),
     )
 
   def test_prepared_api_names_express_specs_and_execution_contract(self):
@@ -777,46 +682,20 @@ class WorkspaceTest(unittest.TestCase):
     self.assertNotIn("_ledger", _StepWorkspace.__dataclass_fields__)
     self.assertIs(mjw.step_workspace_memory_report, native_workspace.step_workspace_memory_report)
 
-  def test_disabled_derivative_copy_preserves_inactive_rows(self):
-    """Route derivative fallback through the same bounded native row-copy owner."""
+  def test_disabled_derivative_preserves_ordinary_copy_semantics(self):
     model = SimpleNamespace(
+      has_fluid=False,
       M_fullm_i=None,
       M_fullm_j=None,
       opt=SimpleNamespace(disableflags=types.DisableBit.ACTUATION | types.DisableBit.DAMPER),
-      has_fluid=False,
     )
     data = SimpleNamespace(M=wp.array(np.arange(12, dtype=np.float32).reshape(4, 3), device="cpu"))
-    for prepared in (False, True):
-      for live in (0, 2, 4):
-        with self.subTest(prepared=prepared, live=live):
-          out = wp.full((4, 3), -7.0, device="cpu")
-          calls = []
+    out = wp.full((4, 3), -7.0, device="cpu")
+    with patch.object(wp, "launch", side_effect=AssertionError("Unexpected derivative kernel")):
+      derivative.deriv_smooth_vel(model, data, out)
+    np.testing.assert_array_equal(out.numpy(), data.M.numpy())
 
-          def copy(bindings, destination, source, domain):
-            if bindings is None:
-              wp.copy(destination, source)
-              return
-            calls.append((destination, source, domain))
-            wp.copy(destination[:live], source[:live])
-
-          workspace = SimpleNamespace(bindings=object()) if prepared else None
-          with (
-            patch.object(wp, "launch", side_effect=AssertionError("Unexpected derivative kernel")),
-            patch.object(native_execution, "validate_step_workspace"),
-            patch.object(native_execution, "copy_step_rows", side_effect=copy),
-          ):
-            derivative.deriv_smooth_vel(model, data, out, workspace=workspace)
-          expected = np.full((4, 3), -7.0, np.float32)
-          count = live if prepared else 4
-          expected[:count] = data.M.numpy()[:count]
-          np.testing.assert_array_equal(out.numpy(), expected)
-          self.assertEqual(len(calls), int(prepared))
-          if prepared:
-            self.assertIs(calls[0][0], out)
-            self.assertIs(calls[0][1], data.M)
-            self.assertEqual(calls[0][2], "world")
-
-  def test_disabled_features_clear_only_live_rows_with_prepared_workspace(self):
+  def test_disabled_features_initialize_their_outputs_with_ordinary_warp(self):
     cases = (
       (forward.fwd_actuation, 0, 0, ("act_dot", "qfrc_actuator", "actuator_force")),
       (forward.fwd_actuation, 3, types.DisableBit.ACTUATION, ("act_dot", "qfrc_actuator", "actuator_force")),
@@ -829,45 +708,20 @@ class WorkspaceTest(unittest.TestCase):
       (smooth._rne_cacc_world, 0, types.DisableBit.GRAVITY, ("cacc",)),
     )
     for operation, nactuator, disableflags, names in cases:
-      for live in (0, 2, 4):
-        for prepared in (False, True):
-          with self.subTest(operation=operation.__name__, live=live, prepared=prepared, nactuator=nactuator):
-            arrays = {name: wp.full((4, 3), 7.0, device="cpu") for name in names}
-            data = SimpleNamespace(**arrays)
-            model = SimpleNamespace(nactuator=nactuator, opt=SimpleNamespace(disableflags=disableflags))
-            touched = []
-
-            def fill(bindings, array, value, domain):
-              if bindings is None:
-                array.fill_(value)
-                return
-              self.assertEqual(domain, "world")
-              touched.append(array)
-              array[:live].fill_(value)
-
-            workspace = SimpleNamespace(bindings=object()) if prepared else None
-            with (
-              patch.object(wp, "launch", side_effect=AssertionError("Unexpected stage work")),
-              patch.object(native_execution, "validate_step_workspace"),
-              patch.object(native_execution, "fill_step_rows", side_effect=fill),
-            ):
-              if operation is smooth._rne_cacc_world:
-                operation(model, data, bindings=None if workspace is None else workspace.bindings)
-              else:
-                operation(model, data, workspace=workspace)
-            expected = np.full((4, 3), 7, np.float32)
-            expected[: live if prepared else 4] = 0
-            for array in arrays.values():
-              np.testing.assert_array_equal(array.numpy(), expected)
-            if prepared:
-              self.assertEqual([id(array) for array in touched], [id(array) for array in arrays.values()])
+      with self.subTest(operation=operation.__name__, nactuator=nactuator):
+        arrays = {name: wp.full((4, 3), 7.0, device="cpu") for name in names}
+        model = SimpleNamespace(nactuator=nactuator, opt=SimpleNamespace(disableflags=disableflags))
+        with patch.object(wp, "launch", side_effect=AssertionError("Unexpected stage work")):
+          operation(model, SimpleNamespace(**arrays))
+        for array in arrays.values():
+          np.testing.assert_array_equal(array.numpy(), 0)
 
   def test_kinematics_emits_plain_warp_pose_launches(self):
     # Sites are allowed in prepared models, even though keyboard fixtures have none.
     model = Mock(nbranch=2, nbody=3, ngeom=4, nsite=2)
     data = Mock(nworld=7)
     with (
-      patch.object(native_execution, "validate_step_workspace", side_effect=AssertionError("Unowned workspace validation")),
+      patch.object(step_program, "validate_step_workspace", side_effect=AssertionError("Unowned workspace validation")),
       patch.object(wp, "launch") as launch,
     ):
       smooth.kinematics(model, data)
@@ -890,7 +744,7 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(arguments["while_body"], "_solver_iteration")
     self.assertEqual(arguments["nsolving"], "nsolving")
     self.assertNotIn("workspace", arguments)
-    count_source = "workspace.bindings.world_storage.protected_count"
+    count_source = "world_count"
     self.assertTrue(
       any(
         isinstance(node, ast.Call)
@@ -901,13 +755,45 @@ class WorkspaceTest(unittest.TestCase):
       "Prepared solver initializes its condition from the live count before entering the captured loop",
     )
 
-  def test_explicit_memory_operations_preserve_eager_behavior_without_bindings(self):
-    source = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), device="cpu")
-    destination = wp.zeros((3, 4), dtype=wp.float32, device="cpu")
-    native_execution.copy_step_rows(None, destination, source, "world")
-    np.testing.assert_array_equal(destination.numpy(), source.numpy())
-    self.assertIs(native_execution.fill_step_rows(None, destination, 7, "world"), destination)
-    np.testing.assert_array_equal(destination.numpy(), np.full((3, 4), 7, np.float32))
+  def test_solver_initializes_condition_each_call_without_mutating_world_count(self):
+    condition = wp.empty(1, dtype=int, device="cpu")
+    world_count = wp.zeros(1, dtype=int, device="cpu")
+    model = Mock(opt=SimpleNamespace(disableflags=0, solver=types.SolverType.NEWTON, iterations=1, graph_conditional=True))
+    with (
+      patch.object(wp, "launch"),
+      patch.object(solver, "init_context"),
+      patch.object(solver, "_use_incremental", return_value=False),
+    ):
+      for live in (0, 3, 7):
+        for source in (None, world_count):
+          world_count.fill_(live)
+          condition.fill_(-91)
+          with patch.object(wp, "capture_while") as loop:
+            solver._solve(model, Mock(nworld=7), Mock(), nsolving=condition, world_count=source)
+          np.testing.assert_array_equal(condition.numpy(), [7 if source is None else live])
+          np.testing.assert_array_equal(world_count.numpy(), [live])
+          self.assertIs(loop.call_args.args[0], condition)
+
+  def test_global_scratch_cannot_alias_borrowed_population_or_capacity_counts(self):
+    specs = _minimal_scratch_specs()
+    for owner, name in (
+      ("world_storage", "protected_count"),
+      ("contact_storage", "ready_count"),
+      ("ccd_storage", "ready_count"),
+    ):
+      for scratch_name in ("nccd", "awake_changed", "nsolving"):
+        bindings = _step_bindings()
+        arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
+        count = wp.array(ptr=arrays[scratch_name].ptr, shape=(1,), dtype=wp.int32, device="cpu")
+        setattr(getattr(bindings, owner), name, count)
+        data = _workspace_data(count)
+        with (
+          self.subTest(count=owner, scratch=scratch_name),
+          _cpu_workspace_preparation(specs),
+          patch.object(native_workspace.field_ops, "lookup", return_value=0),
+        ):
+          with self.assertRaisesRegex(ValueError, "overlap"):
+            make_step_workspace(Metadata(), data, arrays=arrays, bindings=bindings)
 
   def test_callback_recorder_rejected_before_scratch_planning(self):
     data = SimpleNamespace(qpos=SimpleNamespace(device=SimpleNamespace(is_cuda=True)))
@@ -929,7 +815,7 @@ class WorkspaceTest(unittest.TestCase):
     bindings.world_storage.device = device
     with (
       patch.object(wp, "get_stream", return_value=SimpleNamespace(is_capturing=False)),
-      patch.object(native_execution, "_validate_bindings"),
+      patch.object(step_program, "_validate_bindings"),
       patch.object(native_workspace, "step_workspace_layout", side_effect=AssertionError("Unexpected scratch planning")),
     ):
       for domain, name in (("world_storage", "nworld"), ("contact_storage", "naconmax"), ("ccd_storage", "naccdmax")):
@@ -941,61 +827,10 @@ class WorkspaceTest(unittest.TestCase):
         finally:
           storage.capacity = 17
 
-  def test_every_exported_prepared_entry_validates_or_rejects_before_work(self):
-    """Keep the public prepared-stage surface complete and guard every callable before writes."""
-    import mujoco_warp as mjw
-
-    expected = {
-      "step",
-      "collision",
-      "nxn_broadphase",
-      "make_constraint",
-      "deriv_smooth_vel",
-      "forward",
-      "fwd_actuation",
-      "fwd_position",
-      "fwd_velocity",
-      "implicit",
-      "island",
-      "passive",
-      "crb",
-      "rne",
-      "transmission",
-      "solve",
-    }
-    exported = {
-      name: function
-      for name, function in vars(mjw).items()
-      if inspect.isfunction(function)
-      and "workspace" in inspect.signature(function).parameters
-      and inspect.signature(function).parameters["workspace"].kind == inspect.Parameter.KEYWORD_ONLY
-    }
-    self.assertEqual(set(exported), expected)
-    for name, program in exported.items():
-      validate = Mock(side_effect=ValueError("invalid prepared binding"))
-      arguments = [
-        object()
-        for parameter in inspect.signature(program).parameters.values()
-        if parameter.default is inspect.Parameter.empty
-        and parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-      ]
-      with self.subTest(program=name), ExitStack() as stack:
-        stack.enter_context(patch.object(native_execution, "validate_step_workspace", validate))
-        for operation in ("launch", "launch_tiled", "empty", "empty_like", "zeros", "clone", "copy"):
-          stack.enter_context(patch.object(wp, operation, side_effect=AssertionError("stage work before validation")))
-        with self.assertRaisesRegex(ValueError, "invalid prepared binding"):
-          program(*arguments, workspace=SimpleNamespace(bindings=None))
-        validate.assert_called_once()
-
-  def test_prepared_position_rejects_unprepared_factorization(self):
-    """Reject the eager default factorization path before any position work is emitted."""
-    workspace = SimpleNamespace(bindings=None)
-    with (
-      patch.object(wp, "launch", side_effect=AssertionError("work before rejection")),
-      patch.object(native_execution, "validate_step_workspace"),
-    ):
+  def test_borrowed_position_scratch_rejects_unprepared_factorization(self):
+    with patch.object(wp, "launch", side_effect=AssertionError("work before rejection")):
       with self.assertRaisesRegex(NotImplementedError, "factorize=False"):
-        forward.fwd_position(object(), object(), workspace=workspace)
+        forward.fwd_position(object(), object(), scratch=object())
 
   def test_collision_provider_binds_native_scratch_once_and_preserves_external_signature(self):
     for prepared, native in ((False, False), (False, True), (True, True)):
@@ -1004,8 +839,8 @@ class WorkspaceTest(unittest.TestCase):
       def external_collision(model, data, awake_prev=None):
         calls.append((model, data, awake_prev))
 
-      def native_collision(model, data, awake_prev=None, *, workspace=None):
-        calls.append((model, data, awake_prev, workspace))
+      def native_collision(model, data, awake_prev=None, *, scratch=None):
+        calls.append((model, data, awake_prev, scratch))
 
       model = Mock(
         opt=SimpleNamespace(enableflags=types.EnableBit.SLEEP, disableflags=0, run_collision_detection=native),
@@ -1013,100 +848,64 @@ class WorkspaceTest(unittest.TestCase):
         neq=0,
       )
       data = Mock()
-      workspace = (
-        SimpleNamespace(
-          bindings=object(),
-          arrays=dict(awake_prev=snapshot, efc_nnz=object(), island_parent=object(), moment_nnz=object()),
-        )
-        if prepared
-        else None
-      )
+      scratch = forward._PositionScratch(object(), snapshot, object(), object(), object()) if prepared else None
       with self.subTest(prepared=prepared, native=native), ExitStack() as stack:
         for module, name in (
-          (native_execution, "validate_step_workspace"),
-          (native_execution, "copy_step_rows"),
+          (wp, "copy"),
           (forward, "fwd_kinematics"),
           (smooth, "crb"),
           (smooth, "tendon_armature"),
           (sleep, "wake_collision"),
           (sleep, "update_sleep"),
           (constraint, "make_constraint"),
-          (constraint, "_make_constraint"),
           (island, "island"),
-          (island, "_island"),
           (smooth, "transmission"),
-          (smooth, "_compute_transmission"),
         ):
           stack.enter_context(patch.object(module, name))
         stack.enter_context(patch.object(wp, "clone", return_value=snapshot))
         stack.enter_context(patch.object(forward.collision_driver, "collision", side_effect=native_collision))
-        forward.fwd_position(model, data, factorize=False, workspace=workspace)
-      suffix = (workspace,) if native else ()
+        forward.fwd_position(model, data, factorize=False, scratch=scratch)
+      suffix = ((scratch.collision if prepared else None),) if native else ()
       self.assertEqual(calls, [(model, data, None, *suffix), (model, data, snapshot, *suffix)])
 
-  def test_standalone_stages_reuse_their_only_prepared_scratch_source(self):
-    """Use the workspace's actuator and island scratch without hidden stage allocations."""
-    parent, velocity = object(), object()
-    workspace = SimpleNamespace(
-      arrays={"island_parent": parent, "actuator_vel": velocity},
-      bindings=object(),
+  def test_standalone_stages_borrow_exact_scratch_without_allocation(self):
+    parent, velocity, nonzeros = object(), object(), object()
+    with patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
+      with patch.object(island, "direct_dsu") as compute:
+        island.island(SimpleNamespace(ntree=2), SimpleNamespace(nworld=3), parent=parent)
+      self.assertIs(compute.call_args.args[2], parent)
+      model = Mock(nactuator=2, opt=Mock(disableflags=0))
+      with patch.object(wp, "launch", side_effect=RuntimeError("first launch")) as launch:
+        with self.assertRaisesRegex(RuntimeError, "first launch"):
+          derivative.deriv_smooth_vel(model, Mock(nworld=3), Mock(), actuator_vel=velocity)
+      self.assertIs(launch.call_args.kwargs["outputs"][0], velocity)
+      with patch.object(wp, "launch", side_effect=RuntimeError("first launch")) as launch:
+        with self.assertRaisesRegex(RuntimeError, "first launch"):
+          constraint.make_constraint(Mock(), Mock(nworld=3), efc_nnz=nonzeros)
+      self.assertTrue(any(value is nonzeros for value in launch.call_args.kwargs["inputs"]))
+
+  def test_stage_scratch_records_are_passive_and_workspace_has_one_resource_tree(self):
+    records = (
+      forward._PositionScratch,
+      forward._ImplicitScratch,
+      forward._ForwardScratch,
+      forward._StepScratch,
+      solver._SolverScratch,
+      smooth._TransmissionScratch,
+      forward.collision_driver._CollisionScratch,
     )
-    with (
-      patch.object(island, "direct_dsu") as launch,
-      patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
-      patch.object(native_execution, "validate_step_workspace"),
-    ):
-      island.island(SimpleNamespace(ntree=2), SimpleNamespace(nworld=3), workspace=workspace)
-      self.assertIs(launch.call_args.args[2], parent)
-    model = Mock(opt=SimpleNamespace(disableflags=0, timestep=None), nactuator=2, has_fluid=False)
-    data = Mock(nworld=3)
-    with (
-      patch.object(wp, "launch") as launch,
-      patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
-      patch.object(native_execution, "validate_step_workspace"),
-      patch.object(native_execution, "fill_step_rows"),
-    ):
-      derivative.deriv_smooth_vel(model, data, object(), workspace=workspace)
-      self.assertIs(launch.call_args_list[0].kwargs["outputs"][0], velocity)
-    for function, name, position in (
-      (constraint.make_constraint, "efc_nnz", -1),
-      (smooth.transmission, "moment_nnz", -1),
-    ):
-      workspace.arrays[name] = object()
-      model = Mock(opt=SimpleNamespace(solver=types.SolverType.NEWTON, disableflags=types.DisableBit.CONSTRAINT), nacttrnbody=0)
-      with (
-        patch.object(native_execution, "validate_step_workspace"),
-        patch.object(native_execution, "fill_step_rows") as fill,
-        patch.object(wp, "launch", side_effect=RuntimeError("first stage launch")) as launch,
-        patch.object(wp, "empty", side_effect=AssertionError("scratch allocated")),
-        patch.object(wp, "zeros", side_effect=AssertionError("scratch allocated")),
-        self.assertRaisesRegex(RuntimeError, "first stage launch"),
-      ):
-        function(model, data, workspace=workspace)
-      self.assertIs(launch.call_args.kwargs["inputs"][position], workspace.arrays[name])
-      if name == "moment_nnz":
-        fill.assert_called_once_with(workspace.bindings, workspace.arrays[name], 0, "world")
+    for record in records:
+      with self.subTest(record=record.__name__):
+        self.assertTrue(dataclasses.is_dataclass(record))
+        tree = ast.parse(inspect.getsource(record))
+        self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(tree)))
+        self.assertFalse({"bindings", "updates", "device", "storage", "capacity", "arrays"} & record.__annotations__.keys())
+    self.assertFalse(
+      {"convex", "_collision", "_solver_context", "_solver_model", "_solver_data"} & _StepWorkspace.__annotations__.keys()
+    )
+    self.assertIn("scratch", _StepWorkspace.__annotations__)
 
-  def test_shared_computations_have_explicit_operands_without_storage_or_validation(self):
-    """Keep computation independent of its eager or prepared allocation boundary."""
-    for operation in (
-      constraint._make_constraint,
-      island._island,
-      island.direct_dsu,
-      smooth._compute_transmission,
-      derivative._deriv_smooth_vel,
-    ):
-      with self.subTest(operation=operation.__name__):
-        tree = ast.parse(inspect.getsource(operation))
-        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-        calls = {ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
-        self.assertFalse({"workspace", "validated", "skip_validation"} & names)
-        self.assertFalse(
-          {"wp.empty", "wp.zeros", "wp.empty_like", "wp.clone", "step_execution.validate_step_workspace"} & calls
-        )
-
-  def test_prepared_composition_passes_scratch_without_reentering_public_stages(self):
-    """Validate each composing entry, then call computations with the exact borrowed arrays."""
+  def test_numerical_composition_passes_only_each_stages_resources(self):
     model = Mock(
       opt=SimpleNamespace(
         enableflags=types.EnableBit.SLEEP,
@@ -1119,38 +918,15 @@ class WorkspaceTest(unittest.TestCase):
       body_freeadr=SimpleNamespace(size=0),
     )
     data = Mock()
-    workspace = SimpleNamespace(
-      bindings=object(),
-      arrays={
-        name: object()
-        for name in (
-          "efc_nnz",
-          "island_parent",
-          "moment_nnz",
-          "actuator_vel",
-          "qDeriv",
-          "qLD",
-          "qLDiagInv",
-          "qacc",
-          "island_can_sleep",
-        )
-      },
-    )
+    position = forward._PositionScratch(object(), object(), object(), object(), object())
+    implicit = forward._ImplicitScratch(*(object() for _ in range(6)))
     with ExitStack() as stack:
-      validate = stack.enter_context(patch.object(native_execution, "validate_step_workspace"))
-      for module, name in (
-        (constraint, "make_constraint"),
-        (island, "island"),
-        (smooth, "transmission"),
-        (derivative, "deriv_smooth_vel"),
-      ):
-        stack.enter_context(patch.object(module, name, side_effect=AssertionError("Repeated public stage boundary")))
       for module, name in (
         (forward, "fwd_kinematics"),
         (smooth, "crb"),
         (smooth, "tendon_armature"),
-        (forward.sleep, "wake_collision"),
-        (forward.sleep, "update_sleep"),
+        (sleep, "wake_collision"),
+        (sleep, "update_sleep"),
         (smooth, "factor_solve_i"),
         (forward, "_launch_implicit_free_body_solve"),
         (forward, "_advance"),
@@ -1159,58 +935,31 @@ class WorkspaceTest(unittest.TestCase):
       operations = [
         stack.enter_context(patch.object(module, name))
         for module, name in (
-          (constraint, "_make_constraint"),
-          (island, "_island"),
-          (smooth, "_compute_transmission"),
-          (derivative, "_deriv_smooth_vel"),
+          (constraint, "make_constraint"),
+          (island, "island"),
+          (smooth, "transmission"),
+          (derivative, "deriv_smooth_vel"),
         )
       ]
-      forward.fwd_position(model, data, factorize=False, workspace=workspace)
-      validate.assert_called_once_with(workspace, model, data)
-      operations[0].assert_called_once_with(model, data, workspace.arrays["efc_nnz"], bindings=workspace.bindings)
-      operations[1].assert_called_once_with(model, data, workspace.arrays["island_parent"])
-      operations[2].assert_called_once_with(
-        model, data, workspace.arrays["moment_nnz"], body_ncon=None, bindings=workspace.bindings
-      )
-      validate.reset_mock()
-      forward.implicit(model, data, workspace=workspace)
-      validate.assert_called_once_with(workspace, model, data)
-      operations[3].assert_called_once_with(
-        model, data, workspace.arrays["qDeriv"], workspace.arrays["actuator_vel"], bindings=workspace.bindings
-      )
+      forward.fwd_position(model, data, factorize=False, scratch=position)
+      operations[0].assert_called_once_with(model, data, efc_nnz=position.efc_nnz)
+      operations[1].assert_called_once_with(model, data, parent=position.island_parent)
+      operations[2].assert_called_once_with(model, data, scratch=position.transmission)
+      forward.implicit(model, data, scratch=implicit)
+      operations[3].assert_called_once_with(model, data, implicit.qDeriv, actuator_vel=implicit.actuator_vel)
 
   def test_transmission_initializes_supplied_counters_on_every_execution(self):
-    """Retain first-write semantics when allocation moves outside the numerical body."""
     model, data = Mock(nacttrnbody=2), Mock(nworld=3)
     moment_nnz = wp.empty(3, dtype=int, device="cpu")
     body_ncon = wp.empty((3, 2), dtype=int, device="cpu")
-    with patch.object(wp, "launch"):
+    scratch = smooth._TransmissionScratch(moment_nnz, body_ncon)
+    with patch.object(wp, "launch"), patch.object(wp, "empty", side_effect=AssertionError("Unexpected allocation")):
       for poison in (17, -91):
         moment_nnz.fill_(poison)
         body_ncon.fill_(poison)
-        smooth._compute_transmission(model, data, moment_nnz, body_ncon=body_ncon, bindings=None)
+        smooth.transmission(model, data, scratch=scratch)
         np.testing.assert_array_equal(moment_nnz.numpy(), 0)
         np.testing.assert_array_equal(body_ncon.numpy(), 0)
-
-  def test_prepared_stages_reject_alternate_scratch_before_writing_or_launching(self):
-    """One prepared scratch owner cannot be bypassed through an optional eager argument."""
-    for function, arguments, parameter, field in (
-      (constraint.make_constraint, (object(), object()), "efc_nnz", "efc_nnz"),
-      (smooth.transmission, (object(), object()), "moment_nnz", "moment_nnz"),
-      (island.island, (object(), object()), "parent", "island_parent"),
-      (derivative.deriv_smooth_vel, (object(), object(), object()), "actuator_vel", "actuator_vel"),
-    ):
-      workspace = SimpleNamespace(bindings=object(), arrays={field: object()})
-      self.assertNotIn(parameter, inspect.signature(function).parameters)
-      with (
-        self.subTest(function=function.__name__),
-        patch.object(native_execution, "validate_step_workspace"),
-        patch.object(native_execution, "fill_step_rows") as fill,
-        patch.object(wp, "launch", side_effect=AssertionError("unadmitted scratch touched")),
-        self.assertRaisesRegex(TypeError, "unexpected keyword"),
-      ):
-        function(*arguments, **{parameter: object()}, workspace=workspace)
-      fill.assert_not_called()
 
   def test_native_program_rejects_dense_inertia_override_before_publication(self):
     """The computation keeps its eager API; prepared admission owns supported kernel paths."""
@@ -1225,17 +974,17 @@ class WorkspaceTest(unittest.TestCase):
       record = wp.CapturedLaunch(call.args[0], call.kwargs["dim"], 1, 120, (), (), 128, 0, False)
       with (
         _binding_capture(bindings) as graph,
-        patch.object(wp, "capture_get_launches", return_value=(record,)),
-        patch.object(step_program.field_ops, "validate_captured_operation", return_value=False),
-        patch.object(step_program.graph_ops, "adopt_launch", return_value=object()) as adopt,
+        patch.object(step_program, "validate_step_workspace"),
+        patch.object(wp, "capture_get_memory_operations", return_value=()),
+        patch.object(step_program.graph_ops, "adopt_launches", return_value=(object(),)) as adopt,
       ):
         if rank == 2:
-          step_program.bind_step_program(bindings, graph, (record,))
+          step_program.bind_step_program(_program_workspace(bindings), graph, (record,))
           adopt.assert_called_once()
-          self.assertIs(adopt.call_args.kwargs["extent_source"], bindings.world_storage.protected_count)
+          self.assertIs(adopt.call_args.kwargs["extents"][0][2], bindings.world_storage.protected_count)
         else:
           with self.assertRaisesRegex(ValueError, "no native count declaration"):
-            step_program.bind_step_program(bindings, graph, (record,))
+            step_program.bind_step_program(_program_workspace(bindings), graph, (record,))
           adopt.assert_not_called()
           self.assertTrue(bindings.recording_failed)
           self.assertTrue(graph._preparation_failed)
@@ -1244,26 +993,28 @@ class WorkspaceTest(unittest.TestCase):
     """Keep the sole count in the owner record and reject mode or descriptor replacement."""
     bindings = _step_bindings()
     count = bindings.world_storage.protected_count
-    specs = _collision_scratch_specs()
+    specs = _minimal_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
     data = _workspace_data(count)
     with _cpu_workspace_preparation(specs), patch.object(native_workspace.field_ops, "lookup", return_value=0):
       dynamic = make_step_workspace(Metadata(), data, arrays=arrays, bindings=bindings)
       fixed = make_step_workspace(Metadata(), data, arrays=arrays)
     self.assertFalse(hasattr(dynamic, "world_live_count"))
+    self.assertIs(dynamic.scratch.forward.solver.world_count, count)
+    self.assertIsNone(fixed.scratch.forward.solver.world_count)
     for replacement in (None, _step_bindings()):
       dynamic.bindings = replacement
       with self.assertRaisesRegex(ValueError, "execution binding changed"):
-        native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+        step_program.validate_step_workspace(dynamic, dynamic.model, data)
     dynamic.bindings = bindings
     count.fill_(1)
-    native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+    step_program.validate_step_workspace(dynamic, dynamic.model, data)
     for name, changed in (("shape", (0,)), ("strides", (8,)), ("dtype", wp.int64)):
       original = getattr(count, name)
       try:
         setattr(count, name, changed)
         with self.assertRaisesRegex(ValueError, "storage or count descriptors changed"):
-          native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+          step_program.validate_step_workspace(dynamic, dynamic.model, data)
       finally:
         setattr(count, name, original)
     for owner, name, value in (
@@ -1277,13 +1028,13 @@ class WorkspaceTest(unittest.TestCase):
       try:
         setattr(owner, name, value)
         with self.assertRaisesRegex(ValueError, "storage or count descriptors changed"):
-          native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+          step_program.validate_step_workspace(dynamic, dynamic.model, data)
       finally:
         setattr(owner, name, original)
-    native_execution.validate_step_workspace(dynamic, dynamic.model, data)
+    step_program.validate_step_workspace(dynamic, dynamic.model, data)
     fixed.bindings = bindings
     with self.assertRaisesRegex(ValueError, "execution binding changed"):
-      native_execution.validate_step_workspace(fixed, fixed.model, data)
+      step_program.validate_step_workspace(fixed, fixed.model, data)
 
   def test_cpu_template_plans_capacity_without_allocating_or_mutating(self):
     instances = []
@@ -1304,7 +1055,7 @@ class WorkspaceTest(unittest.TestCase):
       instances.append((model, data))
     model, template = instances[0]
     real_model, real_data = instances[1]
-    before = native_execution._layout(model), native_execution._layout(template)
+    before = step_program._layout(model), step_program._layout(template)
     with ExitStack() as stack:
       for name in (
         "empty",
@@ -1337,10 +1088,10 @@ class WorkspaceTest(unittest.TestCase):
       ):
         with self.assertRaises(ValueError):
           step_workspace_layout(model, template, **{name: value})
-    self.assertEqual(before, (native_execution._layout(model), native_execution._layout(template)))
+    self.assertEqual(before, (step_program._layout(model), step_program._layout(template)))
 
   def test_caller_scratch_binding_owns_no_allocation(self):
-    specs = _collision_scratch_specs()
+    specs = _minimal_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
     data = _workspace_data(arrays["collision_worldid"])
     with (
@@ -1370,55 +1121,52 @@ class WorkspaceTest(unittest.TestCase):
     arrays["collision_worldid"].shape = (1,)
     self.assertEqual(native_workspace.step_workspace_memory_report(workspace), report)
     with self.assertRaisesRegex(ValueError, "scratch descriptors"):
-      native_execution.validate_step_workspace(workspace, workspace.model, data)
+      step_program.validate_step_workspace(workspace, workspace.model, data)
 
   def test_snapshot_aliases_share_one_traversal_but_later_mutations_remain_visible(self):
     array = wp.empty(2, dtype=wp.float32, device="cpu")
     metadata = Metadata(pair_counts=(array,))
-    first = native_execution._layout((metadata, metadata, array))
-    self.assertIs(first[1][0], native_execution._LAYOUT_REFERENCE)
-    self.assertIs(first[2][0], native_execution._LAYOUT_REFERENCE)
+    first = step_program._layout((metadata, metadata, array))
+    self.assertIs(first[1][0], step_program._LAYOUT_REFERENCE)
+    self.assertIs(first[2][0], step_program._LAYOUT_REFERENCE)
     self.assertNotEqual(first[1], first[2])
-    self.assertEqual(first, native_execution._layout((metadata, metadata, array)))
+    self.assertEqual(first, step_program._layout((metadata, metadata, array)))
     split_alias = dataclasses.replace(metadata)
-    self.assertNotEqual(first, native_execution._layout((metadata, split_alias, array)))
+    self.assertNotEqual(first, step_program._layout((metadata, split_alias, array)))
     metadata.option += 1
-    self.assertNotEqual(first, native_execution._layout((metadata, metadata, array)))
+    self.assertNotEqual(first, step_program._layout((metadata, metadata, array)))
     metadata.option -= 1
     array.shape = (1,)
-    self.assertNotEqual(first, native_execution._layout((metadata, metadata, array)))
+    self.assertNotEqual(first, step_program._layout((metadata, metadata, array)))
     array.shape = (2,)
-    self.assertEqual(first, native_execution._layout((metadata, metadata, array)))
+    self.assertEqual(first, step_program._layout((metadata, metadata, array)))
 
     # A short-lived traversal retains temporary roots, preventing recycled IDs.
     temporary = Metadata()
     reference = weakref.ref(temporary)
     memo = {}
-    native_execution._layout(temporary, memo)
+    step_program._layout(temporary, memo)
     del temporary
     self.assertIsNotNone(reference())
     del memo
     self.assertIsNone(reference())
 
   def test_derived_scratch_record_rebinding_rejected_before_capture(self):
-    """The shared arrays and the stage records must describe the same retained allocations."""
-    specs = _collision_scratch_specs()
+    specs = _minimal_scratch_specs()
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
     data = _workspace_data(arrays["collision_worldid"])
     with _cpu_workspace_preparation(specs):
       workspace = make_step_workspace(Metadata(), data, arrays=arrays)
-    replacement = wp.empty_like(arrays["nccd"])
-    for name, field in (("convex", "nccd"), ("_collision", "collision_worldid")):
-      original = getattr(workspace, name)
-      try:
-        setattr(workspace, name, dataclasses.replace(original, **{field: replacement}))
-        with self.subTest(name=name), self.assertRaisesRegex(ValueError, "scratch descriptors"):
-          native_execution.validate_step_workspace(workspace, workspace.model, data)
-      finally:
-        setattr(workspace, name, original)
-    workspace._solver_context = SimpleNamespace()
-    with self.assertRaisesRegex(ValueError, "scratch descriptors"):
-      native_execution.validate_step_workspace(workspace, workspace.model, data)
+    original = workspace.scratch
+    for replacement in (
+      dataclasses.replace(original, implicit=object()),
+      dataclasses.replace(original, forward=dataclasses.replace(original.forward, solver=object())),
+    ):
+      workspace.scratch = replacement
+      with self.assertRaisesRegex(ValueError, "scratch descriptors"):
+        step_program.validate_step_workspace(workspace, workspace.model, data)
+    workspace.scratch = original
+    step_program.validate_step_workspace(workspace, workspace.model, data)
 
   def test_caller_scratch_invalid_descriptors_reject_before_allocating(self):
     owner = wp.empty(128, dtype=wp.uint8, device="cpu")
@@ -1445,19 +1193,19 @@ class WorkspaceTest(unittest.TestCase):
         self.metadata_workspace,
         model=model,
         data=data,
-        _data_layout=native_execution._layout(data),
-        _model_layout=native_execution._layout(model),
+        _data_layout=step_program._layout(data),
+        _model_layout=step_program._layout(model),
       )
       value = getattr(workspace, owner)
       setattr(value, field, getattr(value, field) + 1)
       with self.subTest(owner=owner, field=field), self.assertRaisesRegex(ValueError, "scalar metadata"):
-        native_execution.validate_step_workspace(workspace, model, data)
+        step_program.validate_step_workspace(workspace, model, data)
 
   def test_foreign_model_or_data_rejected(self):
     workspace = self.metadata_workspace
     for model, data in ((Metadata(), workspace.data), (workspace.model, Metadata())):
       with self.assertRaisesRegex(ValueError, "original model"):
-        native_execution.validate_step_workspace(workspace, model, data)
+        step_program.validate_step_workspace(workspace, model, data)
 
   def test_nested_list_array_rebinding_is_part_of_immutable_metadata(self):
     """Inspect supported list containers recursively instead of trusting their Python identity."""
@@ -1469,27 +1217,26 @@ class WorkspaceTest(unittest.TestCase):
         self.metadata_workspace,
         model=model,
         data=data,
-        _data_layout=native_execution._layout(data),
-        _model_layout=native_execution._layout(model),
+        _data_layout=step_program._layout(data),
+        _model_layout=step_program._layout(model),
       )
       nested[0] = wp.ones(1, dtype=float, device="cpu")
       with self.subTest(owner=owner), self.assertRaisesRegex(ValueError, "scalar metadata"):
-        native_execution.validate_step_workspace(workspace, model, data)
+        step_program.validate_step_workspace(workspace, model, data)
 
   def test_prepared_topology_tuple_or_callback_change_rejected(self):
     for field, replacement in (("pair_counts", (2, 2)), ("callback", lambda *_: None)):
       workspace = dataclasses.replace(self.metadata_workspace, model=Metadata())
       setattr(workspace.model, field, replacement)
       with self.assertRaisesRegex(ValueError, "scalar metadata"):
-        native_execution.validate_step_workspace(workspace, workspace.model, workspace.data)
+        step_program.validate_step_workspace(workspace, workspace.model, workspace.data)
 
   def test_blocked_scratch_alignment_rejects_base_and_world_stride(self):
     """Reject misaligned blocked matrices without restricting dense scalar counters."""
     specs = (
-      *_collision_scratch_specs(),
+      *_minimal_scratch_specs(),
       WorkspaceFieldSpec("solver.h", (2, 64, 64), wp.float32, "world"),
       WorkspaceFieldSpec("solver.hfactor", (2, 64, 64), wp.float32, "world"),
-      WorkspaceFieldSpec("moment_nnz", (2,), wp.int32, "world"),
     )
     owner = wp.empty(65536, dtype=wp.uint8, device="cpu")
     baseline = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in specs}
@@ -1508,10 +1255,9 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(workspace.arrays["moment_nnz"].strides, (4,))
     # The nonblocked path does not request aligned=True; an absent hfactor is valid.
     small = (
-      *_collision_scratch_specs(),
+      *_minimal_scratch_specs(),
       WorkspaceFieldSpec("solver.h", (2, 2, 2), wp.float32, "world"),
       WorkspaceFieldSpec("solver.hfactor", (2, 0, 0), wp.float32, "world"),
-      specs[-1],
     )
     arrays = {spec.name: wp.empty(spec.shape, dtype=spec.dtype, device="cpu") for spec in small}
     arrays["solver.h"] = wp.array(ptr=owner.ptr + 4, shape=(2, 2, 2), strides=(20, 8, 4), dtype=wp.float32, device="cpu")

@@ -103,10 +103,10 @@ from mujoco_warp._src.smooth import subtree_vel as subtree_vel
 from mujoco_warp._src.smooth import tendon as tendon
 from mujoco_warp._src.smooth import transmission as transmission
 from mujoco_warp._src.solver import solve as solve
-from mujoco_warp._src.step_execution import StepBindings as StepBindings
-from mujoco_warp._src.step_execution import resolve_step_counts as resolve_step_counts
-from mujoco_warp._src.step_execution import validate_step_workspace as validate_step_workspace
+from mujoco_warp._src.step_program import StepBindings as StepBindings
 from mujoco_warp._src.step_program import bind_step_program as bind_step_program
+from mujoco_warp._src.step_program import resolve_step_counts as resolve_step_counts
+from mujoco_warp._src.step_program import validate_step_workspace as validate_step_workspace
 from mujoco_warp._src.support import contact_force as contact_force
 from mujoco_warp._src.support import get_state as get_state
 from mujoco_warp._src.support import jac as jac

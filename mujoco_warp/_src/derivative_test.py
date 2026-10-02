@@ -65,7 +65,8 @@ class DerivativeTest(parameterized.TestCase):
     out = workspace.arrays["qDeriv"] if prepared else wp.empty_like(d.M)
     if prepared:
       with wp.ScopedCapture() as capture:
-        mjw.deriv_smooth_vel(m, d, out, workspace=workspace)
+        mjw.validate_step_workspace(workspace, m, d)
+        mjw.deriv_smooth_vel(m, d, out, actuator_vel=workspace.scratch.implicit.actuator_vel)
       wp.capture_launch(capture.graph)
     else:
       mjw.deriv_smooth_vel(m, d, out)

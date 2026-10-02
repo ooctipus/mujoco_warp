@@ -22,7 +22,6 @@ import warp as wp
 from mujoco_warp._src import island
 from mujoco_warp._src import math
 from mujoco_warp._src import smooth
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_augmented_factorize_solve_newton_func
@@ -38,6 +37,18 @@ from mujoco_warp._src.warp_util import event_scope
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
 _BLOCK_CHOLESKY_DIM = 32
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _SolverScratch:
+  """Borrowed compact model/data views, solver arrays and numerical world-count operand."""
+
+  model: types.Model
+  data: types.Data
+  context: SolverContext
+  nsolving: wp.array[int]
+  world_count: wp.array[int] | None
+  efc_tree: wp.array2d[int]
 
 
 def validate_blocked_matrix(array):
@@ -1405,7 +1416,6 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
   """Iterative linesearch with parallel reductions over efc rows and dofs.
 
   Args:
-    bindings: Explicit native count bindings, or None for fixed execution.
     m: Model.
     d: Data.
     ctx: SolverContext.
@@ -3619,11 +3629,8 @@ def init_context(
   ctx: SolverContext | InverseContext,
   grad: bool = True,
   compact: bool = False,
-  *,
-  workspace=None,
 ):
   # initialize some efc arrays
-  bindings = None if workspace is None else workspace.bindings
   wp.launch(
     _solve_init_efc,
     dim=d.nworld,
@@ -3647,7 +3654,7 @@ def init_context(
     threads_per_efc = ceil(m.nv / dofs_per_thread)
   # we need to clear the jaref array if we're doing atomic adds.
   if threads_per_efc > 1:
-    step_execution.fill_step_rows(bindings, ctx.Jaref, 0, "world")
+    ctx.Jaref.zero_()
 
   sc = _sparse_compact(ctx)
   dj = ctx.compact_d_full if sc else d
@@ -3671,32 +3678,29 @@ def init_context(
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data, *, workspace=None, rebuild_active_dofs: bool = True):
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
+def solve(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = None, rebuild_active_dofs: bool = True):
   if m.opt.enableflags & types.EnableBit.SLEEP:
     # Standalone calls rebuild their maps. Full forward may reuse fwd_acceleration's
     # mapping when tree_awake has not changed between the two stages.
     if rebuild_active_dofs:
       island.update_active_dofs(m, d)
-    solve_compact(m, d, workspace=workspace)
+    solve_compact(m, d, scratch=scratch)
     if m.ntree > 1:
-      island.compute_island_mapping(
-        m, d, efc_tree=None if workspace is None else workspace.arrays["efc_tree"], workspace=workspace
-      )
+      island.compute_island_mapping(m, d, efc_tree=None if scratch is None else scratch.efc_tree)
     return
 
+  if scratch is not None:
+    raise ValueError("Compact solver scratch requires sleeping-enabled execution")
   if d.njmax == 0 or m.nv == 0:
     wp.copy(d.qacc, d.qacc_smooth)
     d.solver_niter.fill_(0)
   else:
     ctx = _create_solver_context(m, d)
-    _solve(m, d, ctx, workspace=workspace)
+    _solve(m, d, ctx)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, workspace=None):
+def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, nsolving=None, world_count=None):
   """Finds forces that satisfy constraints."""
-  bindings = None if workspace is None else workspace.bindings
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
     _solve_init_dof(warmstart),
@@ -3706,12 +3710,12 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   )
 
   #  context
-  init_context(m, d, ctx, grad=True, compact=compact, workspace=workspace)
+  init_context(m, d, ctx, grad=True, compact=compact)
 
   if _use_incremental(m):
     # A new solve computes a new search direction: invalidate the mv/jv reuse
     # left over from the previous solve.
-    step_execution.fill_step_rows(bindings, ctx.search_unchanged, 0, "world")
+    ctx.search_unchanged.zero_()
 
   # CG search = -Mgrad
   if m.opt.solver == types.SolverType.CG:
@@ -3723,14 +3727,12 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       block_dim=m.block_dim.solve_init_search_cg,
     )
 
-  if workspace is None:
-    nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
+  if nsolving is None:
+    nsolving = wp.empty(shape=(1,), dtype=int)
+  if world_count is None:
+    nsolving.fill_(d.nworld)
   else:
-    nsolving = workspace.arrays["nsolving"]
-    if workspace.bindings is None:
-      nsolving.fill_(d.nworld)
-    else:
-      wp.copy(nsolving, workspace.bindings.world_storage.protected_count)
+    wp.copy(nsolving, world_count)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
     # as long as condition_iteration is not zero.
@@ -4060,7 +4062,7 @@ def _compact_solver_views(m: types.Model, d: types.Data):
 
 
 @event_scope
-def solve_compact(m: types.Model, d: types.Data, *, workspace=None):
+def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = None):
   """Run the dense Newton constraint solver in compacted DOF space.
 
   Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
@@ -4069,27 +4071,27 @@ def solve_compact(m: types.Model, d: types.Data, *, workspace=None):
   Inactive DOFs are frozen to 0. On the incremental Newton path the solver
   kernels read the sparse M and J directly through the compaction maps.
   """
-  _compact_gather(m, d, bindings=None if workspace is None else workspace.bindings)
+  _compact_gather(m, d)
 
-  if workspace is None:
+  if scratch is None:
     m2, d2 = _compact_solver_views(m, d)
     sctx = _create_solver_context(m2, d2)
     # compact kernels read the full-coordinate sparse structures (M, J) through
     # the compaction maps instead of dense products on gathered blocks
     sctx.compact_m_full = m
     sctx.compact_d_full = d
-    _solve(m2, d2, sctx, compact=True, workspace=workspace)
   else:
-    m2, d2, sctx = workspace._solver_model, workspace._solver_data, workspace._solver_context
-    step_execution.fill_step_rows(workspace.bindings, sctx.grad, 0, "world")
-    step_execution.fill_step_rows(workspace.bindings, sctx.ls_exhausted, 0, "world")
-    _solve(m2, d2, sctx, compact=True, workspace=workspace)
+    m2, d2, sctx = scratch.model, scratch.data, scratch.context
+    sctx.grad.zero_()
+    sctx.ls_exhausted.zero_()
+  nsolving, world_count = (None, None) if scratch is None else (scratch.nsolving, scratch.world_count)
+  _solve(m2, d2, sctx, compact=True, nsolving=nsolving, world_count=world_count)
 
   _compact_scatter(m, d)
 
 
 @event_scope
-def _compact_gather(m: types.Model, d: types.Data, *, bindings):
+def _compact_gather(m: types.Model, d: types.Data):
   nvp = d.nvmax_pad
   # gather compacted dense inertia and Jacobian only for dense models;
   # sparse models read sparse M and J directly through compaction maps
@@ -4106,7 +4108,7 @@ def _compact_gather(m: types.Model, d: types.Data, *, bindings):
       inputs=[m.M_rownnz, m.M_rowadr, m.M_colind, d.M, d.dof_cdof],
       outputs=[d.cM],
     )
-    step_execution.fill_step_rows(bindings, d.cJ, 0, "world")
+    d.cJ.zero_()
     wp.launch(
       _gather_J_dense,
       dim=(d.nworld, d.njmax),

@@ -22,13 +22,16 @@ from typing import get_type_hints
 import warp as wp
 from gpu_components import fields as field_ops
 
+from mujoco_warp._src import forward
+from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
-from mujoco_warp._src import step_execution
+from mujoco_warp._src import step_program
 from mujoco_warp._src import types
 from mujoco_warp._src.collision_convex import _convex_scratch_shapes
 from mujoco_warp._src.collision_convex import _ConvexScratch
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
+from mujoco_warp._src.collision_driver import _CollisionScratch
 from mujoco_warp._src.types import CollisionType
 
 
@@ -53,15 +56,11 @@ class _StepWorkspace:
 
   model: types.Model
   data: types.Data
-  bindings: step_execution.StepBindings | None
+  bindings: step_program.StepBindings | None
   device: object
   storage: wp.array | None
   arrays: dict[str, wp.array]
-  convex: _ConvexScratch
-  _collision: CollisionContext
-  _solver_model: object
-  _solver_data: object
-  _solver_context: types.SolverContext
+  scratch: forward._StepScratch
   _specs: tuple[WorkspaceFieldSpec, ...]
   _allocation_offsets_bytes: tuple[int, ...] | None
   _execution_binding: object
@@ -112,8 +111,8 @@ def step_workspace_layout(
   At least one dynamic tree is required; the static-only island path is unbound.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
   Every admitted runtime launch and world/candidate/CCD memory operation must
-  declare its native count domain. Route copies/fills through the workspace and reject
-  unsupported execution branches here before allocating any scratch.
+  declare its native count domain at captured-program composition. Reject unsupported
+  execution branches here before allocating any scratch.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
   storage. Omitted capacities use Data's current values. All capacities are positive
@@ -241,8 +240,9 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   owners alive through graph retirement. Binding identity, storage, count descriptors
   and capacities are fixed at preparation. Set bindings.updates before recording;
   the updater identity is fixed at the first recorded operation. Temporarily detached
-  bindings must be restored before recording any step. Only declared stage sites
-  invoke binding operations; no global Warp dispatch is replaced.
+  bindings must be restored before recording any step. Numerical stages borrow
+  workspace.scratch and use ordinary Warp operations. The captured-program composition
+  boundary assigns their count semantics; no global Warp dispatch is replaced.
   """
   if bindings is not None and arrays is None:
     raise ValueError("Dynamic execution requires caller-owned registered scratch")
@@ -251,7 +251,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   if wp.get_stream(data.qpos.device).is_capturing:
     raise RuntimeError("Prepare native step workspace before graph capture")
   if bindings is not None:
-    step_execution._validate_bindings(bindings)
+    step_program._validate_bindings(bindings)
     if bindings.world_storage.device != data.qpos.device:
       raise ValueError("Native storage must use the Data device")
     for storage, name in (
@@ -298,6 +298,13 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
             raise ValueError(f"Scratch must be registered in its declared {spec.capacity_domain} storage: {spec.name}")
         elif spec.capacity_domain == "global_counter" and not array.is_contiguous:
           raise ValueError(f"Global counters require dense descriptors and caller-guaranteed full backing: {spec.name}")
+      global_scratch = tuple(arrays[spec.name] for spec in specs if spec.capacity_domain == "global_counter")
+      for count in (
+        bindings.world_storage.protected_count,
+        bindings.contact_storage.ready_count,
+        bindings.ccd_storage.ready_count,
+      ):
+        field_ops.validate_disjoint_arrays((count, *global_scratch))
   collision = CollisionContext(**{name: arrays[name] for name in ("collision_pair", "collision_pairid", "collision_worldid")})
   convex = _ConvexScratch(**{field.name: arrays[field.name] for field in dataclasses.fields(_ConvexScratch)})
   solver_context = types.SolverContext(
@@ -305,6 +312,23 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   )
   solver.validate_solver_scratch(m2, solver_context)
   solver_context.compact_m_full, solver_context.compact_d_full = model, data
+  world_count = None if bindings is None else bindings.world_storage.protected_count
+  implicit_scratch = forward._ImplicitScratch(
+    **{field.name: arrays[field.name] for field in dataclasses.fields(forward._ImplicitScratch)}
+  )
+  scratch = forward._StepScratch(
+    forward=forward._ForwardScratch(
+      position=forward._PositionScratch(
+        collision=_CollisionScratch(collision, convex, arrays["awake_changed"]),
+        awake_prev=arrays["awake_prev"],
+        efc_nnz=arrays["efc_nnz"],
+        island_parent=arrays["island_parent"],
+        transmission=smooth._TransmissionScratch(arrays["moment_nnz"], None),
+      ),
+      solver=solver._SolverScratch(m2, d2, solver_context, arrays["nsolving"], world_count, arrays["efc_tree"]),
+    ),
+    implicit=implicit_scratch,
+  )
   memo = {}
   return _StepWorkspace(
     model=model,
@@ -313,16 +337,12 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
     device=device,
     storage=storage,
     arrays=arrays,
-    convex=convex,
-    _collision=collision,
-    _solver_model=m2,
-    _solver_data=d2,
-    _solver_context=solver_context,
+    scratch=scratch,
     _specs=specs,
     _allocation_offsets_bytes=offsets,
     _execution_binding=bindings,
-    _binding_layout=step_execution._binding_layout(bindings),
-    _data_layout=step_execution._layout(data, memo),
-    _model_layout=step_execution._layout(model, memo),
-    _scratch_layout=step_execution._layout((tuple(arrays.items()), convex, collision, solver_context, m2, d2), memo),
+    _binding_layout=step_program._binding_layout(bindings),
+    _data_layout=step_program._layout(data, memo),
+    _model_layout=step_program._layout(model, memo),
+    _scratch_layout=step_program._layout((tuple(arrays.items()), scratch), memo),
   )

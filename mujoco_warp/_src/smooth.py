@@ -14,12 +14,11 @@
 # ==============================================================================
 
 
-import functools
+import dataclasses
 
 import warp as wp
 
 from mujoco_warp._src import math
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.types import MJ_MAXVAL
@@ -1048,22 +1047,19 @@ def _M(
 
 
 @event_scope
-def crb(m: Model, d: Data, *, workspace=None):
+def crb(m: Model, d: Data):
   """Computes composite rigid body inertias for each body and the joint-space inertia matrix.
 
   Accumulates composite rigid body inertias up the kinematic tree and computes the
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
-  step_execution.copy_step_rows(bindings, d.crb, d.cinert, "world")
+  wp.copy(d.crb, d.cinert)
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
     wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
 
-  step_execution.fill_step_rows(bindings, d.M, 0, "world")
+  d.M.zero_()
   wp.launch(
     _M,
     dim=(d.nworld, m.nv),
@@ -1335,9 +1331,9 @@ def _cacc_world(
   cacc_out[worldid, 0] = wp.spatial_vector(wp.vec3(0.0), -gravity[worldid % gravity.shape[0]])
 
 
-def _rne_cacc_world(m: Model, d: Data, *, bindings):
+def _rne_cacc_world(m: Model, d: Data):
   if m.opt.disableflags & DisableBit.GRAVITY:
-    step_execution.fill_step_rows(bindings, d.cacc, 0, "world")
+    d.cacc.zero_()
   else:
     wp.launch(_cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc])
 
@@ -1471,22 +1467,18 @@ def _qfrc_bias(
 
 
 @event_scope
-def rne(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
+def rne(m: Model, d: Data, flg_acc: bool = False):
   """Computes inverse dynamics using the recursive Newton-Euler algorithm.
 
   Computes the bias forces (`qfrc_bias`) and internal forces (`cfrc_int`) for the current state,
   including the effects of gravity and optionally joint accelerations.
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     flg_acc: If True, includes joint accelerations in the computation.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
-  _rne_cacc_world(m, d, bindings=bindings)
+  _rne_cacc_world(m, d)
   _rne_cacc_forward(m, d, flg_acc=flg_acc)
   _rne_cfrc(m, d)
   _rne_cfrc_backward(m, d)
@@ -2152,7 +2144,7 @@ def rne_postconstraint(m: Model, d: Data):
     )
 
   # forward pass over bodies: compute cacc, cfrc_int
-  _rne_cacc_world(m, d, bindings=None)
+  _rne_cacc_world(m, d)
   _rne_cacc_forward(m, d, flg_acc=True)
 
   # cfrc_body = cinert * cacc + cvel x (cinert * cvel)
@@ -3224,24 +3216,24 @@ def _transmission_body_moment_scale(
     actuator_moment_out[worldid, rowadr + dofid] /= -float(ncon)
 
 
-def transmission(m: Model, d: Data, *, workspace=None):
+@dataclasses.dataclass(frozen=True, eq=False)
+class _TransmissionScratch:
+  """Borrowed nonzero and body-contact counters for actuator transmissions."""
+
+  moment_nnz: wp.array[int]
+  body_ncon: wp.array2d[int] | None
+
+
+@event_scope
+def transmission(m: Model, d: Data, *, scratch: _TransmissionScratch | None = None):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  moment_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["moment_nnz"]
-  body_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int) if m.nacttrnbody else None
-  _compute_transmission(m, d, moment_nnz, bindings=None if workspace is None else workspace.bindings, body_ncon=body_ncon)
-
-
-@functools.partial(event_scope, name="transmission")
-def _compute_transmission(m: Model, d: Data, moment_nnz, *, body_ncon, bindings):
-  """Compute transmissions from explicit counter scratch and native count bindings."""
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  step_execution.fill_step_rows(bindings, moment_nnz, 0, "world")
+  moment_nnz = wp.empty((d.nworld,), dtype=int) if scratch is None else scratch.moment_nnz
+  moment_nnz.zero_()
   wp.launch(
     _transmission,
     dim=(d.nworld, m.nactuator),
@@ -3282,6 +3274,7 @@ def _compute_transmission(m: Model, d: Data, moment_nnz, *, body_ncon, bindings)
 
   if m.nacttrnbody:
     # compute moments
+    body_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int) if scratch is None else scratch.body_ncon
     body_ncon.zero_()
 
     wp.launch(

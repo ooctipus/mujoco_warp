@@ -1595,7 +1595,8 @@ class CompactSolverTest(parameterized.TestCase):
     workspace = mjw.make_step_workspace(m, d) if prepared else None
     if prepared:
       with wp.ScopedCapture() as capture:
-        mjw.forward(m, d, workspace=workspace)
+        mjw.validate_step_workspace(workspace, m, d)
+        mjw.forward(m, d, scratch=workspace.scratch.forward)
     for _ in range(2):
       # This covers both uninitialized nonfinite bytes and stale finite force from an earlier solve.
       d.cqfrc_constraint.fill_(poison)

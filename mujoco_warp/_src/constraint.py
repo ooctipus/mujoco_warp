@@ -13,13 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
 from typing import Tuple
 
 import warp as wp
 
 from mujoco_warp._src import math
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -4937,18 +4935,12 @@ def _add_surface_vel(is_pyramidal: bool):
   return kernel
 
 
-def make_constraint(m: types.Model, d: types.Data, *, workspace=None):
+@event_scope
+def make_constraint(m: types.Model, d: types.Data, *, efc_nnz: wp.array[int] | None = None):
   """Creates constraint jacobians and other supporting data."""
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  efc_nnz = wp.empty((d.nworld,), dtype=int) if workspace is None else workspace.arrays["efc_nnz"]
-  _make_constraint(m, d, efc_nnz, bindings=None if workspace is None else workspace.bindings)
-
-
-@functools.partial(event_scope, name="make_constraint")
-def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, bindings):
-  """Assemble constraints using the caller's nonzero-count scratch and execution bindings."""
   newton = m.opt.solver == types.SolverType.NEWTON
+  if efc_nnz is None:
+    efc_nnz = wp.empty((d.nworld,), dtype=int)
 
   wp.launch(
     _zero_constraint_counts,
@@ -5694,10 +5686,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
             ],
           )
       else:
-        if bindings is None:
-          d.efc.Jqvel.zero_()
-        else:
-          step_execution.fill_step_rows(bindings, d.efc.Jqvel, 0, "world")
+        d.efc.Jqvel.zero_()
         tile_size = m.block_dim.contact_jac_tiled
         n_dof_blocks = (m.nv_pad + tile_size - 1) // tile_size
 

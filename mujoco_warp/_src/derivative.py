@@ -13,12 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
-
 import warp as wp
 
 from mujoco_warp._src import math
-from mujoco_warp._src import step_execution
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.passive import ellipsoid_max_moment
 from mujoco_warp._src.passive import geom_semiaxes
@@ -1155,34 +1152,26 @@ def _qderiv_box_fluid(
     wp.atomic_add(qDeriv_out[worldid], madr, -contrib)
 
 
-def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, workspace=None):
+@event_scope
+def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel: wp.array2d[float] | None = None):
   """Analytical derivative of smooth forces w.r.t. velocities.
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     out: M - dt * qDeriv (derivatives of smooth forces w.r.t velocities).
+    actuator_vel: Optional borrowed actuator-velocity scratch.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  actuator_vel = None
-  if not (m.opt.disableflags & DisableBit.ACTUATION) and m.nactuator > 0:
-    actuator_vel = wp.empty((d.nworld, m.nactuator), dtype=float) if workspace is None else workspace.arrays["actuator_vel"]
-  _deriv_smooth_vel(m, d, out, actuator_vel, bindings=None if workspace is None else workspace.bindings)
-
-
-@functools.partial(event_scope, name="deriv_smooth_vel")
-def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *, bindings):
-  """Evaluate velocity derivatives using selected scratch and native count bindings."""
   Mi = m.M_fullm_i
   Mj = m.M_fullm_j
 
   velocity_force_flags = DisableBit.ACTUATION | DisableBit.DAMPER
   if (m.opt.disableflags & velocity_force_flags) != velocity_force_flags:
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
-    step_execution.fill_step_rows(bindings, out, 0, "world")
+    out.zero_()
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
+      if actuator_vel is None:
+        actuator_vel = wp.empty((d.nworld, m.nactuator), dtype=float)
       wp.launch(
         _qderiv_actuator_passive_vel,
         dim=(d.nworld, m.nactuator),
@@ -1242,7 +1231,7 @@ def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *
     )
   else:
     # TODO(team): directly utilize M for these settings
-    step_execution.copy_step_rows(bindings, out, d.M, "world")
+    wp.copy(out, d.M)
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
     wp.launch(
