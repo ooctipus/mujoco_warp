@@ -369,10 +369,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
     parameter_domains={"nworld_in": "world", "naconmax_in": "candidate"},
   )
 
-  if workspace is None:
-    wp.copy(d.qacc_warmstart, d.qacc)
-  else:
-    step_execution.copy_step_rows(workspace.bindings, d.qacc_warmstart, d.qacc, "world")
+  step_execution.copy_step_rows(bindings, d.qacc_warmstart, d.qacc, "world")
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
@@ -1659,14 +1656,9 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
     step_execution.validate_step_workspace(workspace, m, d)
   bindings = None if workspace is None else workspace.bindings
   if not m.nactuator or (m.opt.disableflags & DisableBit.ACTUATION):
-    if workspace is None:
-      d.act_dot.zero_()
-      d.qfrc_actuator.zero_()
-      d.actuator_force.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, d.act_dot, 0, "world")
-      step_execution.fill_step_rows(workspace.bindings, d.qfrc_actuator, 0, "world")
-      step_execution.fill_step_rows(workspace.bindings, d.actuator_force, 0, "world")
+    step_execution.fill_step_rows(bindings, d.act_dot, 0, "world")
+    step_execution.fill_step_rows(bindings, d.qfrc_actuator, 0, "world")
+    step_execution.fill_step_rows(bindings, d.actuator_force, 0, "world")
     return
 
   # read delayed ctrl (or direct copy if no delay)
@@ -1738,10 +1730,7 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
     )
 
   # TODO(team): optimize performance
-  if workspace is None:
-    d.qfrc_actuator.zero_()
-  else:
-    step_execution.fill_step_rows(workspace.bindings, d.qfrc_actuator, 0, "world")
+  step_execution.fill_step_rows(bindings, d.qfrc_actuator, 0, "world")
   step_execution.launch_step_kernel(
     bindings,
     _qfrc_actuator,
@@ -1853,15 +1842,12 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=No
     smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth)
 
 
-def _energy_pos(m: Model, d: Data, *, workspace=None):
+def _energy_pos(m: Model, d: Data, *, bindings):
   if m.opt.enableflags & EnableBit.ENERGY:
     if m.sensor_e_potential == 0:  # not computed by sensor
       sensor.energy_pos(m, d)
   else:
-    if workspace is None:
-      d.energy.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, d.energy, 0, "world")
+    step_execution.fill_step_rows(bindings, d.energy, 0, "world")
 
 
 def _energy_vel(m: Model, d: Data):
@@ -1875,18 +1861,16 @@ def forward(m: Model, d: Data, *, workspace=None):
   """Forward dynamics."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
+  bindings = None if workspace is None else workspace.bindings
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
     sleep.wake(m, d, workspace=workspace)
     sleep.update_sleep(m, d, workspace=workspace)
 
   fwd_position(m, d, factorize=False, workspace=workspace)
-  if workspace is None:
-    d.sensordata.zero_()
-  else:
-    step_execution.fill_step_rows(workspace.bindings, d.sensordata, 0, "world")
+  step_execution.fill_step_rows(bindings, d.sensordata, 0, "world")
   sensor.sensor_pos(m, d)
-  _energy_pos(m, d, workspace=workspace)
+  _energy_pos(m, d, bindings=bindings)
 
   fwd_velocity(m, d, workspace=workspace)
   sensor.sensor_vel(m, d)
@@ -1926,7 +1910,7 @@ def step1(m: Model, d: Data):
   d.sensordata.zero_()
   sensor.sensor_pos(m, d)
 
-  _energy_pos(m, d)
+  _energy_pos(m, d, bindings=None)
 
   fwd_velocity(m, d)
   sensor.sensor_vel(m, d)

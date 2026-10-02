@@ -876,10 +876,7 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, work
   )
 
   # 4. Map DOFs
-  if workspace is None:
-    d.island_dofadr.fill_(m.nv)
-  else:
-    step_execution.fill_step_rows(workspace.bindings, d.island_dofadr, m.nv, "world")
+  step_execution.fill_step_rows(bindings, d.island_dofadr, m.nv, "world")
   step_execution.launch_step_kernel(
     bindings,
     _island_map_dofs,

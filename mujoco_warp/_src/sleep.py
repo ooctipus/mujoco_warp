@@ -1270,10 +1270,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
   if island_can_sleep is None:
     island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
   else:
-    if workspace is None:
-      island_can_sleep.fill_(1)
-    else:
-      step_execution.fill_step_rows(workspace.bindings, island_can_sleep, 1, "world")
+    step_execution.fill_step_rows(bindings, island_can_sleep, 1, "world")
   step_execution.launch_step_kernel(
     bindings,
     _check_island_can_sleep,

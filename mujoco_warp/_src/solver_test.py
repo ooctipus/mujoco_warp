@@ -1227,7 +1227,7 @@ class SolverTest(parameterized.TestCase):
           solver._linesearch(m, d, ctx)
           if track:
             ctx.quad_changed_count.zero_()
-          solver._update_constraint(m, d, ctx, track_changes=track)
+          solver._update_constraint(m, d, ctx, track_changes=track, bindings=None)
           if track:
             wp.synchronize()
             if np.any(ctx.quad_changed_count.numpy() > 0):

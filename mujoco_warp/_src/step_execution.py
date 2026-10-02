@@ -38,7 +38,7 @@ class StepBindings:
   Keep all three storage owners alive through graph retirement. World launches use
   world_storage.protected_count; candidate and CCD launches use their ready_count.
   Admission must keep those counts within physically ready rows. Set updates before
-  the first recorded operation. Only native binding operations mutate the ledgers
+  the first recorded operation. Only native binding operations mutate the bindings
   and recording snapshot; do not replace their storage or count sources. A composing
   engine also sets recording_failed on application or capture failure. Never clear
   this latch or publish a graph after it becomes true.
@@ -50,7 +50,6 @@ class StepBindings:
   updates: GraphUpdateTable | None = None
   recording_failed: bool = False
   bindings: list[GraphKernelBinding] = dataclasses.field(default_factory=list)
-  operations: list[dict] = dataclasses.field(default_factory=list)
   _recording_binding: tuple | None = None
 
 
@@ -144,7 +143,7 @@ def _binding_layout(bindings):
       (bindings.contact_storage, bindings.contact_storage.ready_count),
       (bindings.ccd_storage, bindings.ccd_storage.ready_count),
     )
-  ) + (id(bindings.bindings), id(bindings.operations))
+  ) + (id(bindings.bindings),)
 
 
 def _validate_bindings(bindings):
@@ -184,7 +183,7 @@ def _validate_bindings(bindings):
   ):
     raise ValueError("Native updates must use the exact world protected count and capacity")
   if bindings._recording_binding is not None and bindings._recording_binding != (_binding_layout(bindings), id(updates)):
-    raise ValueError("Native recording binding changed; restore its original storage, counts, updates and ledgers")
+    raise ValueError("Native recording binding changed; restore its original storage, counts, updates and bindings")
 
 
 def _resolve_launch_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains):
@@ -253,24 +252,6 @@ def _fail_recording(bindings, stream=None):
     pass
 
 
-def _record_launch(bindings, binding, kernel, dim, extent_domain, parameter_domains):
-  bindings.bindings.append(binding)
-  bindings.operations.append(
-    {
-      "operation": "launch",
-      "kernel": kernel.key,
-      "module": kernel.func.__module__,
-      "function": kernel.func.__qualname__,
-      "dim": list((dim,) if isinstance(dim, int) else dim),
-      "extent_domain": extent_domain,
-      "extent_axis": binding.extent_axis,
-      "parameter_domains": dict(parameter_domains or {}),
-      "launch_rank": binding.launch_rank,
-      "node": binding.node,
-    }
-  )
-
-
 def launch_step_kernel(
   bindings,
   kernel,
@@ -291,8 +272,8 @@ def launch_step_kernel(
 
   Fixed execution supplies bindings=None. Dynamic execution resolves native count
   semantics before emission, then delegates launch and node ownership to the graph
-  component. Native diagnostics use the existing StepBindings ledger. No launch is
-  inferred from numeric dimensions. A failed dispatch invalidates the recording.
+  component. StepBindings retains only the bindings needed to prepare graph updates.
+  No launch is inferred from numeric dimensions. A failed dispatch invalidates the recording.
   """
   if bindings is None:
     return graph_ops.launch(
@@ -330,7 +311,7 @@ def launch_step_kernel(
     )
     if binding is not None:
       _begin_recording(bindings, stream)
-      _record_launch(bindings, binding, kernel, dim, extent_domain, parameter_domains)
+      bindings.bindings.append(binding)
     return binding
   except BaseException:
     _fail_recording(bindings, stream)
@@ -341,7 +322,10 @@ def fill_step_rows(bindings, array, value, domain):
   """Fill native storage rows using that domain's independent admitted count."""
   if bindings is None:
     if array.size:
-      array.fill_(value)
+      if type(value) is int and value == 0:
+        array.zero_()
+      else:
+        array.fill_(value)
     return array
   try:
     _validate_bindings(bindings)
@@ -358,7 +342,6 @@ def fill_step_rows(bindings, array, value, domain):
       return array
     _begin_recording(bindings)
     field_ops.fill(owner, array, value, count=owner.protected_count if domain == "world" else owner.ready_count)
-    bindings.operations.append({"operation": "fill", "domain": domain, "field": field_ops.lookup(owner, array).name})
     return array
   except BaseException:
     _fail_recording(bindings)
@@ -387,8 +370,6 @@ def copy_step_rows(bindings, destination, source, domain):
       return
     _begin_recording(bindings)
     field_ops.copy(owner, destination, source, count=owner.protected_count if domain == "world" else owner.ready_count)
-    field = field_ops.lookup(owner, destination) or field_ops.lookup(owner, source)
-    bindings.operations.append({"operation": "copy", "domain": domain, "field": field.name})
   except BaseException:
     _fail_recording(bindings)
     raise
