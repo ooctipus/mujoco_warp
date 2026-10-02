@@ -1093,10 +1093,7 @@ def crb(m: Model, d: Data, *, workspace=None):
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
   bindings = None if workspace is None else workspace.bindings
-  if workspace is None:
-    wp.copy(d.crb, d.cinert)
-  else:
-    step_execution.copy_step_rows(workspace.bindings, d.crb, d.cinert, "world")
+  step_execution.copy_step_rows(bindings, d.crb, d.cinert, "world")
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
@@ -1109,10 +1106,7 @@ def crb(m: Model, d: Data, *, workspace=None):
       extent_domain="world",
     )
 
-  if workspace is None:
-    d.M.zero_()
-  else:
-    step_execution.fill_step_rows(workspace.bindings, d.M, 0, "world")
+  step_execution.fill_step_rows(bindings, d.M, 0, "world")
   step_execution.launch_step_kernel(
     bindings,
     _M,
@@ -1386,13 +1380,9 @@ def _cacc_world(
   cacc_out[worldid, 0] = wp.spatial_vector(wp.vec3(0.0), -gravity[worldid % gravity.shape[0]])
 
 
-def _rne_cacc_world(m: Model, d: Data, *, workspace=None):
-  bindings = None if workspace is None else workspace.bindings
+def _rne_cacc_world(m: Model, d: Data, *, bindings):
   if m.opt.disableflags & DisableBit.GRAVITY:
-    if workspace is None:
-      d.cacc.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, d.cacc, 0, "world")
+    step_execution.fill_step_rows(bindings, d.cacc, 0, "world")
   else:
     step_execution.launch_step_kernel(
       bindings, _cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc], extent_domain="world"
@@ -1436,8 +1426,7 @@ def _cacc_branch(
     cacc_out[worldid, bodyid] = local_cacc
 
 
-def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
-  bindings = None if workspace is None else workspace.bindings
+def _rne_cacc_forward(m: Model, d: Data, flg_acc: bool = False, *, bindings):
   step_execution.launch_step_kernel(
     bindings,
     _cacc_branch,
@@ -1486,8 +1475,7 @@ def _cfrc(
   cfrc_int_out[worldid, bodyid] = frc
 
 
-def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False, *, workspace=None):
-  bindings = None if workspace is None else workspace.bindings
+def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False, *, bindings):
   step_execution.launch_step_kernel(
     bindings,
     _cfrc,
@@ -1516,8 +1504,7 @@ def _cfrc_backward(
     wp.atomic_add(cfrc_int_out[worldid], pid, cfrc_int_in[worldid, bodyid])
 
 
-def _rne_cfrc_backward(m: Model, d: Data, *, workspace=None):
-  bindings = None if workspace is None else workspace.bindings
+def _rne_cfrc_backward(m: Model, d: Data, *, bindings):
   for body_tree in reversed(m.body_tree):
     step_execution.launch_step_kernel(
       bindings,
@@ -1560,10 +1547,10 @@ def rne(m: Model, d: Data, flg_acc: bool = False, *, workspace=None):
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
   bindings = None if workspace is None else workspace.bindings
-  _rne_cacc_world(m, d, workspace=workspace)
-  _rne_cacc_forward(m, d, flg_acc=flg_acc, workspace=workspace)
-  _rne_cfrc(m, d, workspace=workspace)
-  _rne_cfrc_backward(m, d, workspace=workspace)
+  _rne_cacc_world(m, d, bindings=bindings)
+  _rne_cacc_forward(m, d, flg_acc=flg_acc, bindings=bindings)
+  _rne_cfrc(m, d, bindings=bindings)
+  _rne_cfrc_backward(m, d, bindings=bindings)
   step_execution.launch_step_kernel(
     bindings,
     _qfrc_bias,
@@ -2233,14 +2220,14 @@ def rne_postconstraint(m: Model, d: Data):
     )
 
   # forward pass over bodies: compute cacc, cfrc_int
-  _rne_cacc_world(m, d)
-  _rne_cacc_forward(m, d, flg_acc=True)
+  _rne_cacc_world(m, d, bindings=None)
+  _rne_cacc_forward(m, d, flg_acc=True, bindings=None)
 
   # cfrc_body = cinert * cacc + cvel x (cinert * cvel)
-  _rne_cfrc(m, d, flg_cfrc_ext=True)
+  _rne_cfrc(m, d, flg_cfrc_ext=True, bindings=None)
 
   # backward pass over bodies: accumulate cfrc_int from children
-  _rne_cfrc_backward(m, d)
+  _rne_cfrc_backward(m, d, bindings=None)
 
 
 @wp.func
@@ -3765,9 +3752,8 @@ def _factor_solve_blocks(
   x: wp.array2d[float],
   y: wp.array2d[float],
   *,
-  workspace=None,
+  bindings,
 ):
-  bindings = None if workspace is None else workspace.bindings
   for tile in m.M_tiles:
     if tile.elemid.size == 0:
       step_execution.launch_step_kernel(
@@ -3806,7 +3792,7 @@ def factor_solve_i(m, d, M, L, D, x, y, *, workspace=None):
     y: Input right-hand side array.
   """
   if m.M_tiles:
-    _factor_solve_blocks(m, d, M, L, D, x, y, workspace=workspace)
+    _factor_solve_blocks(m, d, M, L, D, x, y, bindings=None if workspace is None else workspace.bindings)
   if L.shape[1] > m.qLD_block_total:
     L_ldl = L[:, m.qLD_block_total :]
     _factor_i_sparse(m, d, M, L_ldl, D)

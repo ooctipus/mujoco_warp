@@ -16,6 +16,7 @@
 """Prepared native step scratch with explicit allocation and lifetime ownership."""
 
 import dataclasses
+import math
 from typing import get_type_hints
 
 import warp as wp
@@ -61,7 +62,8 @@ class _StepWorkspace:
   _solver_model: object
   _solver_data: object
   _solver_context: types.SolverContext
-  _ledger: tuple[dict, ...]
+  _specs: tuple[WorkspaceFieldSpec, ...]
+  _allocation_offsets_bytes: tuple[int, ...] | None
   _execution_binding: object
   _binding_layout: tuple | None
   _data_layout: object
@@ -71,13 +73,26 @@ class _StepWorkspace:
 
 def step_workspace_memory_report(workspace):
   """Describe scratch payload without claiming ownership of caller-managed backing."""
+  fields = [
+    dict(
+      name=spec.name,
+      shape=spec.shape,
+      dtype=str(spec.dtype),
+      allocation_offset_bytes=None
+      if workspace._allocation_offsets_bytes is None
+      else workspace._allocation_offsets_bytes[index],
+      payload_bytes=math.prod(spec.shape) * wp.types.type_size_in_bytes(spec.dtype),
+      capacity_domain=spec.capacity_domain,
+      world_axis=0 if spec.capacity_domain == "world" else None,
+      pointer=workspace.arrays[spec.name].ptr,
+    )
+    for index, spec in enumerate(workspace._specs)
+  ]
   return {
     "physical_scratch_bytes": None if workspace.storage is None else workspace.storage.capacity,
     "allocation_owner": "caller" if workspace.storage is None else "workspace",
-    "payload_bytes": sum(field["payload_bytes"] for field in workspace._ledger),
-    "fields": [
-      {**field, "dtype": str(field["dtype"]), "pointer": workspace.arrays[field["name"]].ptr} for field in workspace._ledger
-    ],
+    "payload_bytes": sum(field["payload_bytes"] for field in fields),
+    "fields": fields,
     "scope": "scratch payload only; caller-owned physical backing and Model/Data/Contact/graph/context are excluded",
   }
 
@@ -251,13 +266,13 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   solver.validate_blocked_matrix(data.cqLD)
   m2, d2 = solver._compact_solver_views(model, data)
   device = data.qpos.device
-  layouts = tuple(field_ops.contiguous(spec.shape, wp.types.type_size_in_bytes(spec.dtype)) for spec in specs)
-  for spec, layout in zip(specs, layouts):
-    field_ops.validate_layout(layout, dtype=spec.dtype)
-  spans = tuple(field_ops.span_bytes(layout, wp.types.type_size_in_bytes(spec.dtype)) for spec, layout in zip(specs, layouts))
-  offsets, nbytes = field_ops.pack(spans, (128,) * len(specs), end_alignment_bytes=128)
-  storage = None
+  storage, offsets = None, None
   if arrays is None:
+    layouts = tuple(field_ops.contiguous(spec.shape, wp.types.type_size_in_bytes(spec.dtype)) for spec in specs)
+    for spec, layout in zip(specs, layouts):
+      field_ops.validate_layout(layout, dtype=spec.dtype)
+    spans = tuple(field_ops.span_bytes(layout, wp.types.type_size_in_bytes(spec.dtype)) for spec, layout in zip(specs, layouts))
+    offsets, nbytes = field_ops.pack(spans, (128,) * len(specs), end_alignment_bytes=128)
     buffer_shape = (nbytes // 128, 128)
     field_ops.validate_layout(field_ops.contiguous(buffer_shape, 1), dtype=wp.uint8)
     storage = wp.empty(buffer_shape, dtype=wp.uint8, device=device)
@@ -290,18 +305,6 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   )
   solver.validate_solver_scratch(m2, solver_context)
   solver_context.compact_m_full, solver_context.compact_d_full = model, data
-  ledger = tuple(
-    dict(
-      name=spec.name,
-      shape=spec.shape,
-      dtype=spec.dtype,
-      allocation_offset_bytes=offset if storage is not None else None,
-      payload_bytes=span,
-      capacity_domain=spec.capacity_domain,
-      world_axis=0 if spec.capacity_domain == "world" else None,
-    )
-    for spec, offset, span in zip(specs, offsets, spans)
-  )
   memo = {}
   return _StepWorkspace(
     model=model,
@@ -315,7 +318,8 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
     _solver_model=m2,
     _solver_data=d2,
     _solver_context=solver_context,
-    _ledger=ledger,
+    _specs=specs,
+    _allocation_offsets_bytes=offsets,
     _execution_binding=bindings,
     _binding_layout=step_execution._binding_layout(bindings),
     _data_layout=step_execution._layout(data, memo),
