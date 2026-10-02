@@ -1556,7 +1556,7 @@ def _linesearch_jv_fused_kernel(is_sparse: bool, nv: int, dofs_per_thread: int, 
 
 
 @event_scope
-def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, *, workspace=None):
+def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext):
   """Linesearch for constraint solver.
 
   When state changes are tracked, worlds with ctx.search_unchanged reuse last
@@ -1564,7 +1564,6 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, *, workspace=
   invalidation in _solve and the writer in _update_gradient_zero_grad_dot).
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
     m: Model
     d: Data
     ctx: SolverContext
@@ -1575,7 +1574,7 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, *, workspace=
   skip = ctx.search_unchanged if _use_incremental(m) else ctx.done
 
   # mv = M @ search (common to both parallel and iterative)
-  _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip, workspace=workspace)
+  _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip)
 
   # Fuse jv computation in-kernel for small nv (iterative only, dense only)
   # Sparse mode requires pre-computed jv since in-kernel uses dense indexing
@@ -3533,10 +3532,8 @@ def _solver_iteration(
   ctx: SolverContext,
   nsolving: wp.array[int],
   compact: bool = False,
-  *,
-  workspace=None,
 ):
-  _linesearch(m, d, ctx, workspace=workspace)
+  _linesearch(m, d, ctx)
 
   # Incremental H is only valid for non-elliptic cones. The elliptic cone
   # path in _update_constraint_efc has early returns that skip state change
@@ -3665,7 +3662,7 @@ def init_context(
   )
 
   # Ma = M @ qacc
-  _mul_m_compact_aware(m, d, ctx, d.efc.Ma, d.qacc, ctx.done, workspace=workspace)
+  _mul_m_compact_aware(m, d, ctx, d.efc.Ma, d.qacc, ctx.done)
 
   _update_constraint(m, d, ctx)
 
@@ -3742,15 +3739,13 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # When the number of iterations reaches m.opt.iterations, solver_niter
     # becomes zero and all worlds are marked as converged to avoid an infinite loop.
     # note: we only launch the iteration kernel if everything is not done
-    wp.capture_while(
-      nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact, workspace=workspace
-    )
+    wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact)
   else:
     # This branch is mostly for when JAX is used as it is currently not compatible
     # with CUDA graph conditional.
     # It should be removed when JAX becomes compatible.
     for _ in range(m.opt.iterations):
-      _solver_iteration(m, d, ctx, nsolving, compact=compact, workspace=workspace)
+      _solver_iteration(m, d, ctx, nsolving, compact=compact)
 
   # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
   # the fast path leaves it stale, and the per-iteration zeroing wiped it for
@@ -3832,7 +3827,7 @@ def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
   return ctx.compact_d_full is not None and ctx.compact_m_full.is_sparse
 
 
-def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, res, vec, skip, *, workspace=None):
+def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, res, vec, skip):
   """M @ vec: full-coordinate sparse walk under compact, support.mul_m natively."""
   dfull = ctx.compact_d_full
   if dfull is not None:
@@ -3853,7 +3848,7 @@ def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | Inv
       outputs=[res],
     )
   else:
-    support.mul_m(m, d, res, vec, skip=skip, workspace=workspace)
+    support.mul_m(m, d, res, vec, skip=skip)
 
 
 @wp.kernel
@@ -4090,7 +4085,7 @@ def solve_compact(m: types.Model, d: types.Data, *, workspace=None):
     step_execution.fill_step_rows(workspace.bindings, sctx.ls_exhausted, 0, "world")
     _solve(m2, d2, sctx, compact=True, workspace=workspace)
 
-  _compact_scatter(m, d, workspace=workspace)
+  _compact_scatter(m, d)
 
 
 @event_scope
@@ -4137,7 +4132,7 @@ def _compact_gather(m: types.Model, d: types.Data, *, bindings):
 
 
 @event_scope
-def _compact_scatter(m: types.Model, d: types.Data, *, workspace=None):
+def _compact_scatter(m: types.Model, d: types.Data):
   # scatter results back to full DOF space (inactive frozen to 0) in one launch
   wp.launch(
     _scatter_dof_vecs,
@@ -4149,4 +4144,4 @@ def _compact_scatter(m: types.Model, d: types.Data, *, workspace=None):
   # Refresh full d.efc.Ma = M @ qacc. The integrators (Euler/implicit damping) use Ma as
   # the RHS; the compact solve only populated the compacted Ma, so recompute it in full
   # space. Inactive DOFs have qacc=0 so their Ma is 0 and they stay frozen.
-  support.mul_m(m, d, d.efc.Ma, d.qacc, workspace=workspace)
+  support.mul_m(m, d, d.efc.Ma, d.qacc)

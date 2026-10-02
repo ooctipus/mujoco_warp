@@ -993,7 +993,7 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
     convex_pairs,
     scratch=None if workspace is None else workspace.convex,
   )
-  primitive_narrowphase(m, d, ctx, primitive_pairs, workspace=workspace)
+  primitive_narrowphase(m, d, ctx, primitive_pairs)
 
   if m.has_sdf_geom:
     sdf_narrowphase(m, d, ctx)

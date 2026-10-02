@@ -418,15 +418,13 @@ def _flex_edges(
 
 
 @event_scope
-def kinematics(m: Model, d: Data, *, workspace=None):
+def kinematics(m: Model, d: Data):
   """Computes forward kinematics for all bodies, sites, geoms, and flexible elements.
 
   This function updates the global positions and orientations of all bodies, as well as the
   derived positions and orientations of geoms, sites, and flexible elements, based on the
   current joint positions and any attached mocap bodies.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
   wp.launch(
     _kinematics_branch,
     dim=(d.nworld, m.nbranch),
@@ -795,15 +793,13 @@ def _cdof(
 
 
 @event_scope
-def com_pos(m: Model, d: Data, *, workspace=None):
+def com_pos(m: Model, d: Data):
   """Computes subtree center of mass positions.
 
   Transforms inertia and motion to global frame centered at subtree CoM. Accumulates the
   mass-weighted positions up the kinematic tree, divides by total mass, and computes composite
   inertias and motion degrees of freedom in the subtree CoM frame.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
   wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
 
   for i in reversed(range(len(m.body_tree))):
@@ -2600,14 +2596,12 @@ def _comvel_branch(
 
 
 @event_scope
-def com_vel(m: Model, d: Data, *, workspace=None):
+def com_vel(m: Model, d: Data):
   """Computes the spatial velocities (cvel) and the derivative `cdof_dot` for all bodies.
 
   Propagates velocities down the kinematic tree, updating the spatial velocity and
   derivative for each body.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
   wp.launch(_comvel_root, dim=(d.nworld, 6), inputs=[], outputs=[d.cvel])
 
   wp.launch(

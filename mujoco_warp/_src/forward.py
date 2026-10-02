@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import functools
 from typing import Optional
 
 import warp as wp
@@ -1049,18 +1050,15 @@ def implicit(m: Model, d: Data, *, workspace=None):
 
 
 @event_scope
-def fwd_kinematics(m: Model, d: Data, *, workspace=None):
+def fwd_kinematics(m: Model, d: Data):
   """Kinematics-dependent computations.
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
-  smooth.kinematics(m, d, workspace=workspace)
-  smooth.com_pos(m, d, workspace=workspace)
+  smooth.kinematics(m, d)
+  smooth.com_pos(m, d)
   smooth.camlight(m, d)
   smooth.flex(m, d)
   smooth.tendon(m, d)
@@ -1085,7 +1083,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
     step_execution.validate_step_workspace(workspace, m, d)
     if factorize:
       raise NotImplementedError("Prepared fwd_position requires factorize=False; fwd_acceleration owns compact factorization")
-  fwd_kinematics(m, d, workspace=workspace)
+  fwd_kinematics(m, d)
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
 
@@ -1096,11 +1094,10 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
   if m.callback.collision is not None and m.opt.run_collision_detection:
     raise ValueError("An external collision provider requires run_collision_detection=False.")
   collision = collision_driver.collision if m.opt.run_collision_detection else m.callback.collision
+  if workspace is not None and m.opt.run_collision_detection:
+    collision = functools.partial(collision, workspace=workspace)
   if collision is not None:
-    if workspace is None:
-      collision(m, d)
-    else:
-      collision(m, d, workspace=workspace)
+    collision(m, d)
   if sleep_enabled:
     # Contact provenance does not change wake policy or the timing of the support pass.
     sleep.wake_collision(m, d)
@@ -1113,10 +1110,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
         step_execution.copy_step_rows(workspace.bindings, awake_prev, d.body_awake, "world")
     sleep.update_sleep(m, d)
     if collision is not None:
-      if workspace is None:
-        collision(m, d, awake_prev=awake_prev)
-      else:
-        collision(m, d, awake_prev=awake_prev, workspace=workspace)
+      collision(m, d, awake_prev=awake_prev)
 
   if workspace is None:
     constraint.make_constraint(m, d)
@@ -1211,7 +1205,7 @@ def fwd_velocity(m: Model, d: Data, *, workspace=None):
     outputs=[d.ten_velocity],
   )
 
-  smooth.com_vel(m, d, workspace=workspace)
+  smooth.com_vel(m, d)
   passive.passive(m, d, workspace=workspace)
   smooth.rne(m, d, workspace=workspace)
   smooth.tendon_bias(m, d, d.qfrc_bias)
@@ -1782,17 +1776,14 @@ def _qfrc_smooth(enable_sleep: bool):
 
 
 @event_scope
-def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=None):
+def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
   """Add up all non-constraint forces, compute qacc_smooth.
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
   """
-  if workspace is not None:
-    step_execution.validate_step_workspace(workspace, m, d)
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   wp.launch(
     _qfrc_smooth(enable_sleep),
@@ -1808,7 +1799,7 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=No
     ],
     outputs=[d.qfrc_smooth],
   )
-  xfrc_accumulate(m, d, d.qfrc_smooth, workspace=workspace)
+  xfrc_accumulate(m, d, d.qfrc_smooth)
 
   if enable_sleep:
     # update the active-DOF set (needs contacts from fwd_position) and solve
@@ -1859,7 +1850,7 @@ def forward(m: Model, d: Data, *, workspace=None):
     if m.callback.control:
       m.callback.control(m, d)
   fwd_actuation(m, d, workspace=workspace)
-  fwd_acceleration(m, d, factorize=True, workspace=workspace)
+  fwd_acceleration(m, d, factorize=True)
 
   solver.solve(m, d, workspace=workspace, rebuild_active_dofs=not sleep_enabled)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):

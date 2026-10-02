@@ -21,6 +21,7 @@ from gpu_components.graph_data import GraphUpdateTable
 
 from mujoco_warp import test_data
 from mujoco_warp._src import collision_convex
+from mujoco_warp._src import collision_primitive
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
 from mujoco_warp._src import forward
@@ -200,6 +201,18 @@ class NativeBindingsTest(unittest.TestCase):
       smooth.factor_solve_i,
       support.apply_ft,
       collision_convex.convex_narrowphase,
+      collision_primitive.primitive_narrowphase,
+      smooth.kinematics,
+      smooth.com_pos,
+      smooth.com_vel,
+      support.mul_m,
+      support.xfrc_accumulate,
+      forward.fwd_kinematics,
+      forward.fwd_acceleration,
+      solver._mul_m_compact_aware,
+      solver._compact_scatter,
+      solver._linesearch,
+      solver._solver_iteration,
     ):
       with self.subTest(operation=operation.__name__):
         self.assertFalse({"workspace", "bindings"} & inspect.signature(operation).parameters.keys())
@@ -853,12 +866,11 @@ class WorkspaceTest(unittest.TestCase):
     # Sites are allowed in prepared models, even though keyboard fixtures have none.
     model = Mock(nbranch=2, nbody=3, ngeom=4, nsite=2)
     data = Mock(nworld=7)
-    workspace = SimpleNamespace(bindings=object())
     with (
-      patch.object(native_execution, "validate_step_workspace"),
+      patch.object(native_execution, "validate_step_workspace", side_effect=AssertionError("Unowned workspace validation")),
       patch.object(wp, "launch") as launch,
     ):
-      smooth.kinematics(model, data, workspace=workspace)
+      smooth.kinematics(model, data)
     self.assertEqual(launch.call_count, 5)
     for call in launch.call_args_list:
       self.assertNotIn("extent_domain", call.kwargs)
@@ -866,7 +878,7 @@ class WorkspaceTest(unittest.TestCase):
     self.assertIs(launch.call_args.args[0], smooth._site_local_to_global)
     self.assertEqual(launch.call_args.kwargs["dim"], (7, 2))
 
-  def test_solver_conditional_forwards_prepared_owner_to_iteration(self):
+  def test_solver_conditional_borrows_count_without_forwarding_workspace(self):
     tree = ast.parse(inspect.getsource(solver._solve))
     calls = [
       node
@@ -876,7 +888,18 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(len(calls), 1)
     arguments = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
     self.assertEqual(arguments["while_body"], "_solver_iteration")
-    self.assertEqual(arguments.get("workspace"), "workspace", "Unbound WHILE nodes can over-decrement live nsolving")
+    self.assertEqual(arguments["nsolving"], "nsolving")
+    self.assertNotIn("workspace", arguments)
+    count_source = "workspace.bindings.world_storage.protected_count"
+    self.assertTrue(
+      any(
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "wp.copy"
+        and [ast.unparse(argument) for argument in node.args] == ["nsolving", count_source]
+        for node in ast.walk(tree)
+      ),
+      "Prepared solver initializes its condition from the live count before entering the captured loop",
+    )
 
   def test_explicit_memory_operations_preserve_eager_behavior_without_bindings(self):
     source = wp.array(np.arange(12, dtype=np.float32).reshape(3, 4), device="cpu")
@@ -926,27 +949,19 @@ class WorkspaceTest(unittest.TestCase):
       "step",
       "collision",
       "nxn_broadphase",
-      "primitive_narrowphase",
       "make_constraint",
       "deriv_smooth_vel",
       "forward",
-      "fwd_acceleration",
       "fwd_actuation",
-      "fwd_kinematics",
       "fwd_position",
       "fwd_velocity",
       "implicit",
       "island",
       "passive",
-      "com_pos",
-      "com_vel",
       "crb",
-      "kinematics",
       "rne",
       "transmission",
       "solve",
-      "mul_m",
-      "xfrc_accumulate",
     }
     exported = {
       name: function
@@ -981,6 +996,53 @@ class WorkspaceTest(unittest.TestCase):
     ):
       with self.assertRaisesRegex(NotImplementedError, "factorize=False"):
         forward.fwd_position(object(), object(), workspace=workspace)
+
+  def test_collision_provider_binds_native_scratch_once_and_preserves_external_signature(self):
+    for prepared, native in ((False, False), (False, True), (True, True)):
+      calls, snapshot = [], object()
+
+      def external_collision(model, data, awake_prev=None):
+        calls.append((model, data, awake_prev))
+
+      def native_collision(model, data, awake_prev=None, *, workspace=None):
+        calls.append((model, data, awake_prev, workspace))
+
+      model = Mock(
+        opt=SimpleNamespace(enableflags=types.EnableBit.SLEEP, disableflags=0, run_collision_detection=native),
+        callback=SimpleNamespace(collision=None if native else external_collision),
+        neq=0,
+      )
+      data = Mock()
+      workspace = (
+        SimpleNamespace(
+          bindings=object(),
+          arrays=dict(awake_prev=snapshot, efc_nnz=object(), island_parent=object(), moment_nnz=object()),
+        )
+        if prepared
+        else None
+      )
+      with self.subTest(prepared=prepared, native=native), ExitStack() as stack:
+        for module, name in (
+          (native_execution, "validate_step_workspace"),
+          (native_execution, "copy_step_rows"),
+          (forward, "fwd_kinematics"),
+          (smooth, "crb"),
+          (smooth, "tendon_armature"),
+          (sleep, "wake_collision"),
+          (sleep, "update_sleep"),
+          (constraint, "make_constraint"),
+          (constraint, "_make_constraint"),
+          (island, "island"),
+          (island, "_island"),
+          (smooth, "transmission"),
+          (smooth, "_compute_transmission"),
+        ):
+          stack.enter_context(patch.object(module, name))
+        stack.enter_context(patch.object(wp, "clone", return_value=snapshot))
+        stack.enter_context(patch.object(forward.collision_driver, "collision", side_effect=native_collision))
+        forward.fwd_position(model, data, factorize=False, workspace=workspace)
+      suffix = (workspace,) if native else ()
+      self.assertEqual(calls, [(model, data, None, *suffix), (model, data, snapshot, *suffix)])
 
   def test_standalone_stages_reuse_their_only_prepared_scratch_source(self):
     """Use the workspace's actuator and island scratch without hidden stage allocations."""
@@ -1150,27 +1212,33 @@ class WorkspaceTest(unittest.TestCase):
         function(*arguments, **{parameter: object()}, workspace=workspace)
       fill.assert_not_called()
 
-  def test_prepared_inertia_multiply_rejects_dense_override_and_does_not_allocate_unused_skip(self):
-    """Reject dense overrides before access and bind admitted scalar inertia launches."""
-    workspace = SimpleNamespace(bindings=object())
-    model, data = Mock(nv=2), Mock(nworld=7, M=SimpleNamespace(ndim=2))
-    with (
-      patch.object(wp, "launch", side_effect=AssertionError("unbounded dense access")) as launch,
-      patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")),
-      patch.object(native_execution, "validate_step_workspace"),
-      self.assertRaisesRegex(NotImplementedError, "dense block inertia"),
-    ):
-      support.mul_m(model, data, object(), object(), M=SimpleNamespace(ndim=3), workspace=workspace)
-    launch.assert_not_called()
-    with (
-      patch.object(wp, "launch") as launch,
-      patch.object(wp, "empty", side_effect=AssertionError("hidden allocation")),
-      patch.object(native_execution, "validate_step_workspace"),
-    ):
-      support.mul_m(model, data, object(), object(), workspace=workspace)
-    self.assertIsNone(launch.call_args.kwargs["inputs"][-1])
-    self.assertEqual(launch.call_args.kwargs["dim"], (7, 2))
-    self.assertNotIn("extent_domain", launch.call_args.kwargs)
+  def test_native_program_rejects_dense_inertia_override_before_publication(self):
+    """The computation keeps its eager API; prepared admission owns supported kernel paths."""
+    model, data = Mock(nv=2), Mock(nworld=17)
+    for rank in (2, 3):
+      bindings = _step_bindings()
+      with self.subTest(rank=rank), patch.object(wp, "launch") as launch, wp.ScopedDevice("cpu"):
+        support.mul_m(model, data, object(), object(), M=SimpleNamespace(ndim=rank))
+      call = launch.call_args
+      self.assertEqual(call.kwargs["inputs"][-1].size, 0)
+      self.assertEqual(call.kwargs["dim"], (17, 2))
+      record = wp.CapturedLaunch(call.args[0], call.kwargs["dim"], 1, 120, (), (), 128, 0, False)
+      with (
+        _binding_capture(bindings) as graph,
+        patch.object(wp, "capture_get_launches", return_value=(record,)),
+        patch.object(step_program.field_ops, "validate_captured_operation", return_value=False),
+        patch.object(step_program.graph_ops, "adopt_launch", return_value=object()) as adopt,
+      ):
+        if rank == 2:
+          step_program.bind_step_program(bindings, graph, (record,))
+          adopt.assert_called_once()
+          self.assertIs(adopt.call_args.kwargs["extent_source"], bindings.world_storage.protected_count)
+        else:
+          with self.assertRaisesRegex(ValueError, "no native count declaration"):
+            step_program.bind_step_program(bindings, graph, (record,))
+          adopt.assert_not_called()
+          self.assertTrue(bindings.recording_failed)
+          self.assertTrue(graph._preparation_failed)
 
   def test_prepared_execution_binding_cannot_change_mode_count_or_bindings(self):
     """Keep the sole count in the owner record and reject mode or descriptor replacement."""
