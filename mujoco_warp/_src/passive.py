@@ -1385,8 +1385,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     step_execution.fill_step_rows(bindings, d.qfrc_passive, 0, "world")
     return
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _spring_damper_dof_passive,
     dim=(d.nworld, m.njnt),
     inputs=[
@@ -1403,7 +1402,6 @@ def passive(m: Model, d: Data, *, workspace=None):
       d.qvel,
     ],
     outputs=[d.qfrc_spring, d.qfrc_damper],
-    extent_domain="world",
   )
 
   if m.ntendon:
@@ -1555,8 +1553,7 @@ def passive(m: Model, d: Data, *, workspace=None):
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
   step_execution.fill_step_rows(bindings, d.qfrc_gravcomp, 0, "world")
   if gravity_enabled:
-    step_execution.launch_step_kernel(
-      bindings,
+    wp.launch(
       _gravity_force,
       dim=(d.nworld, m.nbody - 1, m.nv),
       inputs=[
@@ -1572,7 +1569,6 @@ def passive(m: Model, d: Data, *, workspace=None):
         d.cdof,
       ],
       outputs=[d.qfrc_gravcomp],
-      extent_domain="world",
     )
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
@@ -1649,8 +1645,7 @@ def passive(m: Model, d: Data, *, workspace=None):
       ],
     )
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _qfrc_passive_kernel(m.has_fluid, m.flg_adhesion, gravity_enabled),
     dim=(d.nworld, m.nv),
     inputs=[
@@ -1665,7 +1660,6 @@ def passive(m: Model, d: Data, *, workspace=None):
     outputs=[
       d.qfrc_passive,
     ],
-    extent_domain="world",
   )
 
   if m.callback.passive:

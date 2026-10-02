@@ -201,32 +201,24 @@ def _update_sleep_dofs(
 
 
 @event_scope
-def update_sleep(
-  m: types.Model, d: types.Data, flg_staticawake: int = 0, *, world_mask: wp.array | None = None, workspace=None
-):
+def update_sleep(m: types.Model, d: types.Data, flg_staticawake: int = 0, *, world_mask: wp.array | None = None):
   """Computes sleeping arrays from tree_asleep."""
-  bindings = None if workspace is None else workspace.bindings
   compact = bool(m.opt.enableflags & types.EnableBit.SLEEP) and not bool(m.opt.disableflags & types.DisableBit.ISLAND)
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _zero_sleep_counters,
     dim=d.nworld,
     inputs=[world_mask],
     outputs=[d.ntree_awake, d.nbody_awake, d.nv_awake],
-    extent_domain="world",
   )
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _update_sleep_trees,
     dim=(d.nworld, m.ntree),
     inputs=[m.tree_sleep_policy, d.tree_asleep, world_mask],
     outputs=[d.ntree_awake, d.tree_awake],
-    extent_domain="world",
   )
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _update_sleep_bodies,
     dim=(d.nworld, m.nbody),
     inputs=[
@@ -245,11 +237,9 @@ def update_sleep(
       d.body_awake,
       d.body_awake_ind,
     ],
-    extent_domain="world",
   )
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _update_sleep_dofs,
     dim=(d.nworld, m.nv),
     inputs=[
@@ -260,7 +250,6 @@ def update_sleep(
       world_mask,
     ],
     outputs=[d.nv_awake, d.dof_awake_ind],
-    extent_domain="world",
   )
 
 
@@ -792,19 +781,15 @@ def _wake_equality_kernel(
 
 
 @event_scope
-def wake(m: types.Model, d: types.Data, *, workspace=None):
+def wake(m: types.Model, d: types.Data):
   """Wakes sleeping trees due to user changes/perturbations."""
-  bindings = None if workspace is None else workspace.bindings
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _clear_disabled_dofs,
     dim=(d.nworld, m.nv),
     inputs=[m.dof_treeid, m.tree_sleep_policy, None, None],
     outputs=[d.qvel, d.qacc_warmstart, d.qfrc_applied, d.qacc],
-    extent_domain="world",
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _wake_kernel,
     dim=(d.nworld, m.ntree),
     inputs=[
@@ -821,16 +806,13 @@ def wake(m: types.Model, d: types.Data, *, workspace=None):
       d.tree_awake,
     ],
     outputs=[d.tree_asleep],
-    extent_domain="world",
   )
 
 
 @event_scope
-def wake_collision(m: types.Model, d: types.Data, *, workspace=None):
+def wake_collision(m: types.Model, d: types.Data):
   """Wakes sleeping trees that touch awake trees."""
-  bindings = None if workspace is None else workspace.bindings
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _wake_collision_kernel,
     dim=d.naconmax,
     inputs=[
@@ -844,7 +826,6 @@ def wake_collision(m: types.Model, d: types.Data, *, workspace=None):
       d.nacon,
     ],
     outputs=[d.tree_asleep],
-    extent_domain="candidate",
   )
 
 
@@ -1246,8 +1227,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
   """Puts trees to sleep according to velocity tolerance."""
   bindings = None if workspace is None else workspace.bindings
   # 1. Sweep over awake trees and increment counter if they can sleep
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _sweep_awake_trees,
     dim=(d.nworld, m.ntree),
     inputs=[
@@ -1263,7 +1243,6 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
       m.opt.sleep_tolerance,
     ],
     outputs=[d.tree_asleep],
-    extent_domain="world",
   )
 
   # 2. Check which constraint islands can sleep (all trees in island must be asleep)
@@ -1271,8 +1250,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
     island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
   else:
     step_execution.fill_step_rows(bindings, island_can_sleep, 1, "world")
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _check_island_can_sleep,
     dim=(d.nworld, m.ntree),
     inputs=[
@@ -1282,12 +1260,10 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
       d.tree_island,
     ],
     outputs=[island_can_sleep],
-    extent_domain="world",
   )
 
   # 3. Build sleep cycles for sleeping islands and sleep unconstrained trees
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _build_cycles,
     dim=d.nworld,
     inputs=[
@@ -1303,5 +1279,4 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep=None, workspace=Non
       d.qvel,
       d.qacc,
     ],
-    extent_domain="world",
   )

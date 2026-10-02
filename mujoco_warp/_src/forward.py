@@ -298,8 +298,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
   # TODO(team): can we assume static timesteps?
 
   # advance activations
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _next_activation,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -319,35 +318,29 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
       True,
     ],
     outputs=[d.act],
-    extent_domain="world",
   )
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _next_velocity,
     dim=(d.nworld, m.nv),
     inputs=[m.opt.timestep, d.qvel, qacc, 1.0],
     outputs=[d.qvel],
-    extent_domain="world",
   )
 
   # advance positions with qvel if given, d.qvel otherwise (semi-implicit)
   qvel_in = qvel or d.qvel
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _next_position,
     dim=(d.nworld, m.njnt),
     inputs=[m.opt.timestep, m.jnt_type, m.jnt_qposadr, m.jnt_dofadr, d.qpos, qvel_in, 1.0],
     outputs=[d.qpos],
-    extent_domain="world",
   )
 
   # advance history buffers before time advance
   history.insert_ctrl_history(m, d)
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _next_time_builder(int(m.opt.warn_overflow)),
     dim=d.nworld,
     inputs=[
@@ -365,8 +358,6 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
       d.ncollision,
     ],
     outputs=[d.time, d.overflow],
-    extent_domain="world",
-    parameter_domains={"nworld_in": "world", "naconmax_in": "candidate"},
   )
 
   step_execution.copy_step_rows(bindings, d.qacc_warmstart, d.qacc, "world")
@@ -375,7 +366,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
   if sleep_enabled:
     sleep.sleep(m, d, island_can_sleep=island_can_sleep, workspace=workspace)
     fwd_velocity(m, d, workspace=workspace)
-    sleep.update_sleep(m, d, workspace=workspace)
+    sleep.update_sleep(m, d)
 
 
 @wp.kernel
@@ -1046,7 +1037,7 @@ def implicit(m: Model, d: Data, *, workspace=None):
         outputs=[qDeriv],
       )
     qacc = wp.empty((d.nworld, m.nv), dtype=float) if workspace is None else workspace.arrays["qacc"]
-    smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma, workspace=workspace)
+    smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
     _advance(
       m, d, qacc, island_can_sleep=None if workspace is None else workspace.arrays["island_can_sleep"], workspace=workspace
@@ -1112,7 +1103,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
       collision(m, d, workspace=workspace)
   if sleep_enabled:
     # Contact provenance does not change wake policy or the timing of the support pass.
-    sleep.wake_collision(m, d, workspace=workspace)
+    sleep.wake_collision(m, d)
     awake_prev = None
     if collision is not None:
       if workspace is None:
@@ -1120,7 +1111,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
       else:
         awake_prev = workspace.arrays["awake_prev"]
         step_execution.copy_step_rows(workspace.bindings, awake_prev, d.body_awake, "world")
-    sleep.update_sleep(m, d, workspace=workspace)
+    sleep.update_sleep(m, d)
     if collision is not None:
       if workspace is None:
         collision(m, d, awake_prev=awake_prev)
@@ -1135,13 +1126,13 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, workspace=None):
   if sleep_enabled:
     if m.neq > 0:
       sleep.wake_equality(m, d)
-    sleep.update_sleep(m, d, workspace=workspace)
+    sleep.update_sleep(m, d)
 
   if sleep_enabled:
     if workspace is None:
       island.island(m, d)
     else:
-      island._island(m, d, workspace.arrays["island_parent"], bindings=workspace.bindings)
+      island._island(m, d, workspace.arrays["island_parent"])
   if workspace is None:
     smooth.transmission(m, d)
   else:
@@ -1205,15 +1196,12 @@ def fwd_velocity(m: Model, d: Data, *, workspace=None):
   """Velocity-dependent computations."""
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _actuator_velocity,
     dim=(d.nworld, m.nactuator),
     inputs=[d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
     outputs=[d.actuator_velocity],
     block_dim=m.block_dim.actuator_velocity,
-    extent_domain="world",
   )
 
   wp.launch(
@@ -1668,8 +1656,7 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
   else:
     ctrl = d.ctrl
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _actuator_force,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -1702,7 +1689,6 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
       m.opt.disableflags & DisableBit.CLAMPCTRL,
     ],
     outputs=[d.act_dot, d.actuator_force],
-    extent_domain="world",
   )
 
   if m.callback.act_dyn:
@@ -1731,8 +1717,7 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
 
   # TODO(team): optimize performance
   step_execution.fill_step_rows(bindings, d.qfrc_actuator, 0, "world")
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _qfrc_actuator,
     dim=(d.nworld, m.nactuator),
     inputs=[
@@ -1743,11 +1728,9 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
       d.actuator_force,
     ],
     outputs=[d.qfrc_actuator],
-    extent_domain="world",
   )
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),
     inputs=[
@@ -1760,7 +1743,6 @@ def fwd_actuation(m: Model, d: Data, *, workspace=None):
       gravity_enabled,
     ],
     outputs=[d.qfrc_actuator],
-    extent_domain="world",
   )
 
 
@@ -1811,10 +1793,8 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=No
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _qfrc_smooth(enable_sleep),
     dim=(d.nworld, m.nv),
     inputs=[
@@ -1827,17 +1807,16 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False, *, workspace=No
       d.qfrc_actuator,
     ],
     outputs=[d.qfrc_smooth],
-    extent_domain="world",
   )
   xfrc_accumulate(m, d, d.qfrc_smooth, workspace=workspace)
 
   if enable_sleep:
     # update the active-DOF set (needs contacts from fwd_position) and solve
     # the smooth acceleration in compacted dense space.
-    island.update_active_dofs(m, d, workspace=workspace)
-    solver.smooth_solve_compact(m, d, workspace=workspace)
+    island.update_active_dofs(m, d)
+    solver.smooth_solve_compact(m, d)
   elif factorize:
-    smooth.factor_solve_i(m, d, d.M, d.qLD, d.qLDiagInv, d.qacc_smooth, d.qfrc_smooth, workspace=workspace)
+    smooth.factor_solve_i(m, d, d.M, d.qLD, d.qLDiagInv, d.qacc_smooth, d.qfrc_smooth)
   else:
     smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth)
 
@@ -1864,8 +1843,8 @@ def forward(m: Model, d: Data, *, workspace=None):
   bindings = None if workspace is None else workspace.bindings
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
-    sleep.wake(m, d, workspace=workspace)
-    sleep.update_sleep(m, d, workspace=workspace)
+    sleep.wake(m, d)
+    sleep.update_sleep(m, d)
 
   fwd_position(m, d, factorize=False, workspace=workspace)
   step_execution.fill_step_rows(bindings, d.sensordata, 0, "world")

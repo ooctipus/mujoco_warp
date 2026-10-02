@@ -241,7 +241,6 @@ def mul_m(
     step_execution.validate_step_workspace(workspace, m, d)
     if (d.M if M is None else M).ndim == 3:
       raise NotImplementedError("Prepared mul_m does not admit external dense block inertia")
-  bindings = None if workspace is None else workspace.bindings
   check_skip = skip is not None
   if skip is None and workspace is None:
     skip = wp.empty(0, dtype=bool)
@@ -258,13 +257,11 @@ def mul_m(
       outputs=[res],
     )
   else:
-    step_execution.launch_step_kernel(
-      bindings,
+    wp.launch(
       mul_m_kernel(check_skip),
       dim=(d.nworld, m.nv),
       inputs=[m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, M, vec, skip],
       outputs=[res],
-      extent_domain="world",
     )
 
 
@@ -313,15 +310,12 @@ def _apply_ft(
     qfrc_out[worldid, dofid] = accumul
 
 
-def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool, *, workspace=None):
-  bindings = None if workspace is None else workspace.bindings
-  step_execution.launch_step_kernel(
-    bindings,
+def apply_ft(m: Model, d: Data, ft: wp.array2d[wp.spatial_vector], qfrc: wp.array2d[float], flg_add: bool):
+  wp.launch(
     kernel=_apply_ft,
     dim=(d.nworld, m.nv),
     inputs=[m.nbody, m.body_parentid, m.body_rootid, m.dof_bodyid, d.xipos, d.subtree_com, d.cdof, ft, flg_add],
     outputs=[qfrc],
-    extent_domain="world",
   )
 
 
@@ -337,7 +331,7 @@ def xfrc_accumulate(m: Model, d: Data, qfrc: wp.array2d[float], *, workspace=Non
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  apply_ft(m, d, d.xfrc_applied, qfrc, True, workspace=workspace)
+  apply_ft(m, d, d.xfrc_applied, qfrc, True)
 
 
 @wp.func

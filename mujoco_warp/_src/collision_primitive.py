@@ -1538,7 +1538,6 @@ def primitive_narrowphase(
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
   # TODO(team): keep the overhead of this small - not launching anything
   # for pair types without collisions, as well as updating the launch dimensions.
 
@@ -1550,8 +1549,7 @@ def primitive_narrowphase(
       _PRIMITIVE_COLLISION_TYPES.append(types)
       _PRIMITIVE_COLLISION_FUNC.append(func)
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _primitive_narrowphase(_PRIMITIVE_COLLISION_TYPES, _PRIMITIVE_COLLISION_FUNC),
     dim=d.naconmax,
     inputs=[
@@ -1615,6 +1613,4 @@ def primitive_narrowphase(
       d.contact.adhesion,
       d.nacon,
     ],
-    extent_domain="candidate",
-    parameter_domains={"naconmax_in": "candidate"},
   )

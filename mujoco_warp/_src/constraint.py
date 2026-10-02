@@ -4950,12 +4950,10 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
   """Assemble constraints using the caller's nonzero-count scratch and execution bindings."""
   newton = m.opt.solver == types.SolverType.NEWTON
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _zero_constraint_counts,
     dim=d.nworld,
     inputs=[d.ne, d.nf, d.nl, d.nefc, d.efc.jtdaj_nblock, efc_nnz],
-    extent_domain="world",
   )
 
   if not (m.opt.disableflags & types.DisableBit.CONSTRAINT):
@@ -5293,8 +5291,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
           )
 
     if not (m.opt.disableflags & types.DisableBit.FRICTIONLOSS):
-      step_execution.launch_step_kernel(
-        bindings,
+      wp.launch(
         _friction_dof(m.is_sparse, newton),
         dim=(d.nworld, m.nv),
         inputs=[
@@ -5329,7 +5326,6 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
           d.efc.frictionloss,
           efc_nnz,
         ],
-        extent_domain="world",
       )
 
       wp.launch(
@@ -5417,8 +5413,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
         ],
       )
 
-      step_execution.launch_step_kernel(
-        bindings,
+      wp.launch(
         _limit_slide_hinge(m.is_sparse, newton),
         dim=(d.nworld, m.jnt_limited_slide_hinge_adr.size),
         inputs=[
@@ -5458,7 +5453,6 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
           d.efc.frictionloss,
           efc_nnz,
         ],
-        extent_domain="world",
       )
 
       wp.launch(
@@ -5581,8 +5575,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
           ],
         )
       else:
-        step_execution.launch_step_kernel(
-          bindings,
+        wp.launch(
           _efc_contact_init(m.opt.cone, m.is_sparse, newton, m.flg_adhesion),
           dim=d.naconmax,
           inputs=[
@@ -5613,7 +5606,6 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
             d.efc.J_rowadr,
             efc_nnz,
           ],
-          extent_domain="candidate",
         )
 
       if m.is_sparse:
@@ -5668,8 +5660,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
             ],
           )
         else:
-          step_execution.launch_step_kernel(
-            bindings,
+          wp.launch(
             _efc_contact_jac_sparse(m.opt.cone),
             dim=(d.naconmax, nmaxdim),
             inputs=[
@@ -5701,7 +5692,6 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
               d.efc.J,
               d.efc.Jqvel,
             ],
-            extent_domain="candidate",
           )
       else:
         if bindings is None:
@@ -5758,8 +5748,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
             block_dim=tile_size,
           )
         else:
-          step_execution.launch_step_kernel(
-            bindings,
+          wp.launch_tiled(
             _efc_contact_jac_dense(tile_size, m.opt.cone),
             dim=(d.nworld, n_dof_blocks),
             inputs=[
@@ -5788,8 +5777,6 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
               d.efc.Jqvel,
             ],
             block_dim=tile_size,
-            extent_domain="world",
-            tiled=True,
           )
 
       if m.flg_surfacevel:
@@ -5869,8 +5856,7 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
           ],
         )
       else:
-        step_execution.launch_step_kernel(
-          bindings,
+        wp.launch(
           _efc_contact_update(m.opt.cone, m.flg_adhesion),
           dim=(d.naconmax, nmaxdim),
           inputs=[
@@ -5904,5 +5890,4 @@ def _make_constraint(m: types.Model, d: types.Data, efc_nnz: wp.array[int], *, b
             d.efc.aref,
             d.efc.frictionloss,
           ],
-          extent_domain="candidate",
         )

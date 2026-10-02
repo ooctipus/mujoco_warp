@@ -186,8 +186,8 @@ def _validate_bindings(bindings):
     raise ValueError("Native recording binding changed; restore its original storage, counts, updates and bindings")
 
 
-def _resolve_launch_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains):
-  """Resolve native count declarations before emitting a launch; mutate no recording state.
+def resolve_step_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains):
+  """Resolve native count labels to numeric descriptors; mutate no recording state.
 
   A dynamic extent is the leading axis of world, candidate or CCD storage. Fixed
   worker grids explicitly use extent_domain=None and extent_axis=None. Named int32
@@ -226,6 +226,12 @@ def _begin_recording(bindings, stream=None):
   graph = graph_ops.current_capture(device=device, stream=stream)
   if graph is None:
     raise RuntimeError("Record native step operations inside a Warp-managed graph capture")
+  _retain_bindings(bindings, graph)
+
+
+def _retain_bindings(bindings, graph):
+  """Retain admitted resources and freeze the one binding relation for this program."""
+  _validate_bindings(bindings)
   if bindings._recording_binding is None:
     graph_ops.retain(graph, bindings)
     for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage):
@@ -250,72 +256,6 @@ def _fail_recording(bindings, stream=None):
     # A malformed borrowed descriptor must not mask the error that poisoned it.
     # The composition root must also reject the native recording_failed latch.
     pass
-
-
-def launch_step_kernel(
-  bindings,
-  kernel,
-  dim,
-  *,
-  inputs=None,
-  outputs=None,
-  extent_domain,
-  extent_axis=0,
-  parameter_domains=None,
-  tiled=False,
-  block_dim=0,
-  max_blocks=0,
-  device=None,
-  stream=None,
-):
-  """Emit one native kernel and its declared count binding as one operation.
-
-  Fixed execution supplies bindings=None. Dynamic execution resolves native count
-  semantics before emission, then delegates launch and node ownership to the graph
-  component. StepBindings retains only the bindings needed to prepare graph updates.
-  No launch is inferred from numeric dimensions. A failed dispatch invalidates the recording.
-  """
-  if bindings is None:
-    return graph_ops.launch(
-      None,
-      kernel,
-      dim,
-      inputs=inputs,
-      outputs=outputs,
-      tiled=tiled,
-      block_dim=block_dim,
-      max_blocks=max_blocks,
-      device=device,
-      stream=stream,
-    )
-  extent, parameters = _resolve_launch_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains)
-  if bindings.updates is None:
-    raise RuntimeError("Prepare native graph updates before recording step operations")
-  if type(tiled) is not bool or (tiled and (type(block_dim) is not int or block_dim < 1)):
-    raise ValueError("Tiled recording requires an explicit positive block dimension")
-  try:
-    binding = graph_ops.launch(
-      bindings.updates,
-      kernel,
-      dim,
-      inputs=inputs,
-      outputs=outputs,
-      extent_axis=extent_axis,
-      extent_source=extent,
-      parameters=parameters,
-      tiled=tiled,
-      block_dim=block_dim,
-      max_blocks=max_blocks,
-      device=device,
-      stream=stream,
-    )
-    if binding is not None:
-      _begin_recording(bindings, stream)
-      bindings.bindings.append(binding)
-    return binding
-  except BaseException:
-    _fail_recording(bindings, stream)
-    raise
 
 
 def fill_step_rows(bindings, array, value, domain):

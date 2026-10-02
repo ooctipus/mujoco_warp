@@ -104,7 +104,8 @@ from mujoco_warp._src.smooth import tendon as tendon
 from mujoco_warp._src.smooth import transmission as transmission
 from mujoco_warp._src.solver import solve as solve
 from mujoco_warp._src.step_execution import StepBindings as StepBindings
-from mujoco_warp._src.step_execution import launch_step_kernel as launch_step_kernel
+from mujoco_warp._src.step_execution import resolve_step_counts as resolve_step_counts
+from mujoco_warp._src.step_program import bind_step_program as bind_step_program
 from mujoco_warp._src.support import contact_force as contact_force
 from mujoco_warp._src.support import get_state as get_state
 from mujoco_warp._src.support import jac as jac

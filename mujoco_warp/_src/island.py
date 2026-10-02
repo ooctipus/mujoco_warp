@@ -286,7 +286,7 @@ _DSU_TARGET_BLOCKS = 2048
 
 
 @event_scope
-def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int], *, bindings=None):
+def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
   """Discover islands with EFC-parallel atomic minimum-root hooks.
 
   `island_parent` is the (nworld, ntree) disjoint-set workspace, owned by the caller.
@@ -297,15 +297,12 @@ def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int], *,
   max_chunks = max(1, -(-d.njmax // _DSU_MIN_CHUNK))
   nchunk = min(max(1, -(-_DSU_TARGET_BLOCKS // d.nworld)), max_chunks)
   chunk_size = -(-d.njmax // nchunk)
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _reset_dsu,
     dim=(d.nworld, m.ntree),
     inputs=[d.nisland, d.tree_island, island_parent],
-    extent_domain="world",
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch_tiled(
     _island_dsu,
     dim=(d.nworld, nchunk),
     inputs=[
@@ -334,29 +331,21 @@ def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int], *,
       island_parent,
     ],
     block_dim=types.BlockDim.island_dsu,
-    extent_domain="world",
-    tiled=True,
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _compress_roots,
     dim=(d.nworld, m.ntree),
     inputs=[d.tree_island, island_parent],
-    extent_domain="world",
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _label_roots,
     dim=d.nworld,
     inputs=[m.ntree, island_parent, d.nisland, d.tree_island],
-    extent_domain="world",
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _propagate_labels,
     dim=(d.nworld, m.ntree),
     inputs=[island_parent, d.tree_island],
-    extent_domain="world",
   )
 
 
@@ -378,12 +367,12 @@ def island(m: types.Model, d: types.Data, *, workspace=None):
   parent = None
   if m.ntree:
     parent = wp.empty((d.nworld, m.ntree), dtype=int) if workspace is None else workspace.arrays["island_parent"]
-  _island(m, d, parent, bindings=None if workspace is None else workspace.bindings)
+  _island(m, d, parent)
 
 
 @functools.partial(event_scope, name="island")
-def _island(m: types.Model, d: types.Data, parent: wp.array2d[int] | None, *, bindings):
-  """Discover islands using the caller's disjoint-set scratch and execution bindings."""
+def _island(m: types.Model, d: types.Data, parent: wp.array2d[int] | None):
+  """Discover islands using the caller's disjoint-set scratch."""
   if m.ntree == 0:
     wp.launch(
       _zero_island_counts,
@@ -392,7 +381,7 @@ def _island(m: types.Model, d: types.Data, parent: wp.array2d[int] | None, *, bi
     )
     return
 
-  direct_dsu(m, d, parent, bindings=bindings)
+  direct_dsu(m, d, parent)
 
 
 @wp.kernel
@@ -788,35 +777,28 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, work
   if d.island_idofadr.shape[1] != m.ntree:
     d.island_idofadr = wp.empty((d.nworld, m.ntree), dtype=int)
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _init_island_arrays,
     dim=(d.nworld, m.ntree),
     inputs=[],
     outputs=[d.nidof, d.island_idofadr, d.island_nv, d.island_nefc, d.island_ne, d.island_nf, d.island_iefcadr],
-    extent_domain="world",
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _init_dof_arrays,
     dim=(d.nworld, m.nv),
     inputs=[],
     outputs=[d.dof_island, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
-    extent_domain="world",
   )
   if efc_tree is None:
     efc_tree = wp.empty((d.nworld, d.njmax), dtype=int)
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _init_efc_arrays,
     dim=(d.nworld, d.njmax),
     inputs=[],
     outputs=[d.efc.island, d.map_efc2iefc, d.map_iefc2efc, d.efc_islandid, efc_tree],
-    extent_domain="world",
   )
 
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _compute_efc_tree,
     dim=(d.nworld, d.njmax),
     inputs=[
@@ -842,58 +824,47 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None, work
       d.njmax,
     ],
     outputs=[efc_tree],
-    extent_domain="world",
   )
 
   # 1. Count DOFs per island
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _island_count_dofs,
     dim=(d.nworld, m.nv),
     inputs=[m.dof_treeid, d.tree_island],
     outputs=[d.dof_island, d.island_nv],
-    extent_domain="world",
   )
 
   # 2. Count Constraints per island
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _island_count_constraints,
     dim=(d.nworld, d.njmax),
     inputs=[d.nefc, d.efc.type, d.tree_island, d.njmax, efc_tree],
     outputs=[d.efc.island, d.island_nefc, d.island_ne, d.island_nf],
-    extent_domain="world",
   )
 
   # 3. Scan sizes and reset counters for mapping
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _island_scan_sizes,
     dim=d.nworld,
     inputs=[d.nisland, d.island_nv],
     outputs=[d.nidof, d.island_idofadr, d.island_nefc, d.island_iefcadr],
-    extent_domain="world",
   )
 
   # 4. Map DOFs
   step_execution.fill_step_rows(bindings, d.island_dofadr, m.nv, "world")
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _island_map_dofs,
     dim=(d.nworld, m.nv),
     inputs=[m.dof_treeid, m.tree_dofadr, m.tree_dofnum, d.nidof, d.tree_island, d.island_idofadr],
     outputs=[d.island_dofadr, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
-    extent_domain="world",
   )
 
   # 5. Map Constraints
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _island_map_constraints,
     dim=(d.nworld, m.ntree),
     inputs=[d.nefc, d.nisland, d.efc.type, d.efc.island, d.island_ne, d.island_nf, d.island_iefcadr, d.njmax],
     outputs=[d.island_nefc, d.map_efc2iefc, d.map_iefc2efc, d.efc_islandid],
-    extent_domain="world",
   )
 
 
@@ -972,22 +943,17 @@ def _compact_dofs_builder(warn_overflow: int):
 
 
 @event_scope
-def update_active_dofs(m: types.Model, d: types.Data, *, workspace=None):
+def update_active_dofs(m: types.Model, d: types.Data):
   """Rebuild the compaction maps (dof_cdof / cdof_dof) from tree_awake."""
-  bindings = None if workspace is None else workspace.bindings
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _reset_compact_maps,
     dim=(d.nworld, max(m.nv, d.nvmax_pad)),
     inputs=[m.nv, d.nvmax_pad],
     outputs=[d.dof_cdof, d.cdof_dof],
-    extent_domain="world",
   )
-  step_execution.launch_step_kernel(
-    bindings,
+  wp.launch(
     _compact_dofs_builder(int(m.opt.warn_overflow)),
     dim=(d.nworld,),
     inputs=[m.ntree, m.tree_dofadr, m.tree_dofnum, d.tree_awake, d.nvmax],
     outputs=[d.ncdof, d.dof_cdof, d.cdof_dof, d.overflow],
-    extent_domain="world",
   )

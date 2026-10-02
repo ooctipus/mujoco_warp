@@ -1183,8 +1183,7 @@ def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
     step_execution.fill_step_rows(bindings, out, 0, "world")
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
-      step_execution.launch_step_kernel(
-        bindings,
+      wp.launch(
         _qderiv_actuator_passive_vel,
         dim=(d.nworld, m.nactuator),
         inputs=[
@@ -1209,11 +1208,9 @@ def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *
           d.actuator_force,
         ],
         outputs=[actuator_vel],
-        extent_domain="world",
       )
       # out (qDeriv) is in M-structure.
-      step_execution.launch_step_kernel(
-        bindings,
+      wp.launch(
         _qderiv_actuator_passive_actuation_sparse,
         dim=(d.nworld, m.nactuator),
         inputs=[
@@ -1225,10 +1222,8 @@ def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *
           actuator_vel,
         ],
         outputs=[out],
-        extent_domain="world",
       )
-    step_execution.launch_step_kernel(
-      bindings,
+    wp.launch(
       _qderiv_actuator_passive,
       dim=(d.nworld, Mi.size),
       inputs=[
@@ -1244,15 +1239,13 @@ def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *
         out,
       ],
       outputs=[out],
-      extent_domain="world",
     )
   else:
     # TODO(team): directly utilize M for these settings
     step_execution.copy_step_rows(bindings, out, d.M, "world")
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
-    step_execution.launch_step_kernel(
-      bindings,
+    wp.launch(
       _qderiv_tendon_damping,
       dim=(d.nworld, Mi.size),
       inputs=[
@@ -1270,7 +1263,6 @@ def _deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel, *
         Mj,
       ],
       outputs=[out],
-      extent_domain="world",
     )
   if m.has_fluid:
     if m.body_fluid_ellipsoid_adr.size > 0:

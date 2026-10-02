@@ -18,7 +18,6 @@ from typing import Tuple, get_type_hints
 
 import warp as wp
 
-from mujoco_warp._src import step_execution
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_core import contact_margin_gap
@@ -38,7 +37,6 @@ from mujoco_warp._src.collision_primitive import geom_collision_pair
 from mujoco_warp._src.collision_primitive import write_contact
 from mujoco_warp._src.math import make_frame
 from mujoco_warp._src.math import upper_trid_index
-from mujoco_warp._src.step_execution import launch_step_kernel
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
 from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
 from mujoco_warp._src.types import MJ_MAXCONPAIR
@@ -1315,7 +1313,7 @@ def _convex_scratch_shapes(m: Model, collision_table: list[tuple[GeomType, GeomT
 
 @event_scope
 def convex_narrowphase(
-  m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]], *, scratch=None, bindings=None
+  m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]], *, scratch=None
 ):
   """Runs narrowphase collision detection for convex geom pairs.
 
@@ -1330,18 +1328,13 @@ def convex_narrowphase(
   To optimize performance, this function dynamically builds and launches a specialized
   kernel for each type of convex collision pair present in the model, avoiding unnecessary
   computations for non-existent pair types. Supplied scratch must be validated by
-  native workspace preparation and retained through execution; bindings require
-  that prepared scratch and an active graph recording.
+  native workspace preparation and retained through execution.
   """
 
   def _pair_count(p1: int, p2: int) -> Tuple[int, int]:
     idx = upper_trid_index(len(GeomType), p1, p2)
     return m.geom_pair_type_count[idx], idx
 
-  if bindings is not None:
-    if scratch is None:
-      raise ValueError("Dynamic execution requires prepared convex scratch")
-    step_execution._validate_bindings(bindings)
   ncollision, epa_iterations, shapes = _convex_scratch_shapes(m, collision_table, d.naccdmax)
   if ncollision == 0:
     return
@@ -1352,12 +1345,6 @@ def convex_narrowphase(
     scratch = _ConvexScratch(
       **{name: wp.empty(shapes[name], dtype=hint.dtype, device=d.ncollision.device) for name, hint in hints.items()}
     )
-  if bindings is not None:
-    try:
-      step_execution._begin_recording(bindings)
-    except BaseException:
-      step_execution._fail_recording(bindings)
-      raise
   scratch.nccd.zero_()
   use_multiccd = (m.opt.disableflags & DisableBit.MULTICCD) == 0
 
@@ -1468,13 +1455,9 @@ def convex_narrowphase(
         int(m.opt.warn_overflow),
       )
       ccd_grid = _ccd_grid_size(ccd_k, d.naconmax, d.ncollision.device)
-      launch_step_kernel(
-        bindings,
+      wp.launch(
         ccd_k,
         dim=ccd_grid,
-        extent_domain=None,
-        extent_axis=None,
-        parameter_domains={"naconmax_in": "candidate", "naccdmax_in": "ccd"},
         block_dim=m.block_dim.convex_ccd,
         inputs=[
           m.opt.ccd_tolerance,

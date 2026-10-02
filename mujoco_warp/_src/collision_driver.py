@@ -913,7 +913,6 @@ def nxn_broadphase(
   """
   if workspace is not None:
     step_execution.validate_step_workspace(workspace, m, d)
-  bindings = None if workspace is None else workspace.bindings
   enable_sleep = bool(m.opt.enableflags & EnableBit.SLEEP)
   incremental = awake_prev is not None
   awake_prev_in = awake_prev if awake_prev is not None else d.body_awake
@@ -928,18 +927,15 @@ def nxn_broadphase(
     else:
       cond = workspace.arrays["awake_changed"]
       cond.zero_()
-    step_execution.launch_step_kernel(
-      bindings,
+    wp.launch(
       _any_awake_changed,
       dim=(d.nworld, m.nbody),
       inputs=[d.body_awake, awake_prev],
       outputs=[cond],
-      extent_domain="world",
     )
 
   def _launch():
-    step_execution.launch_step_kernel(
-      bindings,
+    wp.launch(
       _nxn_broadphase(
         m.opt.broadphase_filter,
         m.geom_aabb.shape[0] > 1,
@@ -976,8 +972,6 @@ def nxn_broadphase(
         ctx.collision_pairid,
         ctx.collision_worldid,
       ],
-      extent_domain="world",
-      parameter_domains={"naconmax_in": "candidate"},
     )
 
   if cond is not None:
@@ -1003,7 +997,6 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, workspace=None):
     ctx,
     convex_pairs,
     scratch=None if workspace is None else workspace.convex,
-    bindings=None if workspace is None else workspace.bindings,
   )
   primitive_narrowphase(m, d, ctx, primitive_pairs, workspace=workspace)
 
