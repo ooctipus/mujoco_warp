@@ -1401,17 +1401,16 @@ def _linesearch_iterative_kernel(
   return kernel
 
 
-def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fuse_jv: bool, *, workspace=None):
+def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fuse_jv: bool, *, bindings):
   """Iterative linesearch with parallel reductions over efc rows and dofs.
 
   Args:
-    workspace: Optional prepared step scratch and launch recorder.
+    bindings: Explicit native count bindings, or None for fixed execution.
     m: Model.
     d: Data.
     ctx: SolverContext.
     fuse_jv: Whether jv is computed in-kernel (True) or pre-computed (False).
   """
-  bindings = None if workspace is None else workspace.bindings
   step_execution.launch_step_kernel(
     bindings,
     _linesearch_iterative_kernel(
@@ -1617,7 +1616,7 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext, *, workspace=
       extent_domain="world",
     )
 
-  _linesearch_iterative(m, d, ctx, fuse_jv, workspace=workspace)
+  _linesearch_iterative(m, d, ctx, fuse_jv, bindings=bindings)
 
 
 @cache_kernel
@@ -2121,10 +2120,9 @@ def _update_constraint(
   track_changes: bool = False,
   stable_fast: bool = False,
   *,
-  workspace=None,
+  bindings,
 ):
   """Update constraint arrays after each solve iteration."""
-  bindings = None if workspace is None else workspace.bindings
   efc_inputs = [
     m.opt.impratio_invsqrt,
     d.ne,
@@ -2802,14 +2800,13 @@ def _padding_h(nv: int, ctx_done_in: wp.array[bool], ctx_h_out: wp.array3d[float
 
 
 def _cholesky_factorize_solve(
-  m: types.Model, d: types.Data, ctx: SolverContext, skip_unchanged: bool = False, skip_noflip: bool = False, *, workspace=None
+  m: types.Model, d: types.Data, ctx: SolverContext, skip_unchanged: bool = False, skip_noflip: bool = False, *, bindings
 ):
   """Cholesky factorize ctx.h and form the Newton search direction.
 
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
-  bindings = None if workspace is None else workspace.bindings
   if m.nv <= _BLOCK_CHOLESKY_DIM:
     step_execution.launch_step_kernel(
       bindings,
@@ -3312,7 +3309,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         outputs=[ctx.h],
       )
 
-    _cholesky_factorize_solve(m, d, ctx, workspace=workspace)
+    _cholesky_factorize_solve(m, d, ctx, bindings=bindings)
   else:
     raise ValueError(f"Unknown solver type: {m.opt.solver}")
 
@@ -3386,7 +3383,7 @@ def _update_gradient_incremental(
       extent_domain="world",
     )
 
-  _cholesky_factorize_solve(m, d, ctx, skip_unchanged=True, skip_noflip=stable_fast, workspace=workspace)
+  _cholesky_factorize_solve(m, d, ctx, skip_unchanged=True, skip_noflip=stable_fast, bindings=bindings)
 
 
 @wp.kernel
@@ -3614,7 +3611,7 @@ def _solver_iteration(
   # flips this iteration were exactly quadratic over the step, so grad/search
   # only changed by a scalar along the same ray. Skip their qfrc/grad/
   # solve/search updates and track the scalar in ctx.grad_scale.
-  _update_constraint(m, d, ctx, track_changes=incremental, stable_fast=incremental, workspace=workspace)
+  _update_constraint(m, d, ctx, track_changes=incremental, stable_fast=incremental, bindings=bindings)
 
   if incremental:
     _update_gradient_incremental(m, d, ctx, stable_fast=incremental, workspace=workspace)
@@ -3712,10 +3709,7 @@ def init_context(
     threads_per_efc = ceil(m.nv / dofs_per_thread)
   # we need to clear the jaref array if we're doing atomic adds.
   if threads_per_efc > 1:
-    if workspace is None:
-      ctx.Jaref.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, ctx.Jaref, 0, "world")
+    step_execution.fill_step_rows(bindings, ctx.Jaref, 0, "world")
 
   sc = _sparse_compact(ctx)
   dj = ctx.compact_d_full if sc else d
@@ -3734,7 +3728,7 @@ def init_context(
   # Ma = M @ qacc
   _mul_m_compact_aware(m, d, ctx, d.efc.Ma, d.qacc, ctx.done, workspace=workspace)
 
-  _update_constraint(m, d, ctx, workspace=workspace)
+  _update_constraint(m, d, ctx, bindings=bindings)
 
   if grad:
     _update_gradient(m, d, ctx, compact=compact, workspace=workspace)
@@ -3783,10 +3777,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   if _use_incremental(m):
     # A new solve computes a new search direction: invalidate the mv/jv reuse
     # left over from the previous solve.
-    if workspace is None:
-      ctx.search_unchanged.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, ctx.search_unchanged, 0, "world")
+    step_execution.fill_step_rows(bindings, ctx.search_unchanged, 0, "world")
 
   # CG search = -Mgrad
   if m.opt.solver == types.SolverType.CG:
@@ -4163,7 +4154,7 @@ def solve_compact(m: types.Model, d: types.Data, *, workspace=None):
   Inactive DOFs are frozen to 0. On the incremental Newton path the solver
   kernels read the sparse M and J directly through the compaction maps.
   """
-  _compact_gather(m, d, workspace=workspace)
+  _compact_gather(m, d, bindings=None if workspace is None else workspace.bindings)
 
   if workspace is None:
     m2, d2 = _compact_solver_views(m, d)
@@ -4183,8 +4174,7 @@ def solve_compact(m: types.Model, d: types.Data, *, workspace=None):
 
 
 @event_scope
-def _compact_gather(m: types.Model, d: types.Data, *, workspace=None):
-  bindings = None if workspace is None else workspace.bindings
+def _compact_gather(m: types.Model, d: types.Data, *, bindings):
   nvp = d.nvmax_pad
   # gather compacted dense inertia and Jacobian only for dense models;
   # sparse models read sparse M and J directly through compaction maps
@@ -4205,10 +4195,7 @@ def _compact_gather(m: types.Model, d: types.Data, *, workspace=None):
       outputs=[d.cM],
       extent_domain="world",
     )
-    if workspace is None:
-      d.cJ.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, d.cJ, 0, "world")
+    step_execution.fill_step_rows(bindings, d.cJ, 0, "world")
     step_execution.launch_step_kernel(
       bindings,
       _gather_J_dense,

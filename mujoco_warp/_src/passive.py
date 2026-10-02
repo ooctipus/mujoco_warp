@@ -1378,18 +1378,11 @@ def passive(m: Model, d: Data, *, workspace=None):
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
   if dsbl_spring and dsbl_damper:
-    if workspace is None:
-      d.qfrc_spring.zero_()
-      d.qfrc_damper.zero_()
-      d.qfrc_gravcomp.zero_()
-      d.qfrc_fluid.zero_()
-      d.qfrc_passive.zero_()
-    else:
-      step_execution.fill_step_rows(workspace.bindings, d.qfrc_spring, 0, "world")
-      step_execution.fill_step_rows(workspace.bindings, d.qfrc_damper, 0, "world")
-      step_execution.fill_step_rows(workspace.bindings, d.qfrc_gravcomp, 0, "world")
-      step_execution.fill_step_rows(workspace.bindings, d.qfrc_fluid, 0, "world")
-      step_execution.fill_step_rows(workspace.bindings, d.qfrc_passive, 0, "world")
+    step_execution.fill_step_rows(bindings, d.qfrc_spring, 0, "world")
+    step_execution.fill_step_rows(bindings, d.qfrc_damper, 0, "world")
+    step_execution.fill_step_rows(bindings, d.qfrc_gravcomp, 0, "world")
+    step_execution.fill_step_rows(bindings, d.qfrc_fluid, 0, "world")
+    step_execution.fill_step_rows(bindings, d.qfrc_passive, 0, "world")
     return
 
   step_execution.launch_step_kernel(
@@ -1560,10 +1553,7 @@ def passive(m: Model, d: Data, *, workspace=None):
     )
 
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-  if workspace is None:
-    d.qfrc_gravcomp.zero_()
-  else:
-    step_execution.fill_step_rows(workspace.bindings, d.qfrc_gravcomp, 0, "world")
+  step_execution.fill_step_rows(bindings, d.qfrc_gravcomp, 0, "world")
   if gravity_enabled:
     step_execution.launch_step_kernel(
       bindings,
@@ -1631,10 +1621,7 @@ def passive(m: Model, d: Data, *, workspace=None):
   if m.has_fluid:
     _fluid(m, d)
 
-  if workspace is None:
-    d.qfrc_adhesion.zero_()
-  else:
-    step_execution.fill_step_rows(workspace.bindings, d.qfrc_adhesion, 0, "world")
+  step_execution.fill_step_rows(bindings, d.qfrc_adhesion, 0, "world")
   if m.flg_adhesion and (not (m.opt.disableflags & DisableBit.CONTACT)) and m.nv > 0:
     wp.launch(
       _qfrc_adhesion,
