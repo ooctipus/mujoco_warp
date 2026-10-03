@@ -69,6 +69,25 @@ def array_fields(source):
   yield from visit(source, "")
 
 
+def _replace_array_fields(value, path, arrays):
+  """Rebuild one subtree without retaining payloads in a self-referential closure."""
+  if path in arrays:
+    return arrays[path]
+  if isinstance(value, wp.CountParameter):
+    return value
+  if dataclasses.is_dataclass(value):
+    return dataclasses.replace(
+      value,
+      **{
+        field.name: _replace_array_fields(getattr(value, field.name), f"{path}.{field.name}" if path else field.name, arrays)
+        for field in dataclasses.fields(value)
+      },
+    )
+  if isinstance(value, (tuple, list)):
+    return type(value)(_replace_array_fields(child, f"{path}[{index}]", arrays) for index, child in enumerate(value))
+  return value
+
+
 def replace_arrays(source, arrays):
   """Return the native record tree with specified array bindings replaced.
 
@@ -86,24 +105,7 @@ def replace_arrays(source, arrays):
     if not isinstance(array, wp.array) or (array.dtype, array.ndim) != (declared[path].dtype, declared[path].ndim):
       raise ValueError(f"Replacement must retain native array dtype and rank: {path}")
 
-  def bind(value, path):
-    if path in arrays:
-      return arrays[path]
-    if isinstance(value, wp.CountParameter):
-      return value
-    if dataclasses.is_dataclass(value):
-      return dataclasses.replace(
-        value,
-        **{
-          field.name: bind(getattr(value, field.name), f"{path}.{field.name}" if path else field.name)
-          for field in dataclasses.fields(value)
-        },
-      )
-    if isinstance(value, (tuple, list)):
-      return type(value)(bind(child, f"{path}[{index}]") for index, child in enumerate(value))
-    return value
-
-  return bind(source, "")
+  return _replace_array_fields(source, "", arrays)
 
 
 @wp.kernel

@@ -513,6 +513,30 @@ class IOTest(parameterized.TestCase):
       with self.assertRaisesRegex(TypeError, "Unsupported mutable native field"):
         io.replace_arrays(invalid, {})
 
+  def test_replacement_releases_borrowed_arrays_without_cyclic_collection(self):
+    """Rebinding retains payloads only through the returned tree, never a recursive closure."""
+
+    @dataclasses.dataclass
+    class Record:
+      nested: tuple
+
+    original = wp.zeros(1, dtype=float, device="cpu")
+    replacement = wp.ones(2, dtype=float, device="cpu")
+    source = Record(([original],))
+    borrowed = weakref.ref(replacement)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+      result = io.replace_arrays(source, {"nested[0][0]": replacement})
+      del replacement
+      self.assertIs(result.nested[0][0], borrowed())
+      del result
+      self.assertIsNone(borrowed())
+      self.assertIs(source.nested[0][0], original)
+    finally:
+      if enabled:
+        gc.enable()
+
   @parameterized.parameters(("dense", False), ("sparse", True))
   def test_copy_worlds_preserves_snapshot_and_continuation(self, jacobian, sleeping):
     """Move real contacting worlds, including nonempty actuator delay history."""
