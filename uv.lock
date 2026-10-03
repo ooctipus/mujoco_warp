@@ -272,23 +272,11 @@ wheels = [
 [[package]]
 name = "gpu-components"
 version = "0.1.0"
-source = { editable = "../../gpu-components.wt/warp-capture" }
+source = { git = "https://github.com/ooctipus/gpu-components.git?rev=846288b15c32f4b45271597b169d4c241b0681c8#846288b15c32f4b45271597b169d4c241b0681c8" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "warp-lang" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy" },
-    { name = "warp-lang", editable = "../../warp.wt/capture-launches" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
 ]
 
 [[package]]
@@ -810,7 +798,7 @@ dev = [
 requires-dist = [
     { name = "absl-py" },
     { name = "etils", extras = ["epath"] },
-    { name = "gpu-components", editable = "../../gpu-components.wt/warp-capture" },
+    { name = "gpu-components", git = "https://github.com/ooctipus/gpu-components.git?rev=846288b15c32f4b45271597b169d4c241b0681c8" },
     { name = "jax", marker = "extra == 'cpu'" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
     { name = "lsprotocol", marker = "extra == 'dev'", specifier = ">=2023.0.1,<2024.0.0" },
@@ -824,8 +812,8 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "warp-lang", editable = "../../warp.wt/capture-launches" },
-    { name = "warp-lang", marker = "extra == 'dev'", editable = "../../warp.wt/capture-launches" },
+    { name = "warp-lang", specifier = ">=1.17" },
+    { name = "warp-lang", marker = "extra == 'dev'", specifier = ">=1.17" },
 ]
 provides-extras = ["dev", "cpu", "cuda"]
 
@@ -1713,39 +1701,18 @@ wheels = [
 
 [[package]]
 name = "warp-lang"
-source = { editable = "../../warp.wt/capture-launches" }
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "blosc", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and extra == 'examples') or (sys_platform != 'win32' and extra == 'examples')", specifier = ">=1.11.1" },
-    { name = "coverage", extras = ["toml"], marker = "extra == 'dev'" },
-    { name = "matplotlib", marker = "extra == 'examples'", specifier = ">=3.7.5" },
-    { name = "ml-dtypes", marker = "extra == 'dev'", specifier = ">=0.5.4" },
-    { name = "myst-parser", marker = "extra == 'docs'" },
-    { name = "numpy" },
-    { name = "nvidia-sphinx-theme", marker = "extra == 'docs'" },
-    { name = "nvtx", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and extra == 'dev') or (sys_platform != 'win32' and extra == 'dev')" },
-    { name = "pillow", marker = "extra == 'examples'", specifier = ">=10.4.0" },
-    { name = "pre-commit", marker = "extra == 'docs'" },
-    { name = "psutil", marker = "extra == 'examples'", specifier = ">=7.1.0" },
-    { name = "pyglet", marker = "extra == 'examples'", specifier = ">=2.1.9" },
-    { name = "sphinx-copybutton", marker = "extra == 'docs'" },
-    { name = "torch", marker = "extra == 'torch-cu12'", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "warp-lang", extra = "torch-cu12" } },
-    { name = "torch", marker = "extra == 'torch-cu13'", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "warp-lang", extra = "torch-cu13" } },
-    { name = "usd-core", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'win32' and extra == 'benchmark') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'benchmark') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'benchmark')", specifier = ">=25.5" },
-    { name = "usd-core", marker = "(platform_machine != 'ARM64' and platform_machine != 'aarch64' and platform_machine != 'arm64' and sys_platform == 'win32' and extra == 'examples') or (platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'examples') or (sys_platform != 'linux' and sys_platform != 'win32' and extra == 'examples')", specifier = ">=25.5" },
-    { name = "usd-exchange", marker = "python_full_version >= '3.10' and python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'benchmark'", specifier = ">=2.2" },
-    { name = "usd-exchange", marker = "python_full_version >= '3.10' and python_full_version < '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'examples'", specifier = ">=2.2" },
-    { name = "warp-lang", extras = ["docs"], marker = "extra == 'dev'" },
-    { name = "warp-lang", extras = ["examples"], marker = "extra == 'dev'" },
-    { name = "warp-lang", extras = ["examples"], marker = "extra == 'torch-cu12'" },
-    { name = "warp-lang", extras = ["examples"], marker = "extra == 'torch-cu13'" },
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/b0/9b1de407fa10b380f5ca4ed1c3e5b129be55ea26a927c7a49e45cdde14b0/warp_lang-1.17.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:f2fec43afb81caa2190c0b7fa3aaf4d869f3599839f0c40b9ead84331f91e993", size = 27544218, upload-time = "2026-08-31T05:52:29.177Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/a1/e11aa6898e8bbb6910e89fe31a3338fb2566f038912010875c072e6dafd1/warp_lang-1.17.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:47cd93636828dd16e55eeb4e77a0e3547b5fb0f383000a3d228629df68f28fd8", size = 164347636, upload-time = "2026-08-31T05:53:14.441Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/4f/a17b1f0ebfeabe37326f01afb6109961f20a0165c1258242f46d10a554f5/warp_lang-1.17.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:5051271048da956a8b94e2db9771ce60ce9591a3ac5bb49037f3d6812d1eea00", size = 172665443, upload-time = "2026-08-31T05:53:52.47Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/7a/36306a503085cbfc79c35a28e441c59dd1d8070d2dd65152345ebf2dfec2/warp_lang-1.17.0-py3-none-win_amd64.whl", hash = "sha256:ca35c82242a7553046f09023bbe56750b5c3d9af72625bd1a905a56d3189771d", size = 151236515, upload-time = "2026-08-31T05:54:27.944Z" },
 ]
-provides-extras = ["docs", "benchmark", "examples", "torch-cu12", "torch-cu13", "dev"]
 
 [[package]]
 name = "websockets"

@@ -46,9 +46,8 @@ url = "https://py.mujoco.org/"
 explicit = true
 
 [tool.uv.sources]
-# Development checkout for the unpublished component extraction.
-gpu-components = {path = "../../gpu-components.wt/warp-capture", editable = true}
-warp-lang = {path = "../../warp.wt/capture-launches", editable = true}
+# The application selects the custom Warp build for prepared execution.
+gpu-components = {git = "https://github.com/ooctipus/gpu-components.git", rev = "846288b15c32f4b45271597b169d4c241b0681c8"}
 mujoco = {index = "mujoco"}
 
 [project.optional-dependencies]
