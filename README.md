@@ -11,6 +11,14 @@ MJWarp is maintained by [Google DeepMind](https://deepmind.google/) and [NVIDIA]
 
 # Getting started
 
+This experimental branch adds prepared growable-memory execution. It requires the
+custom Warp `capture-launches` checkout selected in `pyproject.toml`, including
+`CountParameter`, captured operand records and explicit memory-operation extents.
+GPU Components itself also qualifies on released Warp 1.17; this MJWarp branch
+uses the additional Warp features. Ordinary concrete-data calls retain their
+numerical behavior. Prepared execution currently admits only the feature subset
+checked by `step_workspace_layout`.
+
 MuJoCo Warp requires an NVIDIA GPU for fast simulation but supports CPU for development and debugging.
 
 **Try it now:** view a simulation of a dancing humanoid robot locally on your machine:

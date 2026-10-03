@@ -2461,9 +2461,10 @@ class Data:
   cqfrc_constraint: array("nworld", "nvmax_pad", float)
 
   # warp only fields:
-  nworld: int
-  naconmax: int
-  naccdmax: int
+  # Concrete descriptors allocate storage; prepared execution may borrow count operands.
+  nworld: int | wp.CountParameter
+  naconmax: int | wp.CountParameter
+  naccdmax: int | wp.CountParameter
   njmax: int
   nvmax: int
   nvmax_pad: int

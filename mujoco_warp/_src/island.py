@@ -292,7 +292,7 @@ def direct_dsu(m: types.Model, d: types.Data, island_parent: wp.array2d[int]):
   # device keeps one block per world, since extra chunks would mostly launch past the
   # active prefix; a small batch with a long prefix is split until there is resident work.
   max_chunks = max(1, -(-d.njmax // _DSU_MIN_CHUNK))
-  nchunk = min(max(1, -(-_DSU_TARGET_BLOCKS // d.nworld)), max_chunks)
+  nchunk = min(max(1, -(-_DSU_TARGET_BLOCKS // wp.upper_bound(d.nworld))), max_chunks)
   chunk_size = -(-d.njmax // nchunk)
   wp.launch(
     _reset_dsu,
@@ -836,7 +836,7 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree: wp.array2
   )
 
   # 4. Map DOFs
-  d.island_dofadr.fill_(m.nv)
+  d.island_dofadr.fill_(m.nv, extent=(d.nworld, *d.island_dofadr.shape[1:]))
   wp.launch(
     _island_map_dofs,
     dim=(d.nworld, m.nv),

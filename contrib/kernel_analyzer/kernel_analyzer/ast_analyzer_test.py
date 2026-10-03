@@ -245,6 +245,15 @@ class TestAnalyzer(absltest.TestCase):
     issues = _analyze_str(_TYPE_MISMATCH_CODE)
     _assert_has_issue(issues, ast_analyzer.TypeMismatch)
 
+  def test_host_count_operands_require_integer_kernel_arguments(self):
+    for dtype in ("int", "float", "int | wp.CountParameter"):
+      with self.subTest(dtype=dtype):
+        source = f"@wp.kernel\ndef count(nworld_in: {dtype}):\n    pass\n"
+        mismatches = [issue for issue in _analyze_str(source) if isinstance(issue, ast_analyzer.TypeMismatch)]
+        self.assertEqual(len(mismatches), 0 if dtype == "int" else 1)
+        if mismatches:
+          self.assertEqual(mismatches[0].expected_type, "int")
+
   def test_model_field_suffix_issue(self):
     """Test that model fields with suffixes raise an issue."""
     issues = _analyze_str(_MODEL_SUFFIX_CODE)

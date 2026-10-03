@@ -1247,7 +1247,7 @@ def sleep(m: types.Model, d: types.Data, *, island_can_sleep: wp.array2d[int] | 
   if island_can_sleep is None:
     island_can_sleep = wp.ones((d.nworld, m.ntree), dtype=int)
   else:
-    island_can_sleep.fill_(1)
+    island_can_sleep.fill_(1, extent=(d.nworld, *island_can_sleep.shape[1:]))
   wp.launch(
     _check_island_can_sleep,
     dim=(d.nworld, m.ntree),

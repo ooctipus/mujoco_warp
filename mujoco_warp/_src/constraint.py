@@ -5499,7 +5499,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz: wp.array[int] | N
       contact_frame_2d = wp.array(
         ptr=d.contact.frame.ptr,
         dtype=wp.vec3,
-        shape=(d.naconmax, 3),
+        shape=(d.contact.frame.shape[0], 3),
         strides=(d.contact.frame.strides[0], 12),
         device=d.contact.frame.device,
         copy=False,
@@ -5507,7 +5507,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz: wp.array[int] | N
       contact_friction_2d = wp.array(
         ptr=d.contact.friction.ptr,
         dtype=float,
-        shape=(d.naconmax, 5),
+        shape=(d.contact.friction.shape[0], 5),
         strides=(d.contact.friction.strides[0], 4),
         device=d.contact.friction.device,
         copy=False,
@@ -5686,7 +5686,7 @@ def make_constraint(m: types.Model, d: types.Data, *, efc_nnz: wp.array[int] | N
             ],
           )
       else:
-        d.efc.Jqvel.zero_()
+        d.efc.Jqvel.zero_(extent=(d.nworld, *d.efc.Jqvel.shape[1:]))
         tile_size = m.block_dim.contact_jac_tiled
         n_dof_blocks = (m.nv_pad + tile_size - 1) // tile_size
 

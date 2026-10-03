@@ -13,13 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Compile declared native count relations onto an already captured step.
+"""Bind numerical count operands to the composing engine's admitted device scalars.
 
-Physics emits ordinary Warp launches. This composition boundary imports native
-kernel definitions and factory identities, then assigns the explicit population's
-count sources. It neither infers semantics from shapes nor discovers ownership
-from operands. Workspace preparation owns scratch; Warp records ordinary memory
-operations, and generic fields operations validate their explicit storage domains.
+Warp preserves count identity at each operation. This boundary validates native
+storage and passes that numeric relation to GPU Components; it does not classify
+kernels or reconstruct count meaning from code identity, shapes or launch order.
 """
 
 from __future__ import annotations
@@ -32,21 +30,6 @@ from gpu_components import graph as graph_ops
 from gpu_components.field_data import FieldStorage
 from gpu_components.graph_data import GraphKernelBinding
 from gpu_components.graph_data import GraphUpdateTable
-from gpu_components.graph_data import KernelParameterBinding
-
-from mujoco_warp._src import collision_convex
-from mujoco_warp._src import collision_driver
-from mujoco_warp._src import collision_primitive
-from mujoco_warp._src import constraint
-from mujoco_warp._src import derivative
-from mujoco_warp._src import forward
-from mujoco_warp._src import island
-from mujoco_warp._src import passive
-from mujoco_warp._src import sleep
-from mujoco_warp._src import smooth
-from mujoco_warp._src import solver
-from mujoco_warp._src import support
-from mujoco_warp._src.warp_util import kernel_instances
 
 
 @dataclasses.dataclass(eq=False)
@@ -81,6 +64,8 @@ def _layout(value, memo=None):
   descriptors; later occurrences record their traversal ordinal. The memo retains
   temporary containers and is never reused by a subsequent validation.
   """
+  if isinstance(value, wp.CountParameter):
+    return wp.CountParameter, id(value), value.maximum
   if value is None or isinstance(value, (int, float, bool, str)):
     return value
   if memo is None:
@@ -120,7 +105,9 @@ def validate_step_workspace(workspace, model, data):
   if model is not workspace.model or data is not workspace.data:
     raise ValueError("Prepared workspace requires its original model, data and immutable step options")
   memo = {}
-  if _layout(data, memo) != workspace._data_layout or _layout(model, memo) != workspace._model_layout:
+  if (
+    _layout((data, workspace.execution_data), memo) != workspace._data_layout or _layout(model, memo) != workspace._model_layout
+  ):
     raise ValueError("Prepared Model/Data descriptors or scalar metadata changed; prepare a new workspace")
   if (
     _layout(
@@ -198,39 +185,6 @@ def _validate_bindings(bindings):
     raise ValueError("Native recording binding changed; restore its original storage, counts, updates and bindings")
 
 
-def resolve_step_counts(bindings, kernel, extent_domain, extent_axis, parameter_domains):
-  """Resolve native count labels to numeric descriptors; mutate no recording state.
-
-  A dynamic extent is the leading axis of world, candidate or CCD storage. Fixed
-  worker grids explicitly use extent_domain=None and extent_axis=None. Named int32
-  scalar arguments may independently use any of those domains. Returned descriptors
-  borrow their exact count arrays; parameter indices include Warp's launch bounds.
-  """
-  _validate_bindings(bindings)
-  owners = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
-  if extent_domain is not None and extent_domain not in owners:
-    raise ValueError(f"Unknown native extent domain: {extent_domain!r}")
-  if extent_domain is None and extent_axis is not None:
-    raise ValueError("A fixed worker grid must explicitly omit its extent axis")
-  if extent_domain is not None and (type(extent_axis) is not int or extent_axis != 0):
-    raise ValueError("Native dynamic extents require explicit leading axis zero")
-  if parameter_domains is not None and len(parameter_domains) > 4:
-    raise ValueError("A native launch supports at most four count parameters")
-  sources = {
-    name: (owner.protected_count if name == "world" else owner.ready_count, owner.capacity) for name, owner in owners.items()
-  }
-  labels = {argument.label: (index + 1, argument.type) for index, argument in enumerate(kernel.adj.args)}
-  parameters = []
-  for name, domain in (parameter_domains or {}).items():
-    if name not in labels or domain not in sources:
-      raise ValueError(f"Unknown native count argument or domain: {name!r}, {domain!r}")
-    index, dtype = labels[name]
-    if dtype not in (int, wp.int32):
-      raise ValueError(f"Native count argument must be int32: {name!r}")
-    parameters.append(KernelParameterBinding(index, *sources[domain]))
-  return sources[extent_domain][0] if extent_domain is not None else None, tuple(parameters)
-
-
 def _retain_bindings(bindings, graph):
   """Retain admitted resources and freeze the one binding relation for this program."""
   _validate_bindings(bindings)
@@ -260,145 +214,13 @@ def _fail_recording(bindings, stream=None):
     pass
 
 
-_WORLD, _CANDIDATE, _CCD = range(3)
-_DOMAIN_NAMES = ("world", "candidate", "ccd")
-
-# Every dynamic native extent is its declared population's leading axis.
-# Scalar labels are a schema front door only; compilation resolves exact int32
-# argument positions before the generic graph API receives a declaration.
-_KERNEL_DOMAINS = {
-  collision_driver._any_awake_changed: (_WORLD, ()),
-  constraint._zero_constraint_counts: (_WORLD, ()),
-  derivative._qderiv_actuator_passive: (_WORLD, ()),
-  derivative._qderiv_actuator_passive_actuation_sparse: (_WORLD, ()),
-  derivative._qderiv_actuator_passive_vel: (_WORLD, ()),
-  derivative._qderiv_tendon_damping: (_WORLD, ()),
-  forward._actuator_force: (_WORLD, ()),
-  forward._actuator_velocity: (_WORLD, ()),
-  forward._next_activation: (_WORLD, ()),
-  forward._next_position: (_WORLD, ()),
-  forward._next_velocity: (_WORLD, ()),
-  forward._qfrc_actuator: (_WORLD, ()),
-  forward._qfrc_actuator_gravcomp_limits: (_WORLD, ()),
-  island._compress_roots: (_WORLD, ()),
-  island._compute_efc_tree: (_WORLD, ()),
-  island._init_dof_arrays: (_WORLD, ()),
-  island._init_efc_arrays: (_WORLD, ()),
-  island._init_island_arrays: (_WORLD, ()),
-  island._island_count_constraints: (_WORLD, ()),
-  island._island_count_dofs: (_WORLD, ()),
-  island._island_dsu: (_WORLD, ()),
-  island._island_map_constraints: (_WORLD, ()),
-  island._island_map_dofs: (_WORLD, ()),
-  island._island_scan_sizes: (_WORLD, ()),
-  island._label_roots: (_WORLD, ()),
-  island._propagate_labels: (_WORLD, ()),
-  island._reset_compact_maps: (_WORLD, ()),
-  island._reset_dsu: (_WORLD, ()),
-  passive._gravity_force: (_WORLD, ()),
-  passive._spring_damper_dof_passive: (_WORLD, ()),
-  sleep._build_cycles: (_WORLD, ()),
-  sleep._check_island_can_sleep: (_WORLD, ()),
-  sleep._clear_disabled_dofs: (_WORLD, ()),
-  sleep._sweep_awake_trees: (_WORLD, ()),
-  sleep._update_sleep_bodies: (_WORLD, ()),
-  sleep._update_sleep_dofs: (_WORLD, ()),
-  sleep._update_sleep_trees: (_WORLD, ()),
-  sleep._wake_collision_kernel: (_CANDIDATE, ()),
-  sleep._wake_kernel: (_WORLD, ()),
-  sleep._zero_sleep_counters: (_WORLD, ()),
-  smooth._M: (_WORLD, ()),
-  smooth._cacc_branch: (_WORLD, ()),
-  smooth._cacc_world: (_WORLD, ()),
-  smooth._cdof: (_WORLD, ()),
-  smooth._cfrc: (_WORLD, ()),
-  smooth._cfrc_backward: (_WORLD, ()),
-  smooth._cinert: (_WORLD, ()),
-  smooth._compute_body_inertial_frames: (_WORLD, ()),
-  smooth._compute_body_matrices: (_WORLD, ()),
-  smooth._comvel_branch: (_WORLD, ()),
-  smooth._comvel_root: (_WORLD, ()),
-  smooth._crb_accumulate: (_WORLD, ()),
-  smooth._geom_local_to_global: (_WORLD, ()),
-  smooth._kinematics_branch: (_WORLD, ()),
-  smooth._qfrc_bias: (_WORLD, ()),
-  smooth._site_local_to_global: (_WORLD, ()),
-  smooth._subtree_com_acc: (_WORLD, ()),
-  smooth._subtree_com_init: (_WORLD, ()),
-  smooth._subtree_div: (_WORLD, ()),
-  smooth._transmission: (_WORLD, ()),
-  solver._gather_J_dense: (_WORLD, ()),
-  solver._gather_M_sparse: (_WORLD, ()),
-  solver._gather_dof_vecs_compact: (_WORLD, ()),
-  solver._gather_rhs_compact: (_WORLD, ()),
-  solver._init_compact_inertia: (_WORLD, ()),
-  solver._mul_m_sparse_compact: (_WORLD, ()),
-  solver._qfrc_constraint_from_grad: (_WORLD, ()),
-  solver._scatter_dof_vecs: (_WORLD, ()),
-  solver._scatter_solution: (_WORLD, ()),
-  solver._solve_init_efc: (_WORLD, ()),
-  solver._update_gradient_h_incremental: (_WORLD, ()),
-  solver._zero_change_counters: (_WORLD, ()),
-  solver._zero_qfrc_constraint_sparse: (_WORLD, ()),
-  support._apply_ft: (_WORLD, ()),
-}
-
-_FACTORY_DOMAINS = {
-  collision_convex.ccd_kernel_builder: (None, (("naconmax_in", _CANDIDATE), ("naccdmax_in", _CCD))),
-  collision_driver._nxn_broadphase: (_WORLD, (("naconmax_in", _CANDIDATE),)),
-  collision_primitive._primitive_narrowphase: (_CANDIDATE, (("naconmax_in", _CANDIDATE),)),
-  constraint._efc_contact_init: (_CANDIDATE, ()),
-  constraint._efc_contact_jac_dense: (_WORLD, ()),
-  constraint._efc_contact_jac_sparse: (_CANDIDATE, ()),
-  constraint._efc_contact_update: (_CANDIDATE, ()),
-  constraint._friction_dof: (_WORLD, ()),
-  constraint._limit_slide_hinge: (_WORLD, ()),
-  forward._next_time_builder: (_WORLD, (("nworld_in", _WORLD), ("naconmax_in", _CANDIDATE))),
-  forward._qfrc_smooth: (_WORLD, ()),
-  island._compact_dofs_builder: (_WORLD, ()),
-  passive._qfrc_passive_kernel: (_WORLD, ()),
-  smooth._small_cholesky_factorize_solve_block: (_WORLD, ()),
-  solver._JTDACJ_sparse: (_WORLD, ()),
-  solver._cholesky_factorize_solve_blocked: (_WORLD, ()),
-  solver._linesearch_iterative_kernel: (_WORLD, ()),
-  solver._linesearch_jv_fused_kernel: (_WORLD, ()),
-  solver._solve_done: (_WORLD, ()),
-  solver._solve_init_dof: (_WORLD, ()),
-  solver._solve_init_jaref_kernel: (_WORLD, ()),
-  solver._update_constraint_efc: (_WORLD, ()),
-  solver._update_constraint_init_qfrc_constraint_dense: (_WORLD, ()),
-  solver._update_constraint_init_qfrc_constraint_sparse: (_WORLD, ()),
-  solver._update_gradient_JTDAJ_dense_tiled_compact: (_WORLD, ()),
-  solver._update_gradient_cholesky: (_WORLD, ()),
-  solver._update_gradient_cholesky_blocked: (_WORLD, ()),
-  solver._update_gradient_cholesky_blocked_skip_unchanged: (_WORLD, ()),
-  solver._update_gradient_grad: (_WORLD, ()),
-  solver._update_gradient_h_incremental_sparse: (_WORLD, ()),
-  solver._update_gradient_init_h_sparse: (_WORLD, ()),
-  solver._update_gradient_zero_grad_dot: (_WORLD, ()),
-  support.mul_m_kernel: (_WORLD, ()),
-}
-
-
-def _kernel_contracts():
-  """Resolve already materialized factory instances by exact owner identity."""
-  contracts = dict(_KERNEL_DOMAINS)
-  for factory, contract in _FACTORY_DOMAINS.items():
-    for kernel in kernel_instances(factory):
-      if kernel in contracts and contracts[kernel] != contract:
-        raise ValueError("One native kernel has conflicting domain declarations")
-      contracts[kernel] = contract
-  return contracts
-
-
 def bind_step_program(workspace, graph: wp.Graph, launches: tuple[wp.CapturedLaunch, ...]) -> None:
-  """Compile exact numerical records using the prepared owner's native domains.
+  """Bind exact numerical occurrences through their prepared count operands.
 
   The caller selects this population's records, excluding application callbacks.
-  Native kernels have explicit count declarations. Ordinary Warp fills and copies
-  require canonical memory-operation records and exact registered field descriptors;
-  global counters are explicitly fixed. Unknown operations prevent publication.
-  Generic batch adoption proves record identity, complete coverage and dependencies.
+  Memory records carry the intended region; registered storage only certifies its
+  admission. Fixed operations have neither parameterized extents nor scalar uses.
+  GPU Components proves record identity, operand coverage and updater ordering.
   """
   bindings = workspace.bindings
   try:
@@ -408,47 +230,23 @@ def bind_step_program(workspace, graph: wp.Graph, launches: tuple[wp.CapturedLau
     if type(launches) is not tuple:
       raise TypeError("Native program launches must be an explicit immutable tuple")
     _retain_bindings(bindings, graph)
-    sources = (
-      (bindings.world_storage, bindings.world_storage.protected_count),
-      (bindings.contact_storage, bindings.contact_storage.ready_count),
-      (bindings.ccd_storage, bindings.ccd_storage.ready_count),
+    storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
+    count_sources = (
+      (workspace.execution_data.nworld, bindings.world_storage.protected_count),
+      (workspace.execution_data.naconmax, bindings.contact_storage.ready_count),
+      (workspace.execution_data.naccdmax, bindings.ccd_storage.ready_count),
     )
-    fixed_arrays = [workspace.data.nacon, workspace.data.ncollision, bindings.world_storage.protected_count]
+    fixed_arrays = [workspace.data.nacon, workspace.data.ncollision]
     fixed_arrays.extend(workspace.arrays[spec.name] for spec in workspace._specs if spec.capacity_domain == "global_counter")
     fixed_arrays = tuple({(id(a.device), a.ptr, a.shape, a.strides, a.dtype): a for a in fixed_arrays}.values())
     launch_ids = {id(record) for record in launches}
     operations = tuple(op for op in wp.capture_get_memory_operations(graph) if id(op.launch) in launch_ids)
-    memory_extents = field_ops.memory_operation_extents(graph, operations, sources, fixed_arrays=fixed_arrays)
-    memory = {id(operation.launch): extent for operation, extent in zip(operations, memory_extents)}
-    contracts = _kernel_contracts()
-    extents, parameters, fixed = [], [], []
-    for index, record in enumerate(launches):
-      if id(record) in memory:
-        axis, count = memory[id(record)]
-        if axis is None:
-          fixed.append(index)
-        else:
-          extents.append((index, axis, count))
-        continue
-      if record.kernel not in contracts:
-        raise ValueError(f"Captured kernel has no native count declaration: {record.kernel.key}")
-      extent, declarations = contracts[record.kernel]
-      if extent is not None and record.dim[0] != sources[extent][0].capacity:
-        raise ValueError("Native captured extent must match its declared population capacity")
-      count, scalars = resolve_step_counts(
-        bindings,
-        record.kernel,
-        _DOMAIN_NAMES[extent] if extent is not None else None,
-        0 if extent is not None else None,
-        {label: _DOMAIN_NAMES[domain] for label, domain in declarations},
-      )
-      if extent is not None:
-        extents.append((index, 0, count))
-      parameters.extend((index, parameter) for parameter in scalars)
-      if extent is None and not scalars:
-        fixed.append(index)
+    field_ops.validate_memory_operations(graph, operations, storages, count_sources=count_sources, fixed_arrays=fixed_arrays)
+    fixed = tuple(
+      index for index, record in enumerate(launches) if not record.extent_parameters and not record.scalar_parameters
+    )
     bindings.bindings.extend(
-      graph_ops.adopt_launches(bindings.updates, graph, launches, extents=extents, parameters=parameters, fixed=fixed)
+      graph_ops.adopt_launches(bindings.updates, graph, launches, count_sources=count_sources, fixed=fixed)
     )
   except BaseException:
     _fail_recording(bindings)

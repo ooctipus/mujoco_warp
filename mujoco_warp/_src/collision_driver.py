@@ -1026,7 +1026,7 @@ def collision(
   incremental sleeping pass: contacts are appended to the existing buffer and only pairs involving
   a newly-awakened body are emitted.
   """
-  if d.naconmax == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
+  if wp.upper_bound(d.naconmax) == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
     d.nacon.zero_()
     return
 

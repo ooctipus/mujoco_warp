@@ -56,6 +56,7 @@ class _StepWorkspace:
 
   model: types.Model
   data: types.Data
+  execution_data: types.Data
   bindings: step_program.StepBindings | None
   device: object
   storage: wp.array | None
@@ -110,15 +111,18 @@ def step_workspace_layout(
   gathered/sparse inertia factorizations also lack prepared count bindings.
   At least one dynamic tree is required; the static-only island path is unbound.
   Field domains separate world, candidate, CCD and scalar-counter capacity.
-  Every admitted runtime launch and world/candidate/CCD memory operation must
-  declare its native count domain at captured-program composition. Reject unsupported
-  execution branches here before allocating any scratch.
+  Execution operands retain their count identity. Planning uses their upper bounds
+  for concrete array layouts. Reject unsupported execution branches before allocation.
   A real one-world CPU or GPU Data template supplies topology/solver dimensions.
   Capacity overrides plan larger reservations without cloning Data or allocating
   storage. Omitted capacities use Data's current values. All capacities are positive
   int32 counts. This operation performs no stream or device-context operation.
   """
   m, d = model, data
+  if any(isinstance(getattr(d, name, None), wp.CountParameter) for name in ("nworld", "naconmax", "naccdmax")):
+    d = dataclasses.replace(
+      data, nworld=wp.upper_bound(data.nworld), naconmax=wp.upper_bound(data.naconmax), naccdmax=wp.upper_bound(data.naccdmax)
+    )
   required = (
     m.opt.solver == types.SolverType.NEWTON,
     m.opt.integrator == types.IntegratorType.IMPLICITFAST,
@@ -232,7 +236,9 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   Blocked Cholesky matrices (Data.cM/cqLD and solver.h/hfactor on the blocked
   Newton path) require 16-byte-aligned bases and both world and matrix-row strides.
   Scalar counters and nonblocked/empty matrices retain their natural alignment.
-  Fixed execution supplies bindings=None. Dynamic execution borrows StepBindings;
+  Data remains the original concrete storage descriptor. Fixed execution uses it
+  directly. Dynamic execution borrows StepBindings and creates a shallow execution
+  view whose three count operands remain distinct from storage capacities;
   its world protected count is the sole world-live-count source. Admission enforces
   values in [0, data.nworld] and physically ready rows; candidate and CCD extents use
   their independent storage ready counts. Native operations bind declared launches
@@ -242,7 +248,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   the updater identity is fixed at the first recorded operation. Temporarily detached
   bindings must be restored before recording any step. Numerical stages borrow
   workspace.scratch and use ordinary Warp operations. The captured-program composition
-  boundary assigns their count semantics; no global Warp dispatch is replaced.
+  boundary binds their count operands; no global Warp dispatch is replaced.
   """
   if bindings is not None and arrays is None:
     raise ValueError("Dynamic execution requires caller-owned registered scratch")
@@ -252,6 +258,10 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
     raise RuntimeError("Prepare native step workspace before graph capture")
   if bindings is not None:
     step_program._validate_bindings(bindings)
+  counts = (data.nworld, data.naconmax, data.naccdmax)
+  if any(isinstance(count, wp.CountParameter) for count in counts):
+    raise ValueError("Workspace preparation requires the original concrete Data descriptor")
+  if bindings is not None:
     if bindings.world_storage.device != data.qpos.device:
       raise ValueError("Native storage must use the Data device")
     for storage, name in (
@@ -264,7 +274,15 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   specs = step_workspace_layout(model, data)
   solver.validate_blocked_matrix(data.cM)
   solver.validate_blocked_matrix(data.cqLD)
-  m2, d2 = solver._compact_solver_views(model, data)
+  execution_data = data
+  if bindings is not None:
+    execution_data = dataclasses.replace(
+      data,
+      nworld=wp.CountParameter(data.nworld),
+      naconmax=wp.CountParameter(data.naconmax),
+      naccdmax=wp.CountParameter(data.naccdmax),
+    )
+  m2, d2 = solver._compact_solver_views(model, execution_data)
   device = data.qpos.device
   storage, offsets = None, None
   if arrays is None:
@@ -311,8 +329,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
     **{name: arrays["solver." + name] for name, _, _, _ in solver._solver_context_layout(m2, d2)}
   )
   solver.validate_solver_scratch(m2, solver_context)
-  solver_context.compact_m_full, solver_context.compact_d_full = model, data
-  world_count = None if bindings is None else bindings.world_storage.protected_count
+  solver_context.compact_m_full, solver_context.compact_d_full = model, execution_data
   implicit_scratch = forward._ImplicitScratch(
     **{field.name: arrays[field.name] for field in dataclasses.fields(forward._ImplicitScratch)}
   )
@@ -325,7 +342,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
         island_parent=arrays["island_parent"],
         transmission=smooth._TransmissionScratch(arrays["moment_nnz"], None),
       ),
-      solver=solver._SolverScratch(m2, d2, solver_context, arrays["nsolving"], world_count, arrays["efc_tree"]),
+      solver=solver._SolverScratch(m2, d2, solver_context, arrays["nsolving"], arrays["efc_tree"]),
     ),
     implicit=implicit_scratch,
   )
@@ -333,6 +350,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   return _StepWorkspace(
     model=model,
     data=data,
+    execution_data=execution_data,
     bindings=bindings,
     device=device,
     storage=storage,
@@ -342,7 +360,7 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
     _allocation_offsets_bytes=offsets,
     _execution_binding=bindings,
     _binding_layout=step_program._binding_layout(bindings),
-    _data_layout=step_program._layout(data, memo),
+    _data_layout=step_program._layout((data, execution_data), memo),
     _model_layout=step_program._layout(model, memo),
     _scratch_layout=step_program._layout((tuple(arrays.items()), scratch), memo),
   )

@@ -41,13 +41,12 @@ _BLOCK_CHOLESKY_DIM = 32
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class _SolverScratch:
-  """Borrowed compact model/data views, solver arrays and numerical world-count operand."""
+  """Borrowed compact model/data views and solver scratch arrays."""
 
   model: types.Model
   data: types.Data
   context: SolverContext
   nsolving: wp.array[int]
-  world_count: wp.array[int] | None
   efc_tree: wp.array2d[int]
 
 
@@ -3160,7 +3159,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         outputs=[ctx.h],
       )
 
-      groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax)
+      groups_per_world = _jtdaj_groups_per_world(wp.upper_bound(d.nworld), d.njmax)
       max_condim = 3
       if m.opt.cone == types.ConeType.ELLIPTIC and m.nmaxcondim > 3:
         max_condim = int(m.nmaxcondim)
@@ -3307,7 +3306,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
   sc = _sparse_compact(ctx)
   if m.is_sparse or sc:
     dj = ctx.compact_d_full if sc else d
-    slots = _jtdaj_groups_per_world(d.nworld, ctx.quad_changed_ids.shape[1])
+    slots = _jtdaj_groups_per_world(wp.upper_bound(d.nworld), ctx.quad_changed_ids.shape[1])
     wp.launch(
       _update_gradient_h_incremental_sparse(sc),
       dim=(d.nworld, slots, _JTDAJ_THREADS_PER_GROUP),
@@ -3654,7 +3653,7 @@ def init_context(
     threads_per_efc = ceil(m.nv / dofs_per_thread)
   # we need to clear the jaref array if we're doing atomic adds.
   if threads_per_efc > 1:
-    ctx.Jaref.zero_()
+    ctx.Jaref.zero_(extent=(d.nworld, *ctx.Jaref.shape[1:]))
 
   sc = _sparse_compact(ctx)
   dj = ctx.compact_d_full if sc else d
@@ -3692,14 +3691,14 @@ def solve(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = Non
   if scratch is not None:
     raise ValueError("Compact solver scratch requires sleeping-enabled execution")
   if d.njmax == 0 or m.nv == 0:
-    wp.copy(d.qacc, d.qacc_smooth)
-    d.solver_niter.fill_(0)
+    wp.copy(d.qacc, d.qacc_smooth, extent=(d.nworld, *d.qacc.shape[1:]))
+    d.solver_niter.fill_(0, extent=(d.nworld,))
   else:
     ctx = _create_solver_context(m, d)
     _solve(m, d, ctx)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, nsolving=None, world_count=None):
+def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, nsolving=None):
   """Finds forces that satisfy constraints."""
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
@@ -3715,7 +3714,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   if _use_incremental(m):
     # A new solve computes a new search direction: invalidate the mv/jv reuse
     # left over from the previous solve.
-    ctx.search_unchanged.zero_()
+    ctx.search_unchanged.zero_(extent=(d.nworld, *ctx.search_unchanged.shape[1:]))
 
   # CG search = -Mgrad
   if m.opt.solver == types.SolverType.CG:
@@ -3729,10 +3728,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
 
   if nsolving is None:
     nsolving = wp.empty(shape=(1,), dtype=int)
-  if world_count is None:
-    nsolving.fill_(d.nworld)
-  else:
-    wp.copy(nsolving, world_count)
+  nsolving.fill_(d.nworld)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
     # as long as condition_iteration is not zero.
@@ -4082,10 +4078,10 @@ def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | No
     sctx.compact_d_full = d
   else:
     m2, d2, sctx = scratch.model, scratch.data, scratch.context
-    sctx.grad.zero_()
-    sctx.ls_exhausted.zero_()
-  nsolving, world_count = (None, None) if scratch is None else (scratch.nsolving, scratch.world_count)
-  _solve(m2, d2, sctx, compact=True, nsolving=nsolving, world_count=world_count)
+    sctx.grad.zero_(extent=(d.nworld, *sctx.grad.shape[1:]))
+    if sctx.ls_exhausted.size:
+      sctx.ls_exhausted.zero_(extent=(d.nworld,))
+  _solve(m2, d2, sctx, compact=True, nsolving=None if scratch is None else scratch.nsolving)
 
   _compact_scatter(m, d)
 
@@ -4108,7 +4104,7 @@ def _compact_gather(m: types.Model, d: types.Data):
       inputs=[m.M_rownnz, m.M_rowadr, m.M_colind, d.M, d.dof_cdof],
       outputs=[d.cM],
     )
-    d.cJ.zero_()
+    d.cJ.zero_(extent=(d.nworld, *d.cJ.shape[1:]))
     wp.launch(
       _gather_J_dense,
       dim=(d.nworld, d.njmax),

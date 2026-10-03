@@ -17,7 +17,6 @@ import dataclasses
 import functools
 import inspect
 import warnings
-import weakref
 
 import warp as wp
 
@@ -150,9 +149,7 @@ _KERNEL_CACHE = {}
 
 
 def cache_kernel(func):
-  # Memoization can be cleared when module options change. Provenance survives
-  # for kernels still held by callers or capture records, without retaining them.
-  cache, instances = {}, weakref.WeakSet()
+  cache = {}
 
   @functools.wraps(func)
   def wrapper(*args):
@@ -165,31 +162,17 @@ def cache_kernel(func):
 
     key = tuple(_hash_arg(a) for a in args)
     if key not in cache:
-      kernel = func(*args)
-      instances.add(kernel)
-      cache[key] = kernel
+      cache[key] = func(*args)
     return cache[key]
 
-  _KERNEL_CACHE[wrapper] = cache, instances
+  _KERNEL_CACHE[wrapper] = cache
   return wrapper
 
 
 def clear_kernel_cache():
-  """Regenerate future specializations; preserve provenance of still-live kernels."""
-  for cache, _ in _KERNEL_CACHE.values():
+  """Regenerate future specializations without changing kernels retained by callers."""
+  for cache in _KERNEL_CACHE.values():
     cache.clear()
-
-
-def kernel_instances(factory) -> tuple[wp.Kernel, ...]:
-  """Return the exact generated kernels owned by one cache_kernel factory.
-
-  This relation exposes identity only; callers must declare the meaning of a
-  factory separately. No generated name or argument size identifies a family.
-  Clearing memoization does not remove old kernels retained by a captured graph.
-  """
-  if factory not in _KERNEL_CACHE:
-    raise ValueError("Kernel instances require an exact cache_kernel factory")
-  return tuple(_KERNEL_CACHE[factory][1])
 
 
 def check_toolkit_driver():

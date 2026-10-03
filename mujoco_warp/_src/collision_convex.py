@@ -1335,7 +1335,7 @@ def convex_narrowphase(
     idx = upper_trid_index(len(GeomType), p1, p2)
     return m.geom_pair_type_count[idx], idx
 
-  ncollision, epa_iterations, shapes = _convex_scratch_shapes(m, collision_table, d.naccdmax)
+  ncollision, epa_iterations, shapes = _convex_scratch_shapes(m, collision_table, wp.upper_bound(d.naccdmax))
   if ncollision == 0:
     return
   if scratch is None:
@@ -1454,7 +1454,7 @@ def convex_narrowphase(
         m.block_dim.convex_ccd,
         int(m.opt.warn_overflow),
       )
-      ccd_grid = _ccd_grid_size(ccd_k, d.naconmax, d.ncollision.device)
+      ccd_grid = _ccd_grid_size(ccd_k, wp.upper_bound(d.naconmax), d.ncollision.device)
       wp.launch(
         ccd_k,
         dim=ccd_grid,

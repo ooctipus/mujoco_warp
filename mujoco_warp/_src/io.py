@@ -89,6 +89,8 @@ def replace_arrays(source, arrays):
   def bind(value, path):
     if path in arrays:
       return arrays[path]
+    if isinstance(value, wp.CountParameter):
+      return value
     if dataclasses.is_dataclass(value):
       return dataclasses.replace(
         value,
@@ -437,6 +439,8 @@ def replicate_data(data: types.Data, nworld: int) -> types.Data:
   The source must have no contact overflow. All destination arrays are independent.
   This copies a snapshot; it does not reset an episode or copy a captured graph.
   """
+  if any(isinstance(value, wp.CountParameter) for value in (data.nworld, data.naconmax, data.naccdmax)):
+    raise ValueError("Data replication requires concrete counts, not a prepared execution descriptor")
   if data.nworld != 1:
     raise ValueError("Replication requires a one-world Data source")
   if isinstance(nworld, bool) or not isinstance(nworld, (int, np.integer)) or nworld < 1:
@@ -2691,6 +2695,10 @@ def make_data(
   Returns:
     The data object containing the current state and output arrays (device).
   """
+  if any(
+    isinstance(value, wp.CountParameter) for value in (nworld, nconmax, nccdmax, njmax, njmax_nnz, naconmax, naccdmax, nvmax)
+  ):
+    raise ValueError("Data allocation requires concrete dimensions, not count operands")
   # TODO(team): move nconmax, njmax to Model?
   if nconmax is None:
     nconmax = _default_nconmax(mjm)
@@ -2919,6 +2927,10 @@ def put_data(
   Returns:
     The data object containing the current state and output arrays (device).
   """
+  if any(
+    isinstance(value, wp.CountParameter) for value in (nworld, nconmax, nccdmax, njmax, njmax_nnz, naconmax, naccdmax, nvmax)
+  ):
+    raise ValueError("Data allocation requires concrete dimensions, not count operands")
   # TODO(team): move nconmax and njmax to Model?
   # TODO(team): decide what to do about uninitialized warp-only fields created by put_data
   #             we need to ensure these are only workspace fields and don't carry state
@@ -3198,12 +3210,21 @@ def get_data_into(
 ):
   """Gets data from a device into an existing mujoco.MjData.
 
+  Readback copies complete array descriptors before selecting ``world_id``. The
+  caller must ensure their full ranges are physically accessible, the requested
+  state is initialized, and producer work has completed. Conflicting writes or
+  retirement must remain excluded until readback finishes. Concrete capacities
+  alone do not establish these conditions. Partially backed virtual storage
+  requires a caller-owned, bounded snapshot before using this operation.
+
   Args:
     result: The data object containing the current state and output arrays (host).
     mjm: The model containing kinematic and dynamic information (host).
     d: The data object containing the current state and output arrays (device).
     world_id: The id of the world to get the data from.
   """
+  if any(isinstance(value, wp.CountParameter) for value in (d.nworld, d.naconmax, d.naccdmax)):
+    raise ValueError("Data readback requires concrete counts and accessible storage, not an execution descriptor")
   # nacon and nefc can overflow.  in that case, only pull up to the max contacts and constraints
   nacon = min(d.nacon.numpy()[0], d.naconmax)
   nefc = min(d.nefc.numpy()[world_id], d.njmax)
