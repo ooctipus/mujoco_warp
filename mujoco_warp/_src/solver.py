@@ -37,6 +37,7 @@ from mujoco_warp._src.warp_util import event_scope
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
 _BLOCK_CHOLESKY_DIM = 32
+_ISLAND_BLOCK_DIM = 32
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -2776,6 +2777,248 @@ def _update_gradient_cholesky_blocked_skip_unchanged(
   return kernel
 
 
+@cache_kernel
+def _update_gradient_cholesky_islands(nv: int, skip_unchanged: bool, skip_noflip: bool, parallel_scan: bool):
+  """Solve independent tree islands, retaining the blocked solve for large components.
+
+  The inertia couples DOFs within a kinematic tree; island discovery joins every tree
+  sharing constraint support. Thus H = M + J.T D J is block diagonal in this partition.
+  Restricting to active DOFs preserves independence. Unconstrained trees remain separate
+  blocks; their shared -1 label never denotes a component.
+  """
+  tile_size = types.TILE_SIZE_JTDAJ_DENSE
+
+  @wp.func
+  def solve_component(
+    # Model:
+    tree_dofadr: wp.array[int],
+    # Data in:
+    island_idofadr_in: wp.array2d[int],
+    map_idof2dof_in: wp.array2d[int],
+    dof_cdof_in: wp.array2d[int],
+    # In:
+    world: int,
+    tree: int,
+    label: int,
+    size: int,
+    refactor: bool,
+    ctx_h_in: wp.array3d[float],
+    ctx_grad_in: wp.array3d[float],
+    lane: int,
+    sums: wp.vec2,
+    # Out:
+    ctx_factor_out: wp.array3d[float],
+    ctx_search_out: wp.array3d[float],
+  ) -> wp.vec2:
+    """Solve one component, preserving the supplied per-lane reduction order."""
+    a = wp.tile_zeros(shape=(tile_size, tile_size), dtype=float, storage="shared")
+    b = wp.tile_zeros(shape=tile_size, dtype=float, storage="shared")
+    indices = wp.tile_zeros(shape=tile_size, dtype=int, storage="shared")
+    for iteration in range((tile_size + wp.block_dim() - 1) // wp.block_dim()):
+      index = iteration * wp.block_dim() + lane
+      destination = int(-1)
+      if index < size:
+        dof = tree_dofadr[tree] + index
+        if label >= 0:
+          dof = map_idof2dof_in[world, island_idofadr_in[world, label] + index]
+        destination = dof_cdof_in[world, dof]
+      wp.tile_scatter_masked(indices, index, destination, index < tile_size)
+      rhs = float(0.0)
+      if destination >= 0:
+        rhs = ctx_grad_in[world, destination, 0]
+      wp.tile_scatter_masked(b, index, rhs, index < tile_size)
+    for iteration in range((tile_size * tile_size) // wp.block_dim()):
+      index = iteration * wp.block_dim() + lane
+      row, col = index // tile_size, index % tile_size
+      value = wp.where(row == col, 1.0, 0.0)
+      if row < size and col < size:
+        ci = int(wp.tile_extract(indices, row))
+        cj = int(wp.tile_extract(indices, col))
+        if ci >= 0 and cj >= 0:
+          if refactor:
+            value = ctx_h_in[world, wp.min(ci, cj), wp.max(ci, cj)]
+          else:
+            value = ctx_factor_out[world, ci, cj]
+        elif row != col:
+          value = 0.0
+      wp.tile_scatter_masked(a, row, col, value, True)
+    # Cache in original compact coordinates. Every new solve refactors before reuse.
+    if refactor:
+      wp.tile_cholesky_inplace(a, fill_mode="upper")
+      for iteration in range((tile_size * tile_size) // wp.block_dim()):
+        index = iteration * wp.block_dim() + lane
+        row, col = index // tile_size, index % tile_size
+        if row < size and col < size:
+          ri = int(wp.tile_extract(indices, row))
+          rj = int(wp.tile_extract(indices, col))
+          if ri >= 0 and rj >= 0:
+            ctx_factor_out[world, ri, rj] = wp.tile_extract(a, row, col)
+    x = wp.tile_cholesky_solve(a, b, fill_mode="upper")
+    for iteration in range((tile_size + wp.block_dim() - 1) // wp.block_dim()):
+      index = iteration * wp.block_dim() + lane
+      destination = int(-1)
+      if index < tile_size:
+        destination = int(wp.tile_extract(indices, index))
+      if destination >= 0:
+        solution = wp.tile_extract(x, index)
+        ctx_search_out[world, destination, 0] = -solution
+        sums += solve_search_sums(ctx_grad_in[world, destination, 0], solution)
+    return sums
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False, module_options={"enable_mathdx_gemm": False})
+  def kernel(
+    # Model:
+    ntree: int,
+    dof_treeid: wp.array[int],
+    tree_dofadr: wp.array[int],
+    tree_dofnum: wp.array[int],
+    # Data in:
+    tree_island_in: wp.array2d[int],
+    island_dofadr_in: wp.array2d[int],
+    island_idofadr_in: wp.array2d[int],
+    island_nv_in: wp.array2d[int],
+    map_idof2dof_in: wp.array2d[int],
+    dof_cdof_in: wp.array2d[int],
+    cdof_dof_in: wp.array2d[int],
+    # In:
+    ctx_done_in: wp.array[bool],
+    ctx_state_changed_in: wp.array[int],
+    ctx_h_in: wp.array3d[float],
+    ctx_grad_in: wp.array3d[float],
+    ctx_quad_changed_count_in: wp.array[int],
+    # Out:
+    ctx_factor_out: wp.array3d[float],
+    ctx_search_out: wp.array3d[float],
+    ctx_search_dot_out: wp.array[float],
+    ctx_decrement_out: wp.array[float],
+  ):
+    world, lane = wp.tid()
+    if ctx_done_in[world]:
+      return
+    if wp.static(skip_noflip):
+      if ctx_state_changed_in[world] == 0:
+        return
+    refactor = True
+    if wp.static(skip_unchanged):
+      refactor = ctx_quad_changed_count_in[world] > 0
+    # The CSR covers constraint islands; unlabelled trees remain independent blocks.
+    largest = int(0)
+    for tree in range(lane, ntree, wp.block_dim()):
+      label = tree_island_in[world, tree]
+      size = int(tree_dofnum[tree])
+      if label >= 0:
+        size = int(island_nv_in[world, label])
+      largest = wp.max(largest, size)
+    largest = int(wp.tile_reduce(wp.max, wp.tile(largest, preserve_type=True))[0])
+    if largest > tile_size:
+      if refactor:
+        sums = wp.static(create_blocked_cholesky_augmented_factorize_solve_newton_func(tile_size, nv, nv))(
+          ctx_h_in[world], ctx_grad_in[world], nv, ctx_factor_out[world], ctx_search_out[world]
+        )
+      else:
+        sums = wp.static(create_blocked_cholesky_solve_newton_func(tile_size, nv, nv))(
+          ctx_factor_out[world], ctx_grad_in[world], nv, ctx_search_out[world]
+        )
+      if lane == 0:
+        ctx_search_dot_out[world] = sums[0]
+        ctx_decrement_out[world] = sums[1]
+    else:
+      sums = wp.vec2(0.0)
+      # Scalar trees and compact padding need no cooperative factorization.
+      for ci in range(lane, nv, wp.block_dim()):
+        dof = cdof_dof_in[world, ci]
+        size = int(1)
+        if dof >= 0:
+          tree = int(dof_treeid[dof])
+          label = tree_island_in[world, tree]
+          size = int(tree_dofnum[tree])
+          if label >= 0:
+            size = int(island_nv_in[world, label])
+        if size == 1:
+          diagonal = float(0.0)
+          if refactor:
+            diagonal = wp.sqrt(ctx_h_in[world, ci, ci])
+            ctx_factor_out[world, ci, ci] = diagonal
+          else:
+            diagonal = ctx_factor_out[world, ci, ci]
+          solution = (ctx_grad_in[world, ci, 0] / diagonal) / diagonal
+          ctx_search_out[world, ci, 0] = -solution
+          sums += solve_search_sums(ctx_grad_in[world, ci, 0], solution)
+      if wp.static(parallel_scan):
+        for base in range(0, ntree, wp.block_dim()):
+          eligible = int(0)
+          tree = base + lane
+          if tree < ntree:
+            label = tree_island_in[world, tree]
+            size = int(tree_dofnum[tree])
+            first = int(tree_dofadr[tree])
+            if label >= 0:
+              size = int(island_nv_in[world, label])
+              first = int(island_dofadr_in[world, label])
+            eligible = int(size > 1 and first == tree_dofadr[tree])
+          # Stable prefix ranks retain the serial tree order; all reads lie in the written prefix.
+          ranks = wp.tile_scan_inclusive(wp.tile(eligible))
+          leaders = wp.tile_empty(shape=(_ISLAND_BLOCK_DIM,), dtype=int, storage="shared")
+          wp.tile_scatter_masked(leaders, wp.tile_extract(ranks, lane) - 1, tree, eligible != 0)
+          count = wp.tile_extract(ranks, wp.block_dim() - 1)
+          for leader_index in range(count):
+            tree = int(wp.tile_extract(leaders, leader_index))
+            label = tree_island_in[world, tree]
+            size = int(tree_dofnum[tree])
+            if label >= 0:
+              size = int(island_nv_in[world, label])
+            sums = solve_component(
+              tree_dofadr,
+              island_idofadr_in,
+              map_idof2dof_in,
+              dof_cdof_in,
+              world,
+              tree,
+              label,
+              size,
+              refactor,
+              ctx_h_in,
+              ctx_grad_in,
+              lane,
+              sums,
+              ctx_factor_out,
+              ctx_search_out,
+            )
+      else:
+        for tree in range(ntree):
+          label = tree_island_in[world, tree]
+          size = int(tree_dofnum[tree])
+          first = int(tree_dofadr[tree])
+          if label >= 0:
+            size = int(island_nv_in[world, label])
+            first = int(island_dofadr_in[world, label])
+          # Exactly the first tree owns each island, including disconnected sleeping rows.
+          if size > 1 and first == tree_dofadr[tree]:
+            sums = solve_component(
+              tree_dofadr,
+              island_idofadr_in,
+              map_idof2dof_in,
+              dof_cdof_in,
+              world,
+              tree,
+              label,
+              size,
+              refactor,
+              ctx_h_in,
+              ctx_grad_in,
+              lane,
+              sums,
+              ctx_factor_out,
+              ctx_search_out,
+            )
+      reduced = wp.tile_reduce(wp.add, wp.tile(sums, preserve_type=True))[0]
+      if lane == 0:
+        ctx_search_dot_out[world] = reduced[0]
+        ctx_decrement_out[world] = reduced[1]
+
+  return kernel
+
+
 @wp.kernel(grid_stride=True)
 def _padding_h(nv: int, ctx_done_in: wp.array[bool], ctx_h_out: wp.array3d[float]):
   worldid, elementid = wp.tid()
@@ -2788,7 +3031,12 @@ def _padding_h(nv: int, ctx_done_in: wp.array[bool], ctx_h_out: wp.array3d[float
 
 
 def _cholesky_factorize_solve(
-  m: types.Model, d: types.Data, ctx: SolverContext, skip_unchanged: bool = False, skip_noflip: bool = False
+  m: types.Model,
+  d: types.Data,
+  ctx: SolverContext,
+  skip_unchanged: bool = False,
+  skip_noflip: bool = False,
+  use_islands: bool = False,
 ):
   """Cholesky factorize ctx.h and form the Newton search direction.
 
@@ -2816,7 +3064,33 @@ def _cholesky_factorize_solve(
       for array in (ctx.grad, ctx.search)
     )
     grad_column._ref, search_column._ref = ctx.grad, ctx.search
-    if skip_unchanged:
+    if use_islands:
+      mf, df = ctx.compact_m_full, ctx.compact_d_full
+      wp.launch_tiled(
+        _update_gradient_cholesky_islands(m.nv_pad, skip_unchanged, skip_noflip, mf.ntree > _ISLAND_BLOCK_DIM),
+        dim=d.nworld,
+        inputs=[
+          mf.ntree,
+          mf.dof_treeid,
+          mf.tree_dofadr,
+          mf.tree_dofnum,
+          df.tree_island,
+          df.island_dofadr,
+          df.island_idofadr,
+          df.island_nv,
+          df.map_idof2dof,
+          df.dof_cdof,
+          df.cdof_dof,
+          ctx.done,
+          ctx.state_changed_count,
+          ctx.h,
+          grad_column,
+          ctx.quad_changed_count,
+        ],
+        outputs=[ctx.hfactor, search_column, ctx.search_dot, ctx.newton_decrement],
+        block_dim=_ISLAND_BLOCK_DIM,
+      )
+    elif skip_unchanged:
       wp.launch_tiled(
         _update_gradient_cholesky_blocked_skip_unchanged(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv, skip_noflip),
         dim=d.nworld,
@@ -3120,7 +3394,7 @@ def _jtdaj_groups_per_world(nworld: int, njmax: int) -> int:
   return max(1, min(njmax, _JTDAJ_OVERSUBSCRIBE_WAVES * device_warps // nworld))
 
 
-def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
+def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, use_islands: bool = False):
   # grad = Ma - qfrc_smooth - qfrc_constraint
   if m.opt.solver == types.SolverType.CG:
     wp.launch_tiled(
@@ -3276,12 +3550,14 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         outputs=[ctx.h],
       )
 
-    _cholesky_factorize_solve(m, d, ctx)
+    _cholesky_factorize_solve(m, d, ctx, use_islands=use_islands)
   else:
     raise ValueError(f"Unknown solver type: {m.opt.solver}")
 
 
-def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverContext, stable_fast: bool = False):
+def _update_gradient_incremental(
+  m: types.Model, d: types.Data, ctx: SolverContext, stable_fast: bool = False, use_islands: bool = False
+):
   """Incremental gradient update: update H for changed constraints + re-factorize.
 
   Skips the full J^T*D*J rebuild by applying only the delta from constraints
@@ -3339,7 +3615,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
       outputs=[ctx.h],
     )
 
-  _cholesky_factorize_solve(m, d, ctx, skip_unchanged=True, skip_noflip=stable_fast)
+  _cholesky_factorize_solve(m, d, ctx, skip_unchanged=True, skip_noflip=stable_fast, use_islands=use_islands)
 
 
 @wp.kernel
@@ -3541,6 +3817,7 @@ def _solver_iteration(
   ctx: SolverContext,
   nsolving: wp.array[int],
   compact: bool = False,
+  use_islands: bool = False,
 ):
   _linesearch(m, d, ctx)
 
@@ -3565,9 +3842,9 @@ def _solver_iteration(
   _update_constraint(m, d, ctx, track_changes=incremental, stable_fast=incremental)
 
   if incremental:
-    _update_gradient_incremental(m, d, ctx, stable_fast=incremental)
+    _update_gradient_incremental(m, d, ctx, stable_fast=incremental, use_islands=use_islands)
   else:
-    _update_gradient(m, d, ctx, compact=compact)
+    _update_gradient(m, d, ctx, compact=compact, use_islands=use_islands)
 
   # polak-ribiere
   if m.opt.solver == types.SolverType.CG:
@@ -3628,6 +3905,7 @@ def init_context(
   ctx: SolverContext | InverseContext,
   grad: bool = True,
   compact: bool = False,
+  use_islands: bool = False,
 ):
   # initialize some efc arrays
   wp.launch(
@@ -3673,18 +3951,43 @@ def init_context(
   _update_constraint(m, d, ctx)
 
   if grad:
-    _update_gradient(m, d, ctx, compact=compact)
+    _update_gradient(m, d, ctx, compact=compact, use_islands=use_islands)
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = None, rebuild_active_dofs: bool = True):
+def solve(
+  m: types.Model,
+  d: types.Data,
+  *,
+  scratch: _SolverScratch | None = None,
+  rebuild_active_dofs: bool = True,
+  use_islands: bool = False,
+):
+  """Find constraint forces, optionally using the current position stage's tree islands.
+
+  With use_islands=True, tree_island must describe the current constraint support and
+  inertia. Full forward/step2 provide this ordering. Standalone calls default to the
+  coupled solve and do not require fresh island labels. Unsupported island factor
+  cases retain the coupled solve; this option never changes the physical equations.
+  """
+  use_islands = bool(
+    use_islands
+    and m.opt.enableflags & types.EnableBit.SLEEP
+    and not (m.opt.disableflags & types.DisableBit.ISLAND)
+    and m.opt.solver == types.SolverType.NEWTON
+    and m.ntree > 1
+    and not m.ntendon
+    and not m.nflex
+  )
   if m.opt.enableflags & types.EnableBit.SLEEP:
     # Standalone calls rebuild their maps. Full forward may reuse fwd_acceleration's
     # mapping when tree_awake has not changed between the two stages.
     if rebuild_active_dofs:
       island.update_active_dofs(m, d)
-    solve_compact(m, d, scratch=scratch)
-    if m.ntree > 1:
+    if use_islands:
+      island.compute_island_mapping(m, d, efc_tree=None if scratch is None else scratch.efc_tree)
+    solve_compact(m, d, scratch=scratch, use_islands=use_islands)
+    if m.ntree > 1 and not use_islands:
       island.compute_island_mapping(m, d, efc_tree=None if scratch is None else scratch.efc_tree)
     return
 
@@ -3698,7 +4001,7 @@ def solve(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = Non
     _solve(m, d, ctx)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, nsolving=None):
+def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, nsolving=None, use_islands=False):
   """Finds forces that satisfy constraints."""
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
@@ -3709,7 +4012,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   )
 
   #  context
-  init_context(m, d, ctx, grad=True, compact=compact)
+  init_context(m, d, ctx, grad=True, compact=compact, use_islands=use_islands)
 
   if _use_incremental(m):
     # A new solve computes a new search direction: invalidate the mv/jv reuse
@@ -3737,13 +4040,15 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # When the number of iterations reaches m.opt.iterations, solver_niter
     # becomes zero and all worlds are marked as converged to avoid an infinite loop.
     # note: we only launch the iteration kernel if everything is not done
-    wp.capture_while(nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact)
+    wp.capture_while(
+      nsolving, while_body=_solver_iteration, m=m, d=d, ctx=ctx, nsolving=nsolving, compact=compact, use_islands=use_islands
+    )
   else:
     # This branch is mostly for when JAX is used as it is currently not compatible
     # with CUDA graph conditional.
     # It should be removed when JAX becomes compatible.
     for _ in range(m.opt.iterations):
-      _solver_iteration(m, d, ctx, nsolving, compact=compact)
+      _solver_iteration(m, d, ctx, nsolving, compact=compact, use_islands=use_islands)
 
   # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
   # the fast path leaves it stale, and the per-iteration zeroing wiped it for
@@ -4058,14 +4363,16 @@ def _compact_solver_views(m: types.Model, d: types.Data):
 
 
 @event_scope
-def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = None):
+def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = None, use_islands: bool = False):
   """Run the dense Newton constraint solver in compacted DOF space.
 
   Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
   into nvmax_pad-sized dense workspaces, runs the stock dense Newton solver on a
   shallow-replaced (m, d) at nvmax_pad, then scatters qacc/qfrc_constraint back.
   Inactive DOFs are frozen to 0. On the incremental Newton path the solver
-  kernels read the sparse M and J directly through the compaction maps.
+  kernels read the sparse M and J directly through the compaction maps. With use_islands=True,
+  the caller must supply current compact maps and an island CSR partition of both inertia
+  and constraint support. Public solve applies the feature gates and builds that CSR.
   """
   _compact_gather(m, d)
 
@@ -4081,7 +4388,7 @@ def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | No
     sctx.grad.zero_(extent=(d.nworld, *sctx.grad.shape[1:]))
     if sctx.ls_exhausted.size:
       sctx.ls_exhausted.zero_(extent=(d.nworld,))
-  _solve(m2, d2, sctx, compact=True, nsolving=None if scratch is None else scratch.nsolving)
+  _solve(m2, d2, sctx, compact=True, nsolving=None if scratch is None else scratch.nsolving, use_islands=use_islands)
 
   _compact_scatter(m, d)
 

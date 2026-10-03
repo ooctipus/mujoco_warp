@@ -1860,7 +1860,9 @@ def forward(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
   fwd_actuation(m, d)
   fwd_acceleration(m, d, factorize=True)
 
-  solver.solve(m, d, scratch=None if scratch is None else scratch.solver, rebuild_active_dofs=not sleep_enabled)
+  solver.solve(
+    m, d, scratch=None if scratch is None else scratch.solver, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled
+  )
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
     smooth.rne_postconstraint(m, d)
   sensor.sensor_acc(m, d, skip_rne_postconstraint=True)
@@ -1906,7 +1908,7 @@ def step2(m: Model, d: Data):
   fwd_actuation(m, d)
   fwd_acceleration(m, d)
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
-  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled)
+  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
     smooth.rne_postconstraint(m, d)
   sensor.sensor_acc(m, d, skip_rne_postconstraint=True)

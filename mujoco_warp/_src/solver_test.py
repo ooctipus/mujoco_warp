@@ -15,6 +15,9 @@
 
 """Tests for solver functions."""
 
+from types import SimpleNamespace
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -1227,7 +1230,7 @@ class SolverTest(parameterized.TestCase):
           solver._linesearch(m, d, ctx)
           if track:
             ctx.quad_changed_count.zero_()
-          solver._update_constraint(m, d, ctx, track_changes=track, bindings=None)
+          solver._update_constraint(m, d, ctx, track_changes=track)
           if track:
             wp.synchronize()
             if np.any(ctx.quad_changed_count.numpy() > 0):
@@ -1892,6 +1895,225 @@ class CompactSolverTest(parameterized.TestCase):
       self.assertEqual(qpos[1, 3], 0.7)  # Gripper A z pos unchanged
       self.assertLess(qpos[1, 10], 0.7)  # Gripper B z pos
       np.testing.assert_array_equal(qacc[1, 1:7], 0.0)
+
+
+class IslandFactorTest(parameterized.TestCase):
+  def test_island_option_requires_explicit_freshness(self):
+    """Active-map reuse does not certify the supplied inertia/constraint partition."""
+    d = object()
+    for field, value in (
+      ("eligible", None),
+      ("ntendon", 1),
+      ("nflex", 1),
+      ("ntree", 0),
+      ("ntree", 1),
+      ("disableflags", types.DisableBit.ISLAND),
+      ("solver", types.SolverType.CG),
+    ):
+      m = SimpleNamespace(
+        opt=SimpleNamespace(enableflags=types.EnableBit.SLEEP, disableflags=0, solver=types.SolverType.NEWTON),
+        ntree=2,
+        ntendon=0,
+        nflex=0,
+      )
+      if field != "eligible":
+        setattr(m.opt if field in ("disableflags", "solver") else m, field, value)
+      for opt_in, reuse in ((False, False), (False, True), (True, False), (True, True)):
+        with self.subTest(field=field, value=value, opt_in=opt_in, reuse=reuse):
+          calls = []
+          with mock.patch.object(island, "update_active_dofs") as active:
+            with mock.patch.object(island, "compute_island_mapping", side_effect=lambda *a, **k: calls.append("map")):
+              with mock.patch.object(solver, "solve_compact", side_effect=lambda *a, **k: calls.append(k["use_islands"])):
+                solver.solve(m, d, rebuild_active_dofs=not reuse, use_islands=opt_in)
+          self.assertEqual(active.call_count, int(not reuse))
+          expected = ["map", True] if opt_in and field == "eligible" else [False] + (["map"] if m.ntree > 1 else [])
+          self.assertEqual(calls, expected)
+
+  @parameterized.parameters(31, 32, 33, 65)
+  def test_structural_components_factor_cache_and_skips(self, ntree):
+    """Small islands, a dense fallback and inactive DOFs share the same factor lifetime."""
+    worlds, ndof = 4, ntree + 5
+    width = 1 << (ndof - 1).bit_length()
+    rng = np.random.default_rng(619)
+    labels = np.full((worlds, ntree), -1, dtype=np.int32)
+    sizes = np.zeros_like(labels)
+    starts = np.zeros_like(labels)
+    first = np.zeros_like(labels)
+    members = np.tile(np.arange(ndof, dtype=np.int32), (worlds, 1))
+    compact = np.full((worlds, ndof), -1, dtype=np.int32)
+    full = np.full((worlds, width), -1, dtype=np.int32)
+    h = np.tile(np.eye(width, dtype=np.float32), (worlds, 1, 1))
+    grad = np.zeros((worlds, width, 1), dtype=np.float32)
+    for world, size in enumerate((6, 20, 8, 6)):
+      if world != 3:  # the final world has an unconstrained six-DOF tree
+        labels[world, : 1 + size - 6] = 0
+        sizes[world, 0] = size
+      active = np.arange(ndof)
+      if world == 2:
+        active = active[6:]  # an inactive tree inside an otherwise active island
+      compact[world, active] = np.arange(len(active))
+      full[world, : len(active)] = active
+      block = rng.normal(size=(size, size)).astype(np.float32)
+      block = block.T @ block + np.eye(size, dtype=np.float32)
+      for row in range(size):
+        for col in range(size):
+          ci, cj = compact[world, row], compact[world, col]
+          if ci >= 0 and cj >= 0:
+            h[world, ci, cj] = block[row, col]
+      grad[world, : len(active), 0] = rng.normal(size=len(active))
+    # A second component straddles the scan's last chunk in the 33/65-tree cases.
+    labels[0, -2:] = 1
+    sizes[0, 1], starts[0, 1], first[0, 1] = 2, ndof - 2, ndof - 2
+    h[0, ndof - 2 : ndof, ndof - 2 : ndof] = [[2.0, 0.3], [0.3, 3.0]]
+    # Only the upper Hessian triangle belongs to the producer contract.
+    h[:, np.tril_indices(width, -1)[0], np.tril_indices(width, -1)[1]] = np.nan
+    model = [
+      wp.array(np.r_[0, np.arange(6, ndof)], dtype=int),
+      wp.array(np.r_[6, np.ones(ntree - 1)], dtype=int),
+      wp.array(np.r_[np.zeros(6), np.arange(1, ntree)], dtype=int),
+    ]
+    relation = [wp.array(value, dtype=int) for value in (labels, sizes, starts, first, members, compact, full)]
+    h_gpu, grad_gpu = wp.array(h), wp.array(grad)
+    done = wp.zeros(worlds, dtype=bool)
+    changed, state_changed = wp.ones(worlds, dtype=int), wp.ones(worlds, dtype=int)
+    factors = [wp.full((worlds, width, width), np.nan, dtype=float) for _ in range(2)]
+    search = [wp.zeros((worlds, width, 1), dtype=float) for _ in range(2)]
+    norms, decrements = [wp.zeros(worlds) for _ in range(2)], [wp.zeros(worlds) for _ in range(2)]
+
+    initial_changed = wp.ones(worlds, dtype=int)
+
+    def run(force_refactor=False):
+      wp.launch_tiled(
+        solver._update_gradient_cholesky_blocked_skip_unchanged(16, width, width, True),
+        dim=worlds,
+        inputs=[done, grad_gpu, h_gpu, initial_changed if force_refactor else changed, state_changed, factors[0]],
+        outputs=[search[0], norms[0], decrements[0]],
+        block_dim=32,
+      )
+      wp.launch_tiled(
+        solver._update_gradient_cholesky_islands(width, not force_refactor, True, ntree > solver._ISLAND_BLOCK_DIM),
+        dim=worlds,
+        inputs=[
+          ntree,
+          model[2],
+          model[0],
+          model[1],
+          relation[0],
+          relation[3],
+          relation[2],
+          relation[1],
+          *relation[4:],
+          done,
+          state_changed,
+          h_gpu,
+          grad_gpu,
+          changed,
+        ],
+        outputs=[factors[1], search[1], norms[1], decrements[1]],
+        block_dim=32,
+      )
+
+    for phase in ("factor", "cache", "new_solve", "done", "unchanged"):
+      with self.subTest(phase=phase):
+        if phase == "cache":
+          changed.zero_()
+          grad_gpu.assign(grad * 0.7)
+        elif phase == "new_solve":
+          for factor in factors:
+            factor.fill_(np.nan)
+        elif phase == "done":
+          done.fill_(True)
+          h_gpu.fill_(np.nan)
+        elif phase == "unchanged":
+          done.zero_()
+          state_changed.zero_()
+        run(force_refactor=phase == "new_solve")
+        for reference, actual in zip((*search[:1], *norms[:1], *decrements[:1]), (*search[1:], *norms[1:], *decrements[1:])):
+          value = actual.numpy()
+          self.assertTrue(np.isfinite(value).all())
+          np.testing.assert_allclose(value, reference.numpy(), rtol=2e-5, atol=2e-6)
+
+  @parameterized.parameters(
+    (False, False, "pyramidal"),
+    (False, True, "pyramidal"),
+    (False, False, "elliptic"),
+    (True, False, "pyramidal"),
+    (True, True, "pyramidal"),
+    (True, False, "elliptic"),
+  )
+  def test_full_stage_component_changes(self, sparse, large, cone):
+    """Fresh islands may merge, split and sleep; each new solve must rebuild its factor."""
+    bodies = []
+    if large:
+      bodies.extend(
+        '<body pos=".12 0 0"><joint axis="0 1 0" frictionloss=".02" armature=".2"/>'
+        '<geom size=".025" mass=".2" contype="0" conaffinity="0"/>'
+        for _ in range(20)
+      )
+      bodies.extend("</body>" for _ in range(20))
+    for i in range(20 if large else 40):
+      x = 4.0 + i * 0.4 if large else (0.0 if i == 0 else 0.4 if i == 1 else 1.0 + i * 0.4)
+      bodies.append(
+        f'<body pos="{x} 0 0"><joint type="slide" axis="1 0 0" frictionloss=".02" armature=".1"/>'
+        '<geom size=".08" mass=".5"/></body>'
+      )
+    jacobian = "sparse" if sparse else "dense"
+    mjm = mujoco.MjModel.from_xml_string(
+      f'<mujoco><option gravity="0 0 0" solver="Newton" integrator="implicitfast" cone="{cone}" '
+      f'jacobian="{jacobian}" iterations="100" ls_iterations="30" tolerance="1e-7">'
+      '<flag sleep="enable" multiccd="disable"/></option><worldbody>' + "".join(bodies) + "</worldbody></mujoco>"
+    )
+    mjm.tree_sleep_policy[:] = int(types.SleepPolicy.AUTO_NEVER)
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_forward(mjm, mjd)
+    m = mjw.put_model(mjm)
+    m.opt.disableflags |= types.DisableBit.ACTUATION | types.DisableBit.SPRING | types.DisableBit.DAMPER
+    m.opt.broadphase, m.opt.graph_conditional = types.BroadphaseType.NXN, True
+    m.tree_sleep_policy = wp.array(np.full((4, m.ntree), int(types.SleepPolicy.AUTO_NEVER), dtype=np.int32), dtype=int)
+    data = [mjw.put_data(mjm, mjd, nworld=4, nconmax=256, njmax=256, nvmax=mjm.nv) for _ in range(2)]
+    prepared = sparse and cone == "pyramidal" and wp.get_device().is_cuda
+    workspaces = [mjw.make_step_workspace(m, d) if prepared else None for d in data]
+    qpos = np.tile(mjd.qpos.astype(np.float32), (4, 1))
+    qvel = np.tile(np.linspace(-0.2, 0.3, mjm.nv, dtype=np.float32), (4, 1))
+    original_solve = solver.solve
+    for contact, asleep in ((False, False), (True, False), (False, True), (True, True), (False, False), (True, False)):
+      with self.subTest(contact=contact, asleep=asleep):
+        if not large:
+          qpos[:, 1] = [-0.28 if contact else 0.0, 0.0, -0.28 if contact else 0.0, 0.0]
+        policy = np.full((4, m.ntree), int(types.SleepPolicy.AUTO_NEVER), dtype=np.int32)
+        if asleep:
+          policy[:, 3::3] = int(types.SleepPolicy.ALWAYS)
+          policy[3, :] = int(types.SleepPolicy.ALWAYS)
+          if large:
+            policy[1::2, 0] = int(types.SleepPolicy.ALWAYS)
+        m.tree_sleep_policy.assign(policy)
+        for d in data:
+          d.qpos.assign(qpos)
+          d.qvel.assign(qvel)
+          sleep.reset_sleep(m, d)
+        with mock.patch.object(solver, "solve", side_effect=lambda *a, **k: original_solve(*a, **(k | {"use_islands": False}))):
+          mjw.forward(m, data[0], scratch=None if workspaces[0] is None else workspaces[0].scratch.forward)
+        mjw.forward(m, data[1], scratch=None if workspaces[1] is None else workspaces[1].scratch.forward)
+        for attribute in ("qacc", "qfrc_constraint", "qacc_smooth"):
+          reference, actual = (getattr(d, attribute).numpy() for d in data)
+          self.assertTrue(np.isfinite(reference).all() and np.isfinite(actual).all())
+          np.testing.assert_allclose(reference, actual, rtol=3e-5, atol=3e-5)
+        np.testing.assert_array_equal(data[0].nefc.numpy(), data[1].nefc.numpy())
+        np.testing.assert_array_equal(data[0].ncdof.numpy(), data[1].ncdof.numpy())
+        if not large:
+          labels = data[1].tree_island.numpy()
+          self.assertEqual(bool(labels[0, 0] == labels[0, 1]), contact)
+        if asleep:
+          self.assertEqual(data[1].ncdof.numpy()[3], 0)
+        else:
+          np.testing.assert_array_equal(data[1].ncdof.numpy(), [m.nv] * 4)
+    # Stale diagnostics cannot become an implicit numerical dependency of standalone solves.
+    for rebuild in (False, True):
+      data[1].tree_island.assign(np.tile(np.arange(m.ntree, dtype=np.int32), (4, 1)))
+      data[1].nisland.fill_(m.ntree)
+      for d in data:
+        solver.solve(m, d, rebuild_active_dofs=rebuild)
+      np.testing.assert_allclose(data[0].qacc.numpy(), data[1].qacc.numpy(), rtol=3e-5, atol=3e-5)
 
 
 if __name__ == "__main__":

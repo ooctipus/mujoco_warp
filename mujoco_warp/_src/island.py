@@ -897,18 +897,30 @@ def _compact_dofs_builder(warn_overflow: int):
     cdof_dof_out: wp.array2d[int],
     overflow_out: wp.array[int],
   ):
-    worldid = wp.tid()
+    worldid, lane = wp.tid()
     count = int(0)
-    for t in range(ntree):
-      if tree_awake_in[worldid, t] == 1:
+    # Scan fixed-size tree chunks, preserving the original ascending tree/DOF order.
+    # On CPU launch_tiled uses one lane, so the same operation remains a serial scan.
+    for base in range(0, ntree, wp.block_dim()):
+      t = base + lane
+      num = int(0)
+      if t < ntree:
+        if tree_awake_in[worldid, t] == 1:
+          num = tree_dofnum[t]
+      prefix = wp.tile_scan_inclusive(wp.tile(num))
+      offset = count + wp.tile_extract(prefix, lane) - num
+      if num > 0:
         adr = tree_dofadr[t]
-        num = tree_dofnum[t]
         for j in range(num):
           dof = adr + j
-          if count < nvmax_in:
-            dof_cdof_out[worldid, dof] = count
-            cdof_dof_out[worldid, count] = dof
-          count += 1
+          compact = offset + j
+          if compact < nvmax_in:
+            dof_cdof_out[worldid, dof] = compact
+            cdof_dof_out[worldid, compact] = dof
+      count += wp.tile_extract(prefix, wp.block_dim() - 1)
+
+    if lane != 0:
+      return
 
     if count > nvmax_in:
       if wp.static(bool(warn_overflow & OverflowType.NVMAX)):
@@ -936,9 +948,10 @@ def update_active_dofs(m: types.Model, d: types.Data):
     inputs=[m.nv, d.nvmax_pad],
     outputs=[d.dof_cdof, d.cdof_dof],
   )
-  wp.launch(
+  wp.launch_tiled(
     _compact_dofs_builder(int(m.opt.warn_overflow)),
-    dim=(d.nworld,),
+    dim=d.nworld,
     inputs=[m.ntree, m.tree_dofadr, m.tree_dofnum, d.tree_awake, d.nvmax],
     outputs=[d.ncdof, d.dof_cdof, d.cdof_dof, d.overflow],
+    block_dim=32,
   )
