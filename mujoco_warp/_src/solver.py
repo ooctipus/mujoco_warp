@@ -18,7 +18,6 @@ from math import ceil
 from typing import Any
 
 import warp as wp
-from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import island
 from mujoco_warp._src import math
@@ -32,18 +31,21 @@ from mujoco_warp._src.block_cholesky import solve_search_sums
 from mujoco_warp._src.types import InverseContext
 from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.types import SolverContext
+from mujoco_warp._src.warp_util import allocate_work_arrays
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
+BLOCKED_MATRIX_ALIGNMENT = 16
 _BLOCK_CHOLESKY_DIM = 32
 _ISLAND_BLOCK_DIM = 32
 
 
 def validate_blocked_matrix(array):
   """Check storage alignment required by aligned=True blocked matrix operations."""
-  if array.size and (array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16):
+  alignment = BLOCKED_MATRIX_ALIGNMENT
+  if array.size and (array.ptr % alignment or array.strides[0] % alignment or array.strides[1] % alignment):
     raise ValueError("Blocked Cholesky matrix needs 16-byte base, world and matrix-row strides")
 
 
@@ -71,8 +73,8 @@ def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
   )
 
 
-def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
-  """Request solver temporaries and initialize every value needed by this execution."""
+def solver_context_layout(m: types.Model, d: types.Data):
+  """Declare numerical solver work once; names are resolved only during preparation."""
   nworld = d.nworld
   nv = m.nv
   nv_pad = m.nv_pad
@@ -83,38 +85,41 @@ def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
 
-  arrays = {}
-  for name, shape, dtype, clear in (
-    ("Jaref", (nworld, njmax), float, False),
-    ("search_dot", (nworld,), float, False),
-    ("done", (nworld,), bool, False),
-    ("grad", (nworld, nv_pad), float, True),
-    ("grad_dot", (nworld,), float, False),
-    ("newton_decrement", (nworld,), float, False),
-    ("Mgrad", (nworld, nv_pad if alloc_mgrad else 0), float, False),
-    ("search", (nworld, nv), float, False),
-    ("mv", (nworld, nv), float, False),
-    ("jv", (nworld, njmax), float, False),
-    ("quad", (nworld, njmax), wp.vec3, False),
-    ("alpha", (nworld,), float, False),
-    ("grad_scale", (nworld,), float, False),
-    ("improvement", (nworld,), float, False),
-    ("ls_exhausted", (nworld,), bool, True),
-    ("search_unchanged", (nworld,), bool, False),
-    ("prev_grad", (nworld, nv if alloc_mgrad else 0), float, False),
-    ("prev_Mgrad", (nworld, nv if alloc_mgrad else 0), float, False),
-    ("beta", (nworld if alloc_mgrad else 0,), float, False),
-    ("h", (nworld, nv_pad if alloc_h else 0, nv_pad if alloc_h else 0), float, False),
-    ("hfactor", (nworld, nv_pad if alloc_hfactor else 0, nv_pad if alloc_hfactor else 0), float, False),
-    ("quad_changed_ids", (nworld, njmax if alloc_incremental else 0), int, False),
-    ("quad_changed_count", (nworld if alloc_incremental else 0,), int, False),
-    ("state_changed_count", (nworld if alloc_incremental else 0,), int, False),
-  ):
-    array = scratch_array(d.scratch, "solver." + name, shape, dtype)
-    if clear:
-      array.zero_(extent=(shape[0], *array.shape[1:]))
-    arrays[name] = array
-  context = SolverContext(**arrays)
+  return {
+    name: (shape, dtype)
+    for name, shape, dtype in (
+      ("Jaref", (nworld, njmax), float),
+      ("search_dot", (nworld,), float),
+      ("done", (nworld,), bool),
+      ("grad", (nworld, nv_pad), float),
+      ("grad_dot", (nworld,), float),
+      ("newton_decrement", (nworld,), float),
+      ("Mgrad", (nworld, nv_pad if alloc_mgrad else 0), float),
+      ("search", (nworld, nv), float),
+      ("mv", (nworld, nv), float),
+      ("jv", (nworld, njmax), float),
+      ("quad", (nworld, njmax), wp.vec3),
+      ("alpha", (nworld,), float),
+      ("grad_scale", (nworld,), float),
+      ("improvement", (nworld,), float),
+      ("ls_exhausted", (nworld,), bool),
+      ("search_unchanged", (nworld,), bool),
+      ("prev_grad", (nworld, nv if alloc_mgrad else 0), float),
+      ("prev_Mgrad", (nworld, nv if alloc_mgrad else 0), float),
+      ("beta", (nworld if alloc_mgrad else 0,), float),
+      ("h", (nworld, nv_pad if alloc_h else 0, nv_pad if alloc_h else 0), float),
+      ("hfactor", (nworld, nv_pad if alloc_hfactor else 0, nv_pad if alloc_hfactor else 0), float),
+      ("quad_changed_ids", (nworld, njmax if alloc_incremental else 0), int),
+      ("quad_changed_count", (nworld if alloc_incremental else 0,), int),
+      ("state_changed_count", (nworld if alloc_incremental else 0,), int),
+      ("nsolving", (1,), int),
+    )
+  }
+
+
+def create_solver_context(m: types.Model, d: types.Data, arrays=None) -> SolverContext:
+  """Allocate or borrow solver operands; each solve initializes required values."""
+  context = SolverContext(**allocate_work_arrays(solver_context_layout(m, d), arrays, device=d.qpos.device))
   if m.nv > _BLOCK_CHOLESKY_DIM:
     validate_blocked_matrix(context.h)
     validate_blocked_matrix(context.hfactor)
@@ -3939,7 +3944,7 @@ def init_context(
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data, *, rebuild_active_dofs: bool = True, use_islands: bool = False):
+def solve(m: types.Model, d: types.Data, *, rebuild_active_dofs=True, use_islands=False, ctx=None, efc_tree=None):
   """Find constraint forces, optionally using the current position stage's tree islands.
 
   With use_islands=True, tree_island must describe the current constraint support and
@@ -3962,22 +3967,24 @@ def solve(m: types.Model, d: types.Data, *, rebuild_active_dofs: bool = True, us
     if rebuild_active_dofs:
       island.update_active_dofs(m, d)
     if use_islands:
-      island.compute_island_mapping(m, d)
-    solve_compact(m, d, use_islands=use_islands)
+      island.compute_island_mapping(m, d, efc_tree=efc_tree)
+    solve_compact(m, d, use_islands=use_islands, ctx=ctx)
     if m.ntree > 1 and not use_islands:
-      island.compute_island_mapping(m, d)
+      island.compute_island_mapping(m, d, efc_tree=efc_tree)
     return
 
   if d.njmax == 0 or m.nv == 0:
     wp.copy(d.qacc, d.qacc_smooth, extent=(d.nworld, *d.qacc.shape[1:]))
     d.solver_niter.fill_(0, extent=(d.nworld,))
   else:
-    ctx = _create_solver_context(m, d)
+    ctx = create_solver_context(m, d) if ctx is None else ctx
     _solve(m, d, ctx)
 
 
 def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, use_islands=False):
   """Finds forces that satisfy constraints."""
+  ctx.grad.zero_(extent=(d.nworld, *ctx.grad.shape[1:]))
+  ctx.ls_exhausted.zero_(extent=(d.nworld,))
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
     _solve_init_dof(warmstart),
@@ -4004,7 +4011,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       block_dim=m.block_dim.solve_init_search_cg,
     )
 
-  nsolving = scratch_array(d.scratch, "solver.nsolving", (1,), int)
+  nsolving = ctx.nsolving
   nsolving.fill_(d.nworld)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
@@ -4337,7 +4344,7 @@ def _compact_solver_views(m: types.Model, d: types.Data):
 
 
 @event_scope
-def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False):
+def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False, ctx=None):
   """Run the dense Newton constraint solver in compacted DOF space.
 
   Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
@@ -4351,7 +4358,7 @@ def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False):
   _compact_gather(m, d)
 
   m2, d2 = _compact_solver_views(m, d)
-  sctx = _create_solver_context(m2, d2)
+  sctx = create_solver_context(m2, d2) if ctx is None else ctx
   # Compact kernels read the full-coordinate sparse structures through the compaction maps.
   sctx.compact_m_full, sctx.compact_d_full = m, d
   _solve(m2, d2, sctx, compact=True, use_islands=use_islands)

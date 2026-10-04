@@ -14,7 +14,6 @@
 # ==============================================================================
 
 import warp as wp
-from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -25,6 +24,11 @@ from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"default_grid_stride": False})
+
+
+def island_work_layout(m, d):
+  """Declare the union-find and constraint-to-tree operands."""
+  return {"parent": ((d.nworld, m.ntree), int), "efc_tree": ((d.nworld, d.njmax), int)}
 
 
 @wp.func
@@ -359,7 +363,7 @@ def _zero_island_counts(
 
 
 @event_scope
-def island(m: types.Model, d: types.Data):
+def island(m: types.Model, d: types.Data, *, parent=None):
   """Discover constraint islands."""
   if m.ntree == 0:
     wp.launch(
@@ -369,7 +373,10 @@ def island(m: types.Model, d: types.Data):
     )
     return
 
-  direct_dsu(m, d, scratch_array(d.scratch, "island.parent", (d.nworld, m.ntree), int))
+  if parent is None:
+    shape, dtype = island_work_layout(m, d)["parent"]
+    parent = wp.empty(shape, dtype=dtype, device=d.qpos.device)
+  direct_dsu(m, d, parent)
 
 
 @wp.kernel
@@ -742,7 +749,7 @@ def _init_efc_arrays(
 
 
 @event_scope
-def compute_island_mapping(m: types.Model, d: types.Data):
+def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree=None):
   """Compute DOF/constraint island mappings after island discovery.
 
   Populates d.dof_island, d.efc.island, d.island_idofadr, d.island_dofadr,
@@ -753,6 +760,7 @@ def compute_island_mapping(m: types.Model, d: types.Data):
   Args:
     m: Model.
     d: Data.
+    efc_tree: Optional native constraint-to-tree work array.
   """
   # Ensure dof_islandid / efc_islandid are allocated at the right shape
   if d.dof_islandid.shape[1] != m.nv:
@@ -774,7 +782,9 @@ def compute_island_mapping(m: types.Model, d: types.Data):
     inputs=[],
     outputs=[d.dof_island, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
   )
-  efc_tree = scratch_array(d.scratch, "island.efc_tree", (d.nworld, d.njmax), int)
+  if efc_tree is None:
+    shape, dtype = island_work_layout(m, d)["efc_tree"]
+    efc_tree = wp.empty(shape, dtype=dtype, device=d.qpos.device)
   wp.launch(
     _init_efc_arrays,
     dim=(d.nworld, d.njmax),

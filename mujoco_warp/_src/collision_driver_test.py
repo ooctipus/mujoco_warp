@@ -22,7 +22,6 @@ import numpy as np
 import warp as wp
 from absl.testing import absltest
 from absl.testing import parameterized
-from gpu_components import scratch as scratch_ops
 
 import mujoco_warp as mjw
 from mujoco_warp import BroadphaseType
@@ -33,6 +32,7 @@ from mujoco_warp._src import collision_convex
 from mujoco_warp._src import collision_driver
 from mujoco_warp._src import types
 from mujoco_warp._src.collision_core import Geom
+from mujoco_warp._src.collision_core import collision_context_layout
 from mujoco_warp._src.collision_core import create_collision_context
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
 from mujoco_warp._src.collision_primitive import plane_convex
@@ -76,22 +76,21 @@ def _assert_eq(a, b, name):
   np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
 
 
-class CollisionScratchTest(parameterized.TestCase):
+class CollisionWorkTest(parameterized.TestCase):
   def test_candidate_columns_follow_their_count_identity(self):
     with wp.ScopedDevice("cpu"):
-      registry = scratch_ops.allocate_registry("cpu")
       candidates, ccd = wp.CountParameter(11), wp.CountParameter(11)
-      context = create_collision_context(candidates, registry=registry)
-      specs = scratch_ops.column_specs(registry, candidates)
-      self.assertEqual({spec.name for spec in specs}, {"collision.pair", "collision.pairid", "collision.worldid"})
-      self.assertEqual(scratch_ops.column_specs(registry, ccd), ())
-      arrays = dict(registry.temporaries)
-      scratch_ops.freeze(registry)
-      scratch_ops.prepare(registry, arrays)
-      with mock.patch.object(wp, "empty", side_effect=AssertionError("Prepared candidate allocation")):
-        rebound = create_collision_context(candidates, registry=registry)
-      for field in dataclasses.fields(context):
-        self.assertIs(getattr(context, field.name), getattr(rebound, field.name))
+      layout = collision_context_layout(candidates)
+      for name, (shape, _) in layout.items():
+        if name != "awake_changed":
+          self.assertIs(shape[0], candidates)
+          self.assertIsNot(shape[0], ccd)
+      context = create_collision_context(candidates)
+      arrays = {field.name: getattr(context, field.name) for field in dataclasses.fields(context)}
+      with mock.patch.object(wp, "empty", side_effect=AssertionError("Borrowed candidate allocation")):
+        rebound = create_collision_context(candidates, arrays)
+      for name, array in arrays.items():
+        self.assertIs(getattr(rebound, name), array)
 
   @parameterized.parameters(
     (GeomType.BOX, GeomType.BOX, False, 4, 3, 16),
@@ -111,43 +110,26 @@ class CollisionScratchTest(parameterized.TestCase):
       mock.patch.object(collision_convex, "_ccd_grid_size", return_value=2),
       mock.patch.object(wp, "launch") as launch,
     ):
-      registry = scratch_ops.allocate_registry("cpu")
       candidates, ccd = wp.CountParameter(11), wp.CountParameter(11)
-      data = mock.Mock(scratch=registry, naconmax=candidates, naccdmax=ccd, ncollision=wp.zeros(1, dtype=int))
-      collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
-      declarations = registry.declarations
-      for name, declaration in declarations.items():
-        if name != "convex.nccd":
-          self.assertIs(declaration.shape[0], ccd)
-      self.assertEqual(scratch_ops.column_specs(registry, candidates), ())
-      self.assertEqual(declarations["convex.multiccd_polygon"].shape[1:], (2 * polygons,))
-      self.assertEqual(declarations["convex.multiccd_pdist"].shape[1:], (polygons,))
-      self.assertEqual(declarations["convex.multiccd_idx1"].shape[1:], (degree,))
-      self.assertEqual(declarations["convex.epa_vert"].shape[1:], (10 + 2 * iterations,))
-      self.assertIs(declarations["convex.epa_vert"].dtype, wp.vec3)
-      self.assertIs(declarations["convex.multiccd_pdist"].dtype, wp.float32)
-      arrays = dict(registry.temporaries)
-      counter = arrays["convex.nccd"]
-      for _ in range(2):
-        counter.fill_(9)
-        collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
-        np.testing.assert_array_equal(counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
-      scratch_ops.freeze(registry)
-      scratch_ops.prepare(registry, arrays)
-      with mock.patch.object(wp, "empty", side_effect=AssertionError("Prepared convex allocation")):
+      data = mock.Mock(naconmax=candidates, naccdmax=ccd, ncollision=wp.zeros(1, dtype=int))
+      pairs = [(geom1, geom2)]
+      layout = collision_convex.convex_context_layout(model, data, pairs)
+      for name, (shape, _) in layout.items():
+        if name != "nccd":
+          self.assertIs(shape[0], ccd)
+      self.assertEqual(layout["multiccd_polygon"][0][1:], (2 * polygons,))
+      self.assertEqual(layout["multiccd_pdist"][0][1:], (polygons,))
+      self.assertEqual(layout["multiccd_idx1"][0][1:], (degree,))
+      self.assertEqual(layout["epa_vert"][0][1:], (10 + 2 * iterations,))
+      work = collision_convex.create_convex_context(model, data, pairs)
+      with mock.patch.object(wp, "empty", side_effect=AssertionError("Borrowed convex allocation")):
         for _ in range(2):
-          counter.fill_(9)
-          collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
-          np.testing.assert_array_equal(counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
+          work.nccd.fill_(9)
+          collision_convex.convex_narrowphase(model, data, mock.Mock(), pairs, work=work)
+          np.testing.assert_array_equal(work.nccd.numpy(), np.zeros(work.nccd.shape, dtype=np.int32))
           arguments = launch.call_args.kwargs["inputs"]
-          for array in arrays.values():
-            self.assertTrue(any(argument is array for argument in arguments))
-      data.scratch, data.naconmax, data.naccdmax = None, 11, 11
-      for _ in range(2):
-        collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
-        eager_counter = launch.call_args.kwargs["inputs"][-1]
-        self.assertIsNot(eager_counter, counter)
-        np.testing.assert_array_equal(eager_counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
+          for field in dataclasses.fields(work):
+            self.assertTrue(any(argument is getattr(work, field.name) for argument in arguments))
 
 
 class CollisionTest(parameterized.TestCase):

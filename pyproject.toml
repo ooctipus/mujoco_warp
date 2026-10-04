@@ -29,7 +29,6 @@ requires-python = ">=3.10"
 dependencies = [
     "absl-py",
     "etils[epath]",
-    "gpu-components>=0.1.0",
     "mujoco>=3.12.0",
     "numpy",
     "warp-lang>=1.17",
@@ -47,7 +46,6 @@ explicit = true
 
 [tool.uv.sources]
 # The application selects the custom Warp build for prepared execution.
-gpu-components = {git = "https://github.com/ooctipus/gpu-components.git", rev = "338fa9b34f25ca60bc4a3713d79b1115baf68372"}
 mujoco = {index = "mujoco"}
 
 [project.optional-dependencies]

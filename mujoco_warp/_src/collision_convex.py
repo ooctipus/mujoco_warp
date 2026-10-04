@@ -13,10 +13,10 @@
 # limitations under the License.
 # ==============================================================================
 
+import dataclasses
 from typing import Tuple
 
 import warp as wp
-from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import Geom
@@ -49,6 +49,7 @@ from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.types import mat43
 from mujoco_warp._src.types import mat63
 from mujoco_warp._src.types import vec5
+from mujoco_warp._src.warp_util import allocate_work_arrays
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
@@ -1233,23 +1234,31 @@ def _ccd_grid_size(kernel, naconmax: int, device) -> int:
   return max(1, min(naconmax, _CCD_OVERSUBSCRIBE_WAVES * block_size * min_grid_size))
 
 
-@event_scope
-def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]]):
-  """Runs narrowphase collision detection for convex geom pairs.
+@dataclasses.dataclass
+class ConvexContext:
+  """EPA and clipping operands reused across convex pairs in one collision stage."""
 
-  This function handles collision detection for pairs of convex geometries that were
-  identified during the broadphase. It uses the Gilbert-Johnson-Keerthi (GJK) algorithm to
-  determine the distance between shapes and the Expanding Polytope Algorithm (EPA) to find
-  the penetration depth and contact normal for colliding pairs.
+  nccd: wp.array
+  epa_vert: wp.array
+  epa_vert_index: wp.array
+  epa_face: wp.array
+  epa_pr: wp.array
+  epa_norm2: wp.array
+  epa_horizon: wp.array
+  multiccd_polygon: wp.array
+  multiccd_clipped: wp.array
+  multiccd_pnormal: wp.array
+  multiccd_pdist: wp.array
+  multiccd_idx1: wp.array
+  multiccd_idx2: wp.array
+  multiccd_n1: wp.array
+  multiccd_n2: wp.array
+  multiccd_endvert: wp.array
+  multiccd_face1: wp.array
+  multiccd_face2: wp.array
 
-  The convex geom types handled by this function are `SPHERE`, `CAPSULE`, `ELLIPSOID`, `CYLINDER`,
-  `BOX`, `MESH`, `HFIELD`.
 
-  To optimize performance, this function dynamically builds and launches a specialized
-  kernel for each type of convex collision pair present in the model, avoiding unnecessary
-  computations for non-existent pair types.
-  """
-
+def _convex_dimensions(m, collision_table):
   def _pair_count(p1: int, p2: int) -> Tuple[int, int]:
     idx = upper_trid_index(len(GeomType), p1, p2)
     return m.geom_pair_type_count[idx], idx
@@ -1274,29 +1283,86 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
     npolygonmax = max(m.npolygonmax, 4 if nboxmesh else npolygonmax)
     nmeshdegmax = max(m.nmeshdegmax, 3)
 
-  if ncollision == 0:
-    return
+  return ncollision, epa_iterations, npolygonmax, nmeshdegmax
 
-  # These temporaries share CCD capacity; the geometry-pair counters are fully backed.
-  with wp.ScopedDevice(d.ncollision.device):
-    nccd = scratch_array(d.scratch, "convex.nccd", (len(GeomType) * (len(GeomType) + 1) // 2,), int)
-    epa_vert = scratch_array(d.scratch, "convex.epa_vert", (d.naccdmax, 10 + 2 * epa_iterations), wp.vec3)
-    epa_vert_index = scratch_array(d.scratch, "convex.epa_vert_index", (d.naccdmax, 10 + 2 * epa_iterations), int)
-    epa_face = scratch_array(d.scratch, "convex.epa_face", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), int)
-    epa_pr = scratch_array(d.scratch, "convex.epa_pr", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), wp.vec3)
-    epa_norm2 = scratch_array(d.scratch, "convex.epa_norm2", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), float)
-    epa_horizon = scratch_array(d.scratch, "convex.epa_horizon", (d.naccdmax, MJ_MAX_EPAHORIZON), int)
-    multiccd_polygon = scratch_array(d.scratch, "convex.multiccd_polygon", (d.naccdmax, 2 * npolygonmax), wp.vec3)
-    multiccd_clipped = scratch_array(d.scratch, "convex.multiccd_clipped", (d.naccdmax, 2 * npolygonmax), wp.vec3)
-    multiccd_pnormal = scratch_array(d.scratch, "convex.multiccd_pnormal", (d.naccdmax, npolygonmax), wp.vec3)
-    multiccd_pdist = scratch_array(d.scratch, "convex.multiccd_pdist", (d.naccdmax, npolygonmax), float)
-    multiccd_idx1 = scratch_array(d.scratch, "convex.multiccd_idx1", (d.naccdmax, nmeshdegmax), int)
-    multiccd_idx2 = scratch_array(d.scratch, "convex.multiccd_idx2", (d.naccdmax, nmeshdegmax), int)
-    multiccd_n1 = scratch_array(d.scratch, "convex.multiccd_n1", (d.naccdmax, nmeshdegmax), wp.vec3)
-    multiccd_n2 = scratch_array(d.scratch, "convex.multiccd_n2", (d.naccdmax, nmeshdegmax), wp.vec3)
-    multiccd_endvert = scratch_array(d.scratch, "convex.multiccd_endvert", (d.naccdmax, nmeshdegmax), wp.vec3)
-    multiccd_face1 = scratch_array(d.scratch, "convex.multiccd_face1", (d.naccdmax, npolygonmax), wp.vec3)
-    multiccd_face2 = scratch_array(d.scratch, "convex.multiccd_face2", (d.naccdmax, npolygonmax), wp.vec3)
+
+def convex_context_layout(m, d, collision_table):
+  """Declare convex work from the same geometry choices used by narrowphase."""
+  ncollision, epa_iterations, npolygonmax, nmeshdegmax = _convex_dimensions(m, collision_table)
+  if not ncollision:
+    return {}
+  return {
+    "nccd": ((len(GeomType) * (len(GeomType) + 1) // 2,), int),
+    "epa_vert": ((d.naccdmax, 10 + 2 * epa_iterations), wp.vec3),
+    "epa_vert_index": ((d.naccdmax, 10 + 2 * epa_iterations), int),
+    "epa_face": ((d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), int),
+    "epa_pr": ((d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), wp.vec3),
+    "epa_norm2": ((d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), float),
+    "epa_horizon": ((d.naccdmax, MJ_MAX_EPAHORIZON), int),
+    "multiccd_polygon": ((d.naccdmax, 2 * npolygonmax), wp.vec3),
+    "multiccd_clipped": ((d.naccdmax, 2 * npolygonmax), wp.vec3),
+    "multiccd_pnormal": ((d.naccdmax, npolygonmax), wp.vec3),
+    "multiccd_pdist": ((d.naccdmax, npolygonmax), float),
+    "multiccd_idx1": ((d.naccdmax, nmeshdegmax), int),
+    "multiccd_idx2": ((d.naccdmax, nmeshdegmax), int),
+    "multiccd_n1": ((d.naccdmax, nmeshdegmax), wp.vec3),
+    "multiccd_n2": ((d.naccdmax, nmeshdegmax), wp.vec3),
+    "multiccd_endvert": ((d.naccdmax, nmeshdegmax), wp.vec3),
+    "multiccd_face1": ((d.naccdmax, npolygonmax), wp.vec3),
+    "multiccd_face2": ((d.naccdmax, npolygonmax), wp.vec3),
+  }
+
+
+def create_convex_context(m, d, collision_table, arrays=None):
+  """Allocate or borrow the convex stage's native work arrays."""
+  layout = convex_context_layout(m, d, collision_table)
+  return ConvexContext(**allocate_work_arrays(layout, arrays, device=d.ncollision.device)) if layout else None
+
+
+@event_scope
+def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table, *, work=None):
+  """Runs narrowphase collision detection for convex geom pairs.
+
+  This function handles collision detection for pairs of convex geometries that were
+  identified during the broadphase. It uses the Gilbert-Johnson-Keerthi (GJK) algorithm to
+  determine the distance between shapes and the Expanding Polytope Algorithm (EPA) to find
+  the penetration depth and contact normal for colliding pairs.
+
+  The convex geom types handled by this function are `SPHERE`, `CAPSULE`, `ELLIPSOID`, `CYLINDER`,
+  `BOX`, `MESH`, `HFIELD`.
+
+  To optimize performance, this function dynamically builds and launches a specialized
+  kernel for each type of convex collision pair present in the model, avoiding unnecessary
+  computations for non-existent pair types.
+  """
+
+  def _pair_count(p1, p2):
+    idx = upper_trid_index(len(GeomType), p1, p2)
+    return m.geom_pair_type_count[idx], idx
+
+  ncollision, epa_iterations, npolygonmax, nmeshdegmax = _convex_dimensions(m, collision_table)
+  use_multiccd = (m.opt.disableflags & DisableBit.MULTICCD) == 0
+  if not ncollision:
+    return
+  work = create_convex_context(m, d, collision_table) if work is None else work
+  nccd = work.nccd
+  epa_vert = work.epa_vert
+  epa_vert_index = work.epa_vert_index
+  epa_face = work.epa_face
+  epa_pr = work.epa_pr
+  epa_norm2 = work.epa_norm2
+  epa_horizon = work.epa_horizon
+  multiccd_polygon = work.multiccd_polygon
+  multiccd_clipped = work.multiccd_clipped
+  multiccd_pnormal = work.multiccd_pnormal
+  multiccd_pdist = work.multiccd_pdist
+  multiccd_idx1 = work.multiccd_idx1
+  multiccd_idx2 = work.multiccd_idx2
+  multiccd_n1 = work.multiccd_n1
+  multiccd_n2 = work.multiccd_n2
+  multiccd_endvert = work.multiccd_endvert
+  multiccd_face1 = work.multiccd_face1
+  multiccd_face2 = work.multiccd_face2
   nccd.zero_()
 
   # Contact outputs

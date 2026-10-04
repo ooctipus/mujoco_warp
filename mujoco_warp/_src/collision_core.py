@@ -19,7 +19,6 @@ import dataclasses
 from typing import Any, Tuple
 
 import warp as wp
-from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src.math import safe_div
 from mujoco_warp._src.types import MJ_MINMU
@@ -28,6 +27,7 @@ from mujoco_warp._src.types import ContactType
 from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import mat63
 from mujoco_warp._src.types import vec5
+from mujoco_warp._src.warp_util import allocate_work_arrays
 
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
@@ -484,6 +484,7 @@ class CollisionContext:
   collision_pair: wp.array
   collision_pairid: wp.array
   collision_worldid: wp.array
+  awake_changed: wp.array
 
 
 @wp.func
@@ -520,10 +521,16 @@ def sap_range(
   range_out[worldid, sortedid] = limit - sortedid
 
 
-def create_collision_context(naconmax: int, *, registry=None) -> CollisionContext:
-  """Create candidate arrays from the execution registry or ordinary allocations."""
-  return CollisionContext(
-    collision_pair=scratch_array(registry, "collision.pair", (naconmax,), wp.vec2i),
-    collision_pairid=scratch_array(registry, "collision.pairid", (naconmax,), wp.vec2i),
-    collision_worldid=scratch_array(registry, "collision.worldid", (naconmax,), int),
-  )
+def collision_context_layout(naconmax):
+  """Declare candidate operands; the leading dimension identifies candidate capacity."""
+  return {
+    "collision_pair": ((naconmax,), wp.vec2i),
+    "collision_pairid": ((naconmax,), wp.vec2i),
+    "collision_worldid": ((naconmax,), int),
+    "awake_changed": ((1,), int),
+  }
+
+
+def create_collision_context(naconmax: int, arrays=None, *, device=None) -> CollisionContext:
+  """Allocate or borrow candidate operands without assigning backing ownership."""
+  return CollisionContext(**allocate_work_arrays(collision_context_layout(naconmax), arrays, device=device))

@@ -15,7 +15,6 @@
 
 
 import warp as wp
-from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -1659,6 +1658,11 @@ def _cfrc_ext_equality(
     wp.atomic_sub(cfrc_ext_out[worldid], bodyid2, cfrc_com)
 
 
+def transmission_work_layout(m, d):
+  """Declare transmission reduction counters."""
+  return {"moment_nnz": ((d.nworld,), int), "body_ncon": ((d.nworld, int(m.nacttrnbody)), int)}
+
+
 @wp.func
 def transform_force(force: wp.vec3, torque: wp.vec3, offset: wp.vec3) -> wp.spatial_vector:
   torque -= wp.cross(offset, force)
@@ -3219,14 +3223,16 @@ def _transmission_body_moment_scale(
 
 
 @event_scope
-def transmission(m: Model, d: Data):
+def transmission(m: Model, d: Data, *, moment_nnz=None, body_ncon=None):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  moment_nnz = scratch_array(d.scratch, "transmission.moment_nnz", (d.nworld,), int)
+  if moment_nnz is None:
+    shape, dtype = transmission_work_layout(m, d)["moment_nnz"]
+    moment_nnz = wp.empty(shape, dtype=dtype, device=d.qpos.device)
   moment_nnz.zero_(extent=(d.nworld, *moment_nnz.shape[1:]))
   wp.launch(
     _transmission,
@@ -3268,7 +3274,9 @@ def transmission(m: Model, d: Data):
 
   if m.nacttrnbody:
     # compute moments
-    body_ncon = scratch_array(d.scratch, "transmission.body_ncon", (d.nworld, m.nacttrnbody), int)
+    if body_ncon is None:
+      shape, dtype = transmission_work_layout(m, d)["body_ncon"]
+      body_ncon = wp.empty(shape, dtype=dtype, device=d.qpos.device)
     body_ncon.zero_(extent=(d.nworld, *body_ncon.shape[1:]))
 
     wp.launch(

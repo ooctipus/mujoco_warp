@@ -14,14 +14,11 @@
 # ==============================================================================
 import dataclasses
 import enum
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Callable, Optional
 
 import mujoco
 import numpy as np
 import warp as wp
-
-if TYPE_CHECKING:
-  from gpu_components.scratch_data import ScratchRegistry
 
 MJ_MINVAL = mujoco.mjMINVAL
 MJ_MAXVAL = mujoco.mjMAXVAL
@@ -2482,8 +2479,6 @@ class Data:
   overflow: array("nworld", int)
   face_xpos: array("nworld", "nflexface", 9, wp.vec3)
   face_quat: array("nworld", "nflexface", wp.quat)
-  scratch: Optional["ScratchRegistry"] = None
-  """Scratch registry for the prepared step (see gpu_components.scratch); None is the eager path."""
 
 
 @dataclasses.dataclass
@@ -2498,8 +2493,8 @@ class InverseContext:
   state_changed_count: wp.array[int]
   ls_exhausted: wp.array[bool]
   # the full-coordinate Data, set by solve_compact (None natively)
-  compact_m_full: Optional["Model"] = None
-  compact_d_full: Optional["Data"] = None
+  compact_m_full: Optional["Model"] = dataclasses.field(default=None, metadata={"array_fields": False})
+  compact_d_full: Optional["Data"] = dataclasses.field(default=None, metadata={"array_fields": False})
 
 
 @dataclasses.dataclass
@@ -2530,9 +2525,10 @@ class SolverContext:
   hfactor: wp.array3d[float]
   quad_changed_ids: wp.array2d[int]
   quad_changed_count: wp.array[int]
+  nsolving: wp.array[int]
   # the full-coordinate Data, set by solve_compact (None natively)
-  compact_m_full: Optional["Model"] = None
-  compact_d_full: Optional["Data"] = None
+  compact_m_full: Optional["Model"] = dataclasses.field(default=None, metadata={"array_fields": False})
+  compact_d_full: Optional["Data"] = dataclasses.field(default=None, metadata={"array_fields": False})
 
 
 @dataclasses.dataclass

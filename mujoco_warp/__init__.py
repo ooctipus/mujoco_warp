@@ -38,6 +38,7 @@ from mujoco_warp._src.collision_primitive import primitive_narrowphase as primit
 from mujoco_warp._src.collision_sdf import sdf_narrowphase as sdf_narrowphase
 from mujoco_warp._src.constraint import make_constraint as make_constraint
 from mujoco_warp._src.derivative import deriv_smooth_vel as deriv_smooth_vel
+from mujoco_warp._src.forward import StepWork as StepWork
 from mujoco_warp._src.forward import euler as euler
 from mujoco_warp._src.forward import forward as forward
 from mujoco_warp._src.forward import fwd_acceleration as fwd_acceleration
@@ -46,9 +47,13 @@ from mujoco_warp._src.forward import fwd_kinematics as fwd_kinematics
 from mujoco_warp._src.forward import fwd_position as fwd_position
 from mujoco_warp._src.forward import fwd_velocity as fwd_velocity
 from mujoco_warp._src.forward import implicit as implicit
+from mujoco_warp._src.forward import make_step_work as make_step_work
 from mujoco_warp._src.forward import rungekutta4 as rungekutta4
 from mujoco_warp._src.forward import step1 as step1
 from mujoco_warp._src.forward import step2 as step2
+from mujoco_warp._src.forward import step_work_alignments as step_work_alignments
+from mujoco_warp._src.forward import step_work_layout as step_work_layout
+from mujoco_warp._src.forward import validate_step_work as validate_step_work
 from mujoco_warp._src.history import init_ctrl_history as init_ctrl_history
 from mujoco_warp._src.history import init_sensor_history as init_sensor_history
 from mujoco_warp._src.history import read_ctrl as read_ctrl
@@ -57,8 +62,12 @@ from mujoco_warp._src.history import reset_history as reset_history
 from mujoco_warp._src.inverse import inverse as inverse
 from mujoco_warp._src.io import array_fields as array_fields
 from mujoco_warp._src.io import copy_worlds as copy_worlds
+from mujoco_warp._src.io import data_field_alignments as data_field_alignments
+from mujoco_warp._src.io import data_field_defaults as data_field_defaults
 from mujoco_warp._src.io import get_data_into as get_data_into
+from mujoco_warp._src.io import invalidate_contact_cache as invalidate_contact_cache
 from mujoco_warp._src.io import make_data as make_data
+from mujoco_warp._src.io import metadata_signature as metadata_signature
 from mujoco_warp._src.io import put_data as put_data
 from mujoco_warp._src.io import put_model as put_model
 from mujoco_warp._src.io import replace_arrays as replace_arrays
@@ -66,6 +75,7 @@ from mujoco_warp._src.io import replicate_data as replicate_data
 from mujoco_warp._src.io import replicate_model as replicate_model
 from mujoco_warp._src.io import reset_data as reset_data
 from mujoco_warp._src.io import reset_data_keyframe as reset_data_keyframe
+from mujoco_warp._src.io import validate_data_layout as validate_data_layout
 from mujoco_warp._src.island import island as island
 from mujoco_warp._src.passive import passive as passive
 from mujoco_warp._src.ray import ray as ray
@@ -103,10 +113,8 @@ from mujoco_warp._src.smooth import subtree_vel as subtree_vel
 from mujoco_warp._src.smooth import tendon as tendon
 from mujoco_warp._src.smooth import transmission as transmission
 from mujoco_warp._src.solver import solve as solve
-from mujoco_warp._src.step_program import StepBindings as StepBindings
-from mujoco_warp._src.step_program import bind_step_program as bind_step_program
-from mujoco_warp._src.step_program import validate_step_workspace as validate_step_workspace
 from mujoco_warp._src.support import contact_force as contact_force
+from mujoco_warp._src.support import contact_force_fn as contact_force_fn
 from mujoco_warp._src.support import get_state as get_state
 from mujoco_warp._src.support import jac as jac
 from mujoco_warp._src.support import mul_m as mul_m
@@ -138,7 +146,4 @@ from mujoco_warp._src.types import SolverType as SolverType
 from mujoco_warp._src.types import State as State
 from mujoco_warp._src.types import Statistic as Statistic
 from mujoco_warp._src.types import TrnType as TrnType
-from mujoco_warp._src.workspace import discover_step_scratch as discover_step_scratch
-from mujoco_warp._src.workspace import make_step_workspace as make_step_workspace
-from mujoco_warp._src.workspace import step_workspace_memory_report as step_workspace_memory_report
-from mujoco_warp._src.workspace import validate_step_model as validate_step_model
+from mujoco_warp._src.types import vec5 as vec5

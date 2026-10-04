@@ -37,6 +37,96 @@ from mujoco_warp._src.set_const import set_length_range as set_length_range
 wp.set_module_options({"default_grid_stride": False})
 
 
+def _data_field_default(model, name):
+  """Neutral backing values; episode defaults still come from native model operations."""
+  if name == "contact.efc_address":
+    return -1
+  if name == "island_dofadr":
+    return model.nv
+  return 0
+
+
+def data_field_defaults(model, data):
+  """Return neutral fill values for newly backed native Data arrays.
+
+  This initializes storage before a numerical operation or template copy writes its
+  state. It is not an episode reset: qpos, sleeping policy, history and model-dependent
+  physical defaults must be restored with native reset/initialization operations.
+  """
+  return {name: _data_field_default(model, name) for name, _, _ in array_fields(data)}
+
+
+def data_field_alignments(model, data):
+  """Numerical alignment overrides; unspecified fields need their dtype alignment."""
+  from mujoco_warp._src.solver import BLOCKED_MATRIX_ALIGNMENT
+
+  return {"cM": BLOCKED_MATRIX_ALIGNMENT, "cqLD": BLOCKED_MATRIX_ALIGNMENT}
+
+
+def validate_data_layout(model, data):
+  """Validate native island and blocked-matrix descriptors without storage policy."""
+  from mujoco_warp._src.solver import validate_blocked_matrix
+
+  nworld = wp.upper_bound(data.nworld)
+  if (
+    data.dof_islandid.shape != (nworld, model.nv)
+    or data.efc_islandid.shape != (nworld, data.njmax)
+    or data.island_idofadr.shape != (nworld, model.ntree)
+  ):
+    raise ValueError("Native Data needs complete island descriptors")
+  validate_blocked_matrix(data.cM)
+  validate_blocked_matrix(data.cqLD)
+
+
+def invalidate_contact_cache(data):
+  """Invalidate placement-dependent contact and previous-broadphase counts."""
+  data.nacon.zero_()
+  data.ncollision.zero_()
+
+
+_LAYOUT_REFERENCE = object()
+
+
+def metadata_signature(value, memo=None):
+  """Snapshot native metadata with local references for repeated borrowed aliases.
+
+  Share a fresh memo across one operation's roots. First occurrences record all
+  descriptors; later occurrences record their traversal ordinal. The memo retains
+  temporary containers and is never reused by a subsequent validation.
+  """
+  if isinstance(value, wp.CountParameter):
+    return wp.CountParameter, id(value), value.maximum
+  if value is None or isinstance(value, (int, float, bool, str)):
+    return value
+  if memo is None:
+    memo = {}
+  identity = id(value)
+  if identity in memo:
+    return memo[identity][1]
+  if isinstance(value, wp.array):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    return identity, value.ptr, value.shape, value.strides, value.dtype, value.device
+  if dataclasses.is_dataclass(value):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    result = []
+    for field in dataclasses.fields(value):
+      child = getattr(value, field.name)
+      cached = memo.get(id(child))
+      result.append((field.name, cached[1] if cached is not None else metadata_signature(child, memo)))
+    return type(value), identity, tuple(result)
+  if isinstance(value, dict):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    return tuple((metadata_signature(key, memo), metadata_signature(child, memo)) for key, child in value.items())
+  if isinstance(value, (tuple, list)):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    result = []
+    for child in value:
+      cached = memo.get(id(child))
+      result.append(cached[1] if cached is not None else metadata_signature(child, memo))
+    return tuple(result)
+  return identity
+
+
 def array_fields(source):
   """Yield borrowed arrays as ``(path, array, declared_shape)`` in declaration order.
 
@@ -53,6 +143,8 @@ def array_fields(source):
       yield path, value, tuple(getattr(annotation, "shape", ()))
     elif dataclasses.is_dataclass(value):
       for field in dataclasses.fields(value):
+        if not field.metadata.get("array_fields", True):
+          continue
         name = f"{path}.{field.name}" if path else field.name
         yield from visit(getattr(value, field.name), name, field.type)
     elif isinstance(value, (tuple, list)):
@@ -79,7 +171,11 @@ def _replace_array_fields(value, path, arrays):
     return dataclasses.replace(
       value,
       **{
-        field.name: _replace_array_fields(getattr(value, field.name), f"{path}.{field.name}" if path else field.name, arrays)
+        field.name: (
+          _replace_array_fields(getattr(value, field.name), f"{path}.{field.name}" if path else field.name, arrays)
+          if field.metadata.get("array_fields", True)
+          else getattr(value, field.name)
+        )
         for field in dataclasses.fields(value)
       },
     )
@@ -2538,7 +2634,7 @@ def _allocate_island_arrays(
     "island_nf",
     "island_iefcadr",
   ):
-    arr = np.zeros((nworld, ntree), dtype=np.int32)
+    arr = np.full((nworld, ntree), _data_field_default(mjm, name), dtype=np.int32)
     if nisland > 0:
       arr[:, :nisland] = getattr(mjd, name)[:nisland]
     setattr(d, name, wp.array(arr, dtype=int))
@@ -2791,7 +2887,9 @@ def make_data(
     else:
       contact_kwargs[f.name] = _create_array(None, f.type, sizes)
   contact = types.Contact(**contact_kwargs)
-  contact.efc_address = wp.array(np.full((naconmax, sizes["nmaxpyramid"]), -1, dtype=int), dtype=int)
+  contact.efc_address = wp.array(
+    np.full((naconmax, sizes["nmaxpyramid"]), _data_field_default(mjm, "contact.efc_address"), dtype=int), dtype=int
+  )
 
   efc = _create_constraint(mjm, nworld, njmax, sizes)
 
@@ -3053,7 +3151,7 @@ def put_data(
 
   contact = types.Contact(**contact_kwargs)
 
-  contact.efc_address = np.full((naconmax, sizes["nmaxpyramid"]), -1, dtype=int)
+  contact.efc_address = np.full((naconmax, sizes["nmaxpyramid"]), _data_field_default(mjm, "contact.efc_address"), dtype=int)
   for i in range(mjd.ncon):
     efc_address = mjd.contact.efc_address[i]
     if efc_address == -1:
