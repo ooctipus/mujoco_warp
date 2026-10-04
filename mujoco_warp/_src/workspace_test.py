@@ -251,6 +251,8 @@ class NativeBindingsTest(unittest.TestCase):
         "updates",
         "recording_failed",
         "bindings",
+        "extra_storages",
+        "extra_fixed_arrays",
       ],
     )
     tree = ast.parse(inspect.getsource(StepBindings))
@@ -652,7 +654,7 @@ class WorkspaceTest(unittest.TestCase):
     self.assertEqual(
       [field.name for field in dataclasses.fields(WorkspaceFieldSpec)], ["name", "shape", "dtype", "capacity_domain"]
     )
-    self.assertEqual(set(inspect.signature(make_step_workspace).parameters), {"model", "data", "arrays", "bindings"})
+    self.assertEqual(set(inspect.signature(make_step_workspace).parameters), {"model", "data", "arrays", "bindings", "scratch"})
     self.assertTrue(dataclasses.is_dataclass(_StepWorkspace))
     record = ast.parse(inspect.getsource(_StepWorkspace))
     self.assertFalse(any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in ast.walk(record)))
@@ -915,7 +917,6 @@ class WorkspaceTest(unittest.TestCase):
   def test_stage_scratch_records_are_passive_and_workspace_has_one_resource_tree(self):
     records = (
       forward._PositionScratch,
-      forward._ImplicitScratch,
       forward._ForwardScratch,
       forward._StepScratch,
       solver._SolverScratch,
@@ -947,7 +948,6 @@ class WorkspaceTest(unittest.TestCase):
     )
     data = Mock()
     position = forward._PositionScratch(object(), object(), object(), object(), object())
-    implicit = forward._ImplicitScratch(*(object() for _ in range(6)))
     with ExitStack() as stack:
       for module, name in (
         (forward, "fwd_kinematics"),
@@ -973,8 +973,15 @@ class WorkspaceTest(unittest.TestCase):
       operations[0].assert_called_once_with(model, data, efc_nnz=position.efc_nnz)
       operations[1].assert_called_once_with(model, data, parent=position.island_parent)
       operations[2].assert_called_once_with(model, data, scratch=position.transmission)
-      forward.implicit(model, data, scratch=implicit)
-      operations[3].assert_called_once_with(model, data, implicit.qDeriv, actuator_vel=implicit.actuator_vel)
+      # the implicit stage owns its temporaries: requested by name through the data's registry
+      model.nC, model.nv, model.nactuator, model.ntree = 4, 3, 2, 1
+      data.nworld, data.qLD, data.scratch = 3, SimpleNamespace(shape=(3, 5)), None
+      with patch.object(wp, "empty", side_effect=lambda shape, dtype=float, **kw: ("empty", tuple(shape), dtype)) as empty:
+        forward.implicit(model, data)
+      operations[3].assert_called_once()
+      self.assertEqual(operations[3].call_args.args[2], ("empty", (3, 4), wp.float32))
+      self.assertEqual(operations[3].call_args.kwargs["actuator_vel"], ("empty", (3, 2), wp.float32))
+      self.assertEqual(empty.call_count, 6)
 
   def test_transmission_initializes_supplied_counters_on_every_execution(self):
     model, data = Mock(nacttrnbody=2), Mock(nworld=3)
@@ -1215,7 +1222,7 @@ class WorkspaceTest(unittest.TestCase):
       workspace = make_step_workspace(Metadata(), data, arrays=arrays)
     original = workspace.scratch
     for replacement in (
-      dataclasses.replace(original, implicit=object()),
+      dataclasses.replace(original, forward=object()),
       dataclasses.replace(original, forward=dataclasses.replace(original.forward, solver=object())),
     ):
       workspace.scratch = replacement

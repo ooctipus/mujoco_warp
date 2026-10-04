@@ -52,6 +52,11 @@ class StepBindings:
   recording_failed: bool = False
   bindings: list[GraphKernelBinding] = dataclasses.field(default_factory=list)
   _recording_binding: tuple | None = None
+  # Additional storages whose columns captured launches may touch (scratch columns the
+  # composition prepared after discovery) and plain arrays that are fixed for the graph.
+  # Additive: the composition sets them before the first real recording.
+  extra_storages: tuple = ()
+  extra_fixed_arrays: tuple = ()
 
 
 _LAYOUT_REFERENCE = object()
@@ -151,9 +156,13 @@ def _validate_bindings(bindings):
   if bindings.recording_failed:
     raise RuntimeError("The native step program has a failed recording")
   if not all(
-    isinstance(storage, FieldStorage) for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
+    isinstance(storage, FieldStorage)
+    for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage, *bindings.extra_storages)
   ):
     raise TypeError("Native capacity domains must borrow FieldStorage records")
+  for storage in bindings.extra_storages:
+    if storage.closed or storage.service_failed:
+      raise RuntimeError("Native scratch storage is closed or quarantined")
   device = bindings.world_storage.device
   for storage, count in (
     (bindings.world_storage, bindings.world_storage.protected_count),
@@ -230,7 +239,7 @@ def bind_step_program(workspace, graph: wp.Graph, launches: tuple[wp.CapturedLau
     if type(launches) is not tuple:
       raise TypeError("Native program launches must be an explicit immutable tuple")
     _retain_bindings(bindings, graph)
-    storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
+    storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage, *bindings.extra_storages)
     count_sources = (
       (workspace.execution_data.nworld, bindings.world_storage.protected_count),
       (workspace.execution_data.naconmax, bindings.contact_storage.ready_count),
@@ -238,6 +247,7 @@ def bind_step_program(workspace, graph: wp.Graph, launches: tuple[wp.CapturedLau
     )
     fixed_arrays = [workspace.data.nacon, workspace.data.ncollision]
     fixed_arrays.extend(workspace.arrays[spec.name] for spec in workspace._specs if spec.capacity_domain == "global_counter")
+    fixed_arrays.extend(bindings.extra_fixed_arrays)
     fixed_arrays = tuple({(id(a.device), a.ptr, a.shape, a.strides, a.dtype): a for a in fixed_arrays}.values())
     launch_ids = {id(record) for record in launches}
     operations = tuple(op for op in wp.capture_get_memory_operations(graph) if id(op.launch) in launch_ids)

@@ -31,6 +31,7 @@ from mujoco_warp._src import sleep
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
 from mujoco_warp._src import util_misc
+from mujoco_warp._src.scratch import scratch_array
 from mujoco_warp._src.support import next_act
 from mujoco_warp._src.support import xfrc_accumulate
 from mujoco_warp._src.types import MJ_MINVAL
@@ -66,18 +67,6 @@ class _PositionScratch:
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
-class _ImplicitScratch:
-  """Borrowed implicit-fast factorization, derivative and sleep arrays."""
-
-  qDeriv: wp.array2d[float]
-  qLD: wp.array2d[float]
-  qLDiagInv: wp.array2d[float]
-  qacc: wp.array2d[float]
-  actuator_vel: wp.array2d[float]
-  island_can_sleep: wp.array2d[int]
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
 class _ForwardScratch:
   position: _PositionScratch
   solver: solver._SolverScratch
@@ -86,7 +75,6 @@ class _ForwardScratch:
 @dataclasses.dataclass(frozen=True, eq=False)
 class _StepScratch:
   forward: _ForwardScratch
-  implicit: _ImplicitScratch
 
 
 @wp.kernel
@@ -444,10 +432,10 @@ def euler(m: Model, d: Data):
   """Euler integrator, semi-implicit in velocity."""
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = scratch_array(d.scratch, "euler.qacc", (d.nworld, m.nv), float)
 
     # Compute damping derivative
-    damp_deriv = wp.empty((d.nworld, m.nv), dtype=float)
+    damp_deriv = scratch_array(d.scratch, "euler.damp_deriv", (d.nworld, m.nv), float)
     wp.launch(
       _compute_damping_deriv,
       dim=(d.nworld, m.nv),
@@ -457,9 +445,10 @@ def euler(m: Model, d: Data):
 
     # Clone M, add the damping to the diagonal, and factor-solve. factor_solve_i factors each block
     # per-block (packed dense and/or sparse LDL); the scratch qLD matches d.qLD.
-    M = wp.clone(d.M)
-    qLD = wp.empty_like(d.qLD)
-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
+    M = scratch_array(d.scratch, "euler.M", (d.nworld, *d.M.shape[1:]), float)
+    wp.copy(M, d.M, extent=(d.nworld, *d.M.shape[1:]))
+    qLD = scratch_array(d.scratch, "euler.qLD", (d.nworld, *d.qLD.shape[1:]), float)
+    qLDiagInv = scratch_array(d.scratch, "euler.qLDiagInv", (d.nworld, m.nv), float)
     wp.launch(
       _euler_damp_qfrc,
       dim=(d.nworld, m.nv),
@@ -1020,13 +1009,11 @@ def _launch_implicit_free_body_solve(m: Model, d: Data, qacc: wp.array2d[float])
 
 
 @event_scope
-def implicit(m: Model, d: Data, *, scratch: _ImplicitScratch | None = None):
+def implicit(m: Model, d: Data):
   """Integrates fully implicit in velocity."""
   if m.opt.integrator == IntegratorType.IMPLICIT:
-    if scratch is not None:
-      raise ValueError("Implicit-fast scratch does not support the full implicit integrator")
     # 1. Smooth velocity derivatives into M-structure
-    qH_M = wp.empty((d.nworld, m.nC), dtype=float)
+    qH_M = scratch_array(d.scratch, "implicit.qH_M", (d.nworld, m.nC), float)
     derivative.deriv_smooth_vel(m, d, qH_M)
 
     # 2. Map qH_M (M-structure) to qLU (D-structure) via mapM2D.
@@ -1043,18 +1030,19 @@ def implicit(m: Model, d: Data, *, scratch: _ImplicitScratch | None = None):
     derivative.deriv_rne_vel(m, d, d.qLU)
 
     # 4. Factorize and solve: qacc = qLU \ Ma
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = scratch_array(d.scratch, "implicit.qacc_lu", (d.nworld, m.nv), float)
     smooth.factor_solve_lu(m, d, d.qLU, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
     _advance(m, d, qacc)
   elif (m.opt.disableflags & (DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)) != (
     DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
   ):
-    # qDeriv is in M-structure; the scratch qLD matches d.qLD (per-block).
-    qDeriv = wp.empty((d.nworld, m.nC), dtype=float) if scratch is None else scratch.qDeriv
-    qLD = wp.empty_like(d.qLD) if scratch is None else scratch.qLD
-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float) if scratch is None else scratch.qLDiagInv
-    derivative.deriv_smooth_vel(m, d, qDeriv, actuator_vel=None if scratch is None else scratch.actuator_vel)
+    # qDeriv is in M-structure; qLD matches d.qLD (per-block).
+    qDeriv = scratch_array(d.scratch, "implicit.qDeriv", (d.nworld, m.nC), float)
+    qLD = scratch_array(d.scratch, "implicit.qLD", (d.nworld, *d.qLD.shape[1:]), float)
+    qLDiagInv = scratch_array(d.scratch, "implicit.qLDiagInv", (d.nworld, m.nv), float)
+    actuator_vel = scratch_array(d.scratch, "implicit.actuator_vel", (d.nworld, m.nactuator), float)
+    derivative.deriv_smooth_vel(m, d, qDeriv, actuator_vel=actuator_vel)
     if m.body_freeadr.size > 0:
       wp.launch(
         _implicit_free_body_reset_m,
@@ -1068,12 +1056,12 @@ def implicit(m: Model, d: Data, *, scratch: _ImplicitScratch | None = None):
         ],
         outputs=[qDeriv],
       )
-    qacc = wp.empty((d.nworld, m.nv), dtype=float) if scratch is None else scratch.qacc
+    qacc = scratch_array(d.scratch, "implicit.qacc", (d.nworld, m.nv), float)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
-    _advance(m, d, qacc, island_can_sleep=None if scratch is None else scratch.island_can_sleep)
+    _advance(m, d, qacc, island_can_sleep=scratch_array(d.scratch, "implicit.island_can_sleep", (d.nworld, m.ntree), int))
   else:
-    _advance(m, d, d.qacc, island_can_sleep=None if scratch is None else scratch.island_can_sleep)
+    _advance(m, d, d.qacc, island_can_sleep=scratch_array(d.scratch, "implicit.island_can_sleep", (d.nworld, m.ntree), int))
 
 
 @event_scope
@@ -1878,7 +1866,7 @@ def step(m: Model, d: Data, *, scratch: _StepScratch | None = None):
   elif m.opt.integrator == IntegratorType.RK4:
     rungekutta4(m, d)
   elif m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
-    implicit(m, d, scratch=None if scratch is None else scratch.implicit)
+    implicit(m, d)
   else:
     raise NotImplementedError(f"integrator {m.opt.integrator} not implemented.")
 

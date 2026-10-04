@@ -14,11 +14,14 @@
 # ==============================================================================
 import dataclasses
 import enum
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import mujoco
 import numpy as np
 import warp as wp
+
+if TYPE_CHECKING:
+  from gpu_components.scratch_data import ScratchRegistry
 
 MJ_MINVAL = mujoco.mjMINVAL
 MJ_MAXVAL = mujoco.mjMAXVAL
@@ -2478,6 +2481,8 @@ class Data:
   overflow: array("nworld", int)
   face_xpos: array("nworld", "nflexface", 9, wp.vec3)
   face_quat: array("nworld", "nflexface", wp.quat)
+  scratch: Optional["ScratchRegistry"] = None
+  """Scratch registry for the prepared step (see gpu_components.scratch); None is the eager path."""
 
 
 @dataclasses.dataclass

@@ -62,11 +62,11 @@ class DerivativeTest(parameterized.TestCase):
     d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
     mjw.forward(m, d)
     workspace = mjw.make_step_workspace(m, d) if prepared else None
-    out = workspace.arrays["qDeriv"] if prepared else wp.empty_like(d.M)
+    out = wp.empty_like(d.M)  # the derivative stage no longer has a workspace-owned qDeriv; implicit declares its own
     if prepared:
       with wp.ScopedCapture() as capture:
         mjw.validate_step_workspace(workspace, m, d)
-        mjw.deriv_smooth_vel(m, d, out, actuator_vel=workspace.scratch.implicit.actuator_vel)
+        mjw.deriv_smooth_vel(m, d, out)
       wp.capture_launch(capture.graph)
     else:
       mjw.deriv_smooth_vel(m, d, out)

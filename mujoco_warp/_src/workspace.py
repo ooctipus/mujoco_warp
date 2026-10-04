@@ -203,15 +203,9 @@ def step_workspace_layout(
     ("awake_changed", (1,), int, "global_counter"),
     ("efc_nnz", (nw,), int, "world"),
     ("island_parent", (nw, m.ntree), int, "world"),
-    ("island_can_sleep", (nw, m.ntree), int, "world"),
     ("efc_tree", (nw, d.njmax), int, "world"),
     ("moment_nnz", (nw,), int, "world"),
     ("nsolving", (1,), int, "global_counter"),
-    ("qDeriv", (nw, m.nC), float, "world"),
-    ("qLD", d.qLD.shape, float, "world"),
-    ("qLDiagInv", (nw, m.nv), float, "world"),
-    ("qacc", (nw, m.nv), float, "world"),
-    ("actuator_vel", (nw, m.nactuator), float, "world"),
   ]
   specs.extend(("solver." + name, shape, dtype, "world") for name, shape, dtype, _ in solver._solver_context_layout(m2, d2))
   fields = []
@@ -222,7 +216,7 @@ def step_workspace_layout(
   return tuple(fields)
 
 
-def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bindings=None) -> _StepWorkspace:
+def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bindings=None, scratch=None) -> _StepWorkspace:
   """Prepare a workspace with caller-owned typed scratch or fixed scratch allocated here.
 
   This is the sole public workspace construction operation. The returned owner
@@ -276,12 +270,16 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   solver.validate_blocked_matrix(data.cqLD)
   execution_data = data
   if bindings is not None:
+    # The composition owns the scratch registry; stages request temporaries through it by name.
     execution_data = dataclasses.replace(
       data,
       nworld=wp.CountParameter(data.nworld),
       naconmax=wp.CountParameter(data.naconmax),
       naccdmax=wp.CountParameter(data.naccdmax),
+      **({} if scratch is None else {"scratch": scratch}),
     )
+  elif scratch is not None:
+    raise ValueError("A scratch registry belongs to dynamic execution; fixed execution allocates eagerly")
   m2, d2 = solver._compact_solver_views(model, execution_data)
   device = data.qpos.device
   storage, offsets = None, None
@@ -330,9 +328,6 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   )
   solver.validate_solver_scratch(m2, solver_context)
   solver_context.compact_m_full, solver_context.compact_d_full = model, execution_data
-  implicit_scratch = forward._ImplicitScratch(
-    **{field.name: arrays[field.name] for field in dataclasses.fields(forward._ImplicitScratch)}
-  )
   scratch = forward._StepScratch(
     forward=forward._ForwardScratch(
       position=forward._PositionScratch(
@@ -344,7 +339,6 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
       ),
       solver=solver._SolverScratch(m2, d2, solver_context, arrays["nsolving"], arrays["efc_tree"]),
     ),
-    implicit=implicit_scratch,
   )
   memo = {}
   return _StepWorkspace(
