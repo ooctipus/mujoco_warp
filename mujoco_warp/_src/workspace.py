@@ -13,117 +13,40 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Prepared native step scratch with explicit allocation and lifetime ownership."""
+"""Discover numerical scratch, then bind one complete prepared execution."""
 
 import dataclasses
-import math
-from typing import get_type_hints
+import traceback
 
 import warp as wp
 from gpu_components import fields as field_ops
+from gpu_components import graph as graph_ops
+from gpu_components import scratch as scratch_ops
 from gpu_components import scratch_data
 
 from mujoco_warp._src import forward
+from mujoco_warp._src import io
 from mujoco_warp._src import solver
 from mujoco_warp._src import step_program
 from mujoco_warp._src import types
-from mujoco_warp._src.collision_convex import _convex_scratch_shapes
-from mujoco_warp._src.collision_convex import _ConvexScratch
-from mujoco_warp._src.collision_core import CollisionContext
-from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
-from mujoco_warp._src.collision_driver import _CollisionScratch
-from mujoco_warp._src.types import CollisionType
-
-
-@dataclasses.dataclass(frozen=True)
-class WorkspaceFieldSpec:
-  """Scratch requirement; capacity_domain declares its independent capacity axis."""
-
-  name: str
-  shape: tuple[int, ...]
-  dtype: type
-  capacity_domain: str
 
 
 @dataclasses.dataclass(eq=False)
 class _StepWorkspace:
-  """Passive prepared scratch and borrowed stage views, constructed by make_step_workspace.
-
-  One record serves ordered substeps and collision passes. Concurrent steps need
-  separate scratch. Only preparation operations create owners and derived views;
-  native execution operations validate bindings and retain this record on capture.
-  """
+  """Borrow the complete native execution and its immutable resource relationship."""
 
   model: types.Model
   data: types.Data
   execution_data: types.Data
-  bindings: step_program.StepBindings | None
+  bindings: step_program.StepBindings
   device: object
-  storage: wp.array | None
-  arrays: dict[str, wp.array]
-  scratch: forward._ForwardScratch
-  _specs: tuple[WorkspaceFieldSpec, ...]
-  _allocation_offsets_bytes: tuple[int, ...] | None
-  _execution_binding: object
-  _binding_layout: tuple | None
-  _data_layout: object
-  _model_layout: object
-  _scratch_layout: object
-  _finalized_layout: object
+  _layout: tuple
+  _binding_layout: tuple
 
 
-def step_workspace_memory_report(workspace):
-  """Describe scratch payload without claiming ownership of caller-managed backing."""
-  fields = [
-    dict(
-      name=spec.name,
-      shape=spec.shape,
-      dtype=str(spec.dtype),
-      allocation_offset_bytes=None
-      if workspace._allocation_offsets_bytes is None
-      else workspace._allocation_offsets_bytes[index],
-      payload_bytes=math.prod(spec.shape) * wp.types.type_size_in_bytes(spec.dtype),
-      capacity_domain=spec.capacity_domain,
-      world_axis=0 if spec.capacity_domain == "world" else None,
-      pointer=workspace.arrays[spec.name].ptr,
-    )
-    for index, spec in enumerate(workspace._specs)
-  ]
-  return {
-    "physical_scratch_bytes": None if workspace.storage is None else workspace.storage.capacity,
-    "allocation_owner": "caller" if workspace.storage is None else "workspace",
-    "payload_bytes": sum(field["payload_bytes"] for field in fields),
-    "fields": fields,
-    "scope": "scratch payload only; caller-owned physical backing and Model/Data/Contact/graph/context are excluded",
-  }
-
-
-def step_workspace_layout(
-  model: types.Model, data: types.Data, *, world_capacity=None, contact_capacity=None, ccd_capacity=None
-) -> tuple[WorkspaceFieldSpec, ...]:
-  """Describe scratch before allocation for Newton/implicit-fast keyboard execution.
-
-  Admits native NxN contacts, sleeping, pyramidal Newton and no optional callbacks,
-  sensors, cameras, lights, flex, tendons, fluid or SDF. Unsupported features fail
-  before allocation. Specialized free-body implicit solves are unsupported unless
-  actuation, springs and dampers are all disabled, so that solve is not executed.
-  Enabled ball limits, surface velocity, passive adhesion and postconstraint dynamics are
-  unsupported. Dense full Jacobians above 50 padded DOFs and derivative-enabled
-  gathered/sparse inertia factorizations also lack prepared count bindings.
-  At least one dynamic tree is required; the static-only island path is unbound.
-  Field domains separate world, candidate, CCD and scalar-counter capacity.
-  Execution operands retain their count identity. Planning uses their upper bounds
-  for concrete array layouts. Reject unsupported execution branches before allocation.
-  A real one-world CPU or GPU Data template supplies topology/solver dimensions.
-  Capacity overrides plan larger reservations without cloning Data or allocating
-  storage. Omitted capacities use Data's current values. All capacities are positive
-  int32 counts. This operation performs no stream or device-context operation.
-  """
+def validate_step_model(model: types.Model, data: types.Data) -> None:
+  """Reject features without prepared execution and initialization contracts."""
   m, d = model, data
-  if any(isinstance(getattr(d, name, None), wp.CountParameter) for name in ("nworld", "naconmax", "naccdmax")):
-    d = dataclasses.replace(
-      data, nworld=wp.upper_bound(data.nworld), naconmax=wp.upper_bound(data.naconmax), naccdmax=wp.upper_bound(data.naccdmax)
-    )
   required = (
     m.opt.solver == types.SolverType.NEWTON,
     m.opt.integrator == types.IntegratorType.IMPLICITFAST,
@@ -176,219 +99,138 @@ def step_workspace_layout(
     or d.island_idofadr.shape != (d.nworld, m.ntree)
   ):
     raise ValueError("Prepare complete island Data before constructing a step workspace")
-  m2, d2 = solver._compact_solver_views(m, d)
-  table = MJ_COLLISION_TABLE.copy()
-  if m.opt.disableflags & types.DisableBit.NATIVECCD:
-    table[(types.GeomType.BOX, types.GeomType.BOX)] = CollisionType.PRIMITIVE
-  pairs = [pair for pair, kind in table.items() if kind == CollisionType.CONVEX]
-  nw = d.nworld if world_capacity is None else world_capacity
-  candidates = d.naconmax if contact_capacity is None else contact_capacity
-  nc = d.naccdmax if ccd_capacity is None else ccd_capacity
-  if any(type(value) is not int or not 1 <= value < 2**31 for value in (nw, candidates, nc)):
-    raise ValueError("World, contact and CCD capacities must be positive int32 counts")
-  _, _, convex_shapes = _convex_scratch_shapes(m, pairs, nc)
-  convex_types = get_type_hints(_ConvexScratch)
-  if set(convex_shapes) != set(convex_types) or any(
-    len(convex_shapes[name]) != hint.ndim for name, hint in convex_types.items()
-  ):
-    raise ValueError("Convex shapes must match the typed scratch declaration")
-  specs = [
-    ("collision_pair", (candidates,), wp.vec2i, "candidate"),
-    ("collision_pairid", (candidates,), wp.vec2i, "candidate"),
-    ("collision_worldid", (candidates,), int, "candidate"),
-    *(
-      (name, convex_shapes[name], hint.dtype, "global_counter" if name == "nccd" else "ccd")
-      for name, hint in convex_types.items()
-    ),
-  ]
-  specs.extend(("solver." + name, shape, dtype, "world") for name, shape, dtype, _ in solver._solver_context_layout(m2, d2))
-  fields = []
-  for name, shape, dtype, domain in specs:
-    if domain == "world" and shape[0]:
-      shape = (nw, *shape[1:])
-    fields.append(WorkspaceFieldSpec(name, shape, {int: wp.int32, float: wp.float32, bool: wp.bool}.get(dtype, dtype), domain))
-  return tuple(fields)
 
 
-def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bindings=None, scratch=None) -> _StepWorkspace:
-  """Prepare a workspace with caller-owned typed scratch or fixed scratch allocated here.
+def discover_step_scratch(model, template, *, world_capacity=None, contact_capacity=None, ccd_capacity=None):
+  """Discover native scratch before allocating the final capacity domains.
 
-  This is the sole public workspace construction operation. The returned owner
-  retains borrowed native stage views and data; free operations perform execution;
-  its implementation type and derived views are private.
-
-  Supplied arrays must cover step_workspace_layout exactly and retain their backing
-  owner. Fields must not overlap, and all required rows must be physically ready
-  before step execution. The caller owns mapping and budget policy. Inner field
-  dimensions stay contiguous; outer row strides may describe packed reservations.
-  Blocked Cholesky matrices (Data.cM/cqLD and solver.h/hfactor on the blocked
-  Newton path) require 16-byte-aligned bases and both world and matrix-row strides.
-  Scalar counters and nonblocked/empty matrices retain their natural alignment.
-  Data remains the original concrete storage descriptor. Fixed execution uses it
-  directly. Dynamic execution borrows StepBindings and creates a shallow execution
-  view whose three count operands remain distinct from storage capacities;
-  its world protected count is the sole world-live-count source. Admission enforces
-  values in [0, data.nworld] and physically ready rows; candidate and CCD extents use
-  their independent storage ready counts. Native operations bind declared launches
-  and bound row operations in the caller's graph program. Keep the borrowed storage
-  owners alive through graph retirement. Binding identity, storage, count descriptors
-  and capacities are fixed at preparation. Set bindings.updates before recording;
-  the updater identity is fixed at the first recorded operation. With a scratch registry,
-  recordings made while it is discovering pin nothing; finalize_step_workspace fixes the
-  complete scratch relation before the recording that is published. Temporarily detached
-  bindings must be restored before recording any step. Numerical stages borrow
-  workspace.scratch and use ordinary Warp operations. The captured-program composition
-  boundary binds their count operands; no global Warp dispatch is replaced.
+  Return a frozen registry and the exact ``(nworld, naconmax, naccdmax)`` count
+  parameters that the final workspace must reuse. A discarded recording uses
+  capacity-sized graph allocations for Data descriptors; it never executes or
+  initializes simulation payload. The caller warms the native program first.
   """
-  if bindings is not None and arrays is None:
-    raise ValueError("Dynamic execution requires caller-owned registered scratch")
-  if not data.qpos.device.is_cuda:
-    raise ValueError("Prepared step workspace currently requires CUDA")
-  if wp.get_stream(data.qpos.device).is_capturing:
-    raise RuntimeError("Prepare native step workspace before graph capture")
-  if bindings is not None:
-    step_program._validate_bindings(bindings)
-  counts = (data.nworld, data.naconmax, data.naccdmax)
-  if any(isinstance(count, wp.CountParameter) for count in counts):
-    raise ValueError("Workspace preparation requires the original concrete Data descriptor")
-  if bindings is not None:
-    if bindings.world_storage.device != data.qpos.device:
-      raise ValueError("Native storage must use the Data device")
-    for storage, name in (
-      (bindings.world_storage, "nworld"),
-      (bindings.contact_storage, "naconmax"),
-      (bindings.ccd_storage, "naccdmax"),
+  validate_step_model(model, template)
+  if template.scratch is not None:
+    raise ValueError("Scratch discovery requires an unbound native Data template")
+  capacities = (
+    template.nworld if world_capacity is None else world_capacity,
+    template.naconmax if contact_capacity is None else contact_capacity,
+    template.naccdmax if ccd_capacity is None else ccd_capacity,
+  )
+  if any(type(value) is not int or not 1 <= value < 2**31 for value in capacities):
+    raise ValueError("Discovery capacities must be positive int32 counts")
+  device = template.qpos.device
+  if not device.is_cuda or device.is_capturing:
+    raise RuntimeError("Scratch discovery requires a CUDA device outside capture")
+  if not wp.is_mempool_enabled(device):
+    raise RuntimeError("Scratch discovery requires the CUDA memory pool")
+  counts = tuple(wp.CountParameter(value) for value in capacities)
+  capacity_by_axis = dict(zip(("nworld", "naconmax", "naccdmax"), capacities, strict=True))
+  registry = scratch_ops.allocate_registry(device)
+  arrays, execution, failure = {}, None, None
+  capture = wp.ScopedCapture(
+    device=device,
+    force_module_load=False,
+    capture_mode=wp.CaptureMode.THREAD_LOCAL,
+    record_launches=True,
+    record_memory_operations=True,
+  )
+  try:
+    with wp.ScopedDevice(device), capture:
+      for name, array, declared_shape in io.array_fields(template):
+        axis = declared_shape[0] if declared_shape else None
+        if axis in capacity_by_axis and array.shape[0]:
+          arrays[name] = wp.empty((capacity_by_axis[axis], *array.shape[1:]), dtype=array.dtype, device=device)
+      execution = dataclasses.replace(
+        io.replace_arrays(template, arrays), nworld=counts[0], naconmax=counts[1], naccdmax=counts[2], scratch=registry
+      )
+      forward.step(model, execution)
+  except BaseException as error:
+    failure = error
+    traceback.clear_frames(error.__traceback__)
+  try:
+    if capture.graph is not None:
+      graph_ops.invalidate(capture.graph)
+  except BaseException as cleanup:
+    if failure is not None:
+      raise BaseExceptionGroup("Scratch discovery and graph invalidation failed", [failure, cleanup]) from failure
+    raise
+  finally:
+    execution = capture = None
+    arrays.clear()
+    scratch_ops.freeze(registry)
+  if failure is not None:
+    raise failure
+  return registry, counts
+
+
+def make_step_workspace(model, data, *, bindings, scratch, count_parameters) -> _StepWorkspace:
+  """Bind complete scratch and state storage once, before recording execution.
+
+  Discovery supplies three count identities in world, candidate, CCD order. Newton
+  prepares all columns in their corresponding domain storage before calling this
+  operation. No prepared object exists while those relationships are incomplete.
+  Ordinary numerical execution uses Data.scratch=None and needs no workspace.
+  """
+  if not data.qpos.device.is_cuda or wp.get_stream(data.qpos.device).is_capturing:
+    raise RuntimeError("Prepare a step workspace on CUDA before graph capture")
+  validate_step_model(model, data)
+  step_program._validate_bindings(bindings)
+  if scratch.state != scratch_data.PREPARED or scratch.device != data.qpos.device:
+    raise ValueError("Prepare scratch on the Data device before binding the step")
+  if len(count_parameters) != 3 or len({id(count) for count in count_parameters}) != 3:
+    raise ValueError("Prepared execution needs three distinct count parameters")
+  storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
+  for name, parameter, storage in zip(("nworld", "naconmax", "naccdmax"), count_parameters, storages):
+    if not isinstance(parameter, wp.CountParameter) or parameter.maximum != getattr(data, name):
+      raise ValueError(f"Prepared count must match Data.{name}")
+    if storage.capacity != parameter.maximum or storage.device != data.qpos.device:
+      raise ValueError(f"Prepared storage must match Data.{name} and its device")
+  execution = dataclasses.replace(data, **dict(zip(("nworld", "naconmax", "naccdmax"), count_parameters)), scratch=scratch)
+  if scratch.columns.keys() != scratch.declarations.keys() or scratch.temporaries:
+    raise ValueError("Prepared scratch must cover its declarations exactly, without discovery temporaries")
+  for name, declaration in scratch.declarations.items():
+    column = scratch.columns[name]
+    if (column.shape, column.dtype, column.device) != (
+      scratch_ops.bounded_shape(declaration.shape),
+      declaration.dtype,
+      scratch.device,
     ):
-      if storage.capacity != getattr(data, name):
-        raise ValueError(f"Native storage capacity must equal Data.{name}")
-  specs = step_workspace_layout(model, data)
+      raise ValueError(f"Scratch column {name!r} does not match its declaration")
+    if isinstance(declaration.shape[0], wp.CountParameter):
+      owner = next((s for p, s in zip(count_parameters, storages) if p is declaration.shape[0]), None)
+      if owner is None or (column.size and field_ops.lookup(owner, column) is None):
+        raise ValueError(f"Scratch column {name!r} must belong to its declared capacity domain")
+    elif not any(column is array for array in bindings.fixed_arrays):
+      raise ValueError(f"Count-free scratch {name!r} must be a bound fixed array")
+  field_ops.validate_disjoint_arrays(
+    (
+      *scratch.columns.values(),
+      *(a for a in bindings.fixed_arrays if all(a is not column for column in scratch.columns.values())),
+      *(c for _, c in step_program._count_sources(execution, bindings)),
+    )
+  )
+  # Native Data may legitimately alias its own views; temporaries must never alias it.
+  field_ops.validate_disjoint_arrays(scratch.columns.values(), against=(array for _, array, _ in io.array_fields(data)))
   solver.validate_blocked_matrix(data.cM)
   solver.validate_blocked_matrix(data.cqLD)
-  execution_data = data
-  if bindings is not None:
-    # The composition owns the scratch registry; stages request temporaries through it by name.
-    execution_data = dataclasses.replace(
-      data,
-      nworld=wp.CountParameter(data.nworld),
-      naconmax=wp.CountParameter(data.naconmax),
-      naccdmax=wp.CountParameter(data.naccdmax),
-      **({} if scratch is None else {"scratch": scratch}),
-    )
-  elif scratch is not None:
-    raise ValueError("A scratch registry belongs to dynamic execution; fixed execution allocates eagerly")
-  m2, d2 = solver._compact_solver_views(model, execution_data)
-  device = data.qpos.device
-  storage, offsets = None, None
-  if arrays is None:
-    layouts = tuple(field_ops.contiguous(spec.shape, wp.types.type_size_in_bytes(spec.dtype)) for spec in specs)
-    for spec, layout in zip(specs, layouts):
-      field_ops.validate_layout(layout, dtype=spec.dtype)
-    spans = tuple(field_ops.span_bytes(layout, wp.types.type_size_in_bytes(spec.dtype)) for spec, layout in zip(specs, layouts))
-    offsets, nbytes = field_ops.pack(spans, (128,) * len(specs), end_alignment_bytes=128)
-    buffer_shape = (nbytes // 128, 128)
-    field_ops.validate_layout(field_ops.contiguous(buffer_shape, 1), dtype=wp.uint8)
-    storage = wp.empty(buffer_shape, dtype=wp.uint8, device=device)
-    if nbytes and storage.ptr % 128:
-      raise ValueError("Scratch allocation requires 128-byte base alignment")
-    arrays = {
-      spec.name: field_ops.bind(storage, spec.dtype, layout, byte_offset=offset)
-      for spec, layout, offset in zip(specs, layouts, offsets)
-    }
-  else:
-    if set(arrays) != {spec.name for spec in specs}:
-      raise ValueError("Caller-owned scratch must supply exactly the declared field names")
-    arrays = dict(arrays)
-    for spec in specs:
-      field_ops.validate_array(arrays[spec.name], dtype=spec.dtype, shape=spec.shape, device=device)
-    field_ops.validate_disjoint_arrays(tuple(arrays.values()))
-    if bindings is not None:
-      domains = {"world": bindings.world_storage, "candidate": bindings.contact_storage, "ccd": bindings.ccd_storage}
-      for spec in specs:
-        array = arrays[spec.name]
-        if spec.capacity_domain in domains and spec.shape[0]:
-          if field_ops.lookup(domains[spec.capacity_domain], array) is None:
-            raise ValueError(f"Scratch must be registered in its declared {spec.capacity_domain} storage: {spec.name}")
-        elif spec.capacity_domain == "global_counter" and not array.is_contiguous:
-          raise ValueError(f"Global counters require dense descriptors and caller-guaranteed full backing: {spec.name}")
-      global_scratch = tuple(arrays[spec.name] for spec in specs if spec.capacity_domain == "global_counter")
-      for count in (
-        bindings.world_storage.protected_count,
-        bindings.contact_storage.ready_count,
-        bindings.ccd_storage.ready_count,
-      ):
-        field_ops.validate_disjoint_arrays((count, *global_scratch))
-  collision = CollisionContext(**{name: arrays[name] for name in ("collision_pair", "collision_pairid", "collision_worldid")})
-  convex = _ConvexScratch(**{field.name: arrays[field.name] for field in dataclasses.fields(_ConvexScratch)})
-  solver_context = types.SolverContext(
-    **{name: arrays["solver." + name] for name, _, _, _ in solver._solver_context_layout(m2, d2)}
-  )
-  solver.validate_solver_scratch(m2, solver_context)
-  solver_context.compact_m_full, solver_context.compact_d_full = model, execution_data
-  scratch = forward._ForwardScratch(
-    collision=_CollisionScratch(collision, convex), solver=solver._SolverScratch(m2, d2, solver_context)
-  )
-  memo = {}
   return _StepWorkspace(
-    model=model,
-    data=data,
-    execution_data=execution_data,
-    bindings=bindings,
-    device=device,
-    storage=storage,
-    arrays=arrays,
-    scratch=scratch,
-    _specs=specs,
-    _allocation_offsets_bytes=offsets,
-    _execution_binding=bindings,
-    _binding_layout=step_program._binding_layout(bindings),
-    _data_layout=step_program._layout((data, execution_data), memo),
-    _model_layout=step_program._layout(model, memo),
-    _scratch_layout=step_program._layout((tuple(arrays.items()), scratch), memo),
-    _finalized_layout=None,
+    model,
+    data,
+    execution,
+    bindings,
+    data.qpos.device,
+    step_program._layout((model, data, execution)),
+    step_program._binding_layout(bindings),
   )
 
 
-def finalize_step_workspace(workspace) -> None:
-  """Fix the complete scratch relation of a dynamic workspace after discovery.
-
-  Call once, after the registry is prepared and the binding extras are set, and before
-  the recording that will be published. Every count-led declaration must have one
-  column in exactly one bound storage whose admitted count is that count operand;
-  every count-free declaration must be one of the binding's fixed arrays, and no fixed
-  array may alias a count. The relation is then snapshotted: validate_step_workspace
-  refuses a frozen or unfinalized registry and rejects any later change to the
-  registry, its columns, the fixed arrays or the binding.
-  """
-  bindings, execution = workspace._execution_binding, workspace.execution_data
-  registry = getattr(execution, "scratch", None)
-  if bindings is None or registry is None:
-    raise ValueError("Finalizing requires dynamic execution with a scratch registry")
-  if registry.state != scratch_data.PREPARED:
-    raise RuntimeError("Prepare the scratch registry before finalizing the step workspace")
-  if workspace._finalized_layout is not None:
-    raise RuntimeError("The step workspace is already finalized")
-  step_program._validate_bindings(bindings)
-  admitted = {
-    id(execution.nworld): bindings.world_storage.protected_count,
-    id(execution.naconmax): bindings.contact_storage.ready_count,
-    id(execution.naccdmax): bindings.ccd_storage.ready_count,
+def step_workspace_memory_report(workspace):
+  """Report borrowed scratch payload; physical storage is reported by its owner."""
+  return {
+    "allocation_owner": "caller",
+    "payload_bytes": sum(
+      a.size * wp.types.type_size_in_bytes(a.dtype) for a in workspace.execution_data.scratch.columns.values()
+    ),
+    "scope": "borrowed scratch payload only",
   }
-  storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage, *bindings.extra_storages)
-  fixed = {id(array) for array in bindings.extra_fixed_arrays}
-  for name, declaration in registry.declarations.items():
-    column, lead = registry.columns[name], declaration.shape[0]
-    if isinstance(lead, wp.CountParameter):
-      if not column.size:
-        continue  # an empty column owns no bytes; memory validation ignores it as well
-      owners = [storage for storage in storages if field_ops.lookup(storage, column) is not None]
-      if len(owners) != 1:
-        raise ValueError(f"Scratch column {name!r} must be a field of exactly one bound storage")
-      count = admitted.get(id(lead))
-      if count is None or (count is not owners[0].protected_count and count is not owners[0].ready_count):
-        raise ValueError(f"Scratch column {name!r} is not admitted by its storage's count for that operand")
-    elif id(column) not in fixed:
-      raise ValueError(f"Count-free scratch {name!r} must be one of the binding's fixed arrays")
-  field_ops.validate_disjoint_arrays((*admitted.values(), *bindings.extra_fixed_arrays))
-  workspace._binding_layout = step_program._binding_layout(bindings)
-  workspace._data_layout = step_program._layout((workspace.data, execution), {})
-  workspace._finalized_layout = step_program._finalized_layout(workspace)

@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
-import functools
 from typing import Optional
 
 import warp as wp
@@ -53,14 +51,6 @@ from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False})
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _ForwardScratch:
-  """Borrowed collision and solver resources of one prepared step."""
-
-  collision: collision_driver._CollisionScratch
-  solver: solver._SolverScratch
 
 
 @wp.kernel
@@ -1071,17 +1061,14 @@ def fwd_kinematics(m: Model, d: Data):
 
 
 @event_scope
-def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: collision_driver._CollisionScratch | None = None):
+def fwd_position(m: Model, d: Data, factorize: bool = True):
   """Position-dependent computations.
 
   Args:
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
-    scratch: Optional borrowed collision scratch.
   """
-  if scratch is not None and factorize:
-    raise NotImplementedError("Borrowed position scratch requires factorize=False; fwd_acceleration owns compact factorization")
   fwd_kinematics(m, d)
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
@@ -1093,8 +1080,6 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: collisio
   if m.callback.collision is not None and m.opt.run_collision_detection:
     raise ValueError("An external collision provider requires run_collision_detection=False.")
   collision = collision_driver.collision if m.opt.run_collision_detection else m.callback.collision
-  if scratch is not None and m.opt.run_collision_detection:
-    collision = functools.partial(collision, scratch=scratch)
   if collision is not None:
     collision(m, d)
   if sleep_enabled:
@@ -1809,14 +1794,14 @@ def _energy_vel(m: Model, d: Data):
 
 
 @event_scope
-def forward(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
+def forward(m: Model, d: Data):
   """Forward dynamics."""
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
     sleep.wake(m, d)
     sleep.update_sleep(m, d)
 
-  fwd_position(m, d, factorize=False, scratch=None if scratch is None else scratch.collision)
+  fwd_position(m, d, factorize=False)
   d.sensordata.zero_()
   sensor.sensor_pos(m, d)
   _energy_pos(m, d)
@@ -1831,18 +1816,16 @@ def forward(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
   fwd_actuation(m, d)
   fwd_acceleration(m, d, factorize=True)
 
-  solver.solve(
-    m, d, scratch=None if scratch is None else scratch.solver, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled
-  )
+  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
     smooth.rne_postconstraint(m, d)
   sensor.sensor_acc(m, d, skip_rne_postconstraint=True)
 
 
 @event_scope
-def step(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
+def step(m: Model, d: Data):
   """Advance simulation."""
-  forward(m, d, scratch=scratch)
+  forward(m, d)
 
   if m.opt.integrator == IntegratorType.EULER:
     euler(m, d)

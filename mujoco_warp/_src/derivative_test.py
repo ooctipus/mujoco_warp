@@ -39,9 +39,9 @@ def _assert_eq(a, b, name):
 
 class DerivativeTest(parameterized.TestCase):
   @parameterized.product(
-    disable_actuation=(False, True), disable_damper=(False, True), disable_spring=(False, True), prepared=(False, True)
+    disable_actuation=(False, True), disable_damper=(False, True), disable_spring=(False, True), captured=(False, True)
   )
-  def test_independent_actuation_and_damper_flags(self, disable_actuation, disable_damper, disable_spring, prepared):
+  def test_independent_actuation_and_damper_flags(self, disable_actuation, disable_damper, disable_spring, captured):
     """Disabling either velocity-force source must retain the other source's derivative."""
     mjm = mujoco.MjModel.from_xml_string(
       '<mujoco><option timestep="0.005" solver="Newton" integrator="implicitfast" jacobian="sparse">'
@@ -61,11 +61,9 @@ class DerivativeTest(parameterized.TestCase):
     m.opt.graph_conditional = True
     d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
     mjw.forward(m, d)
-    workspace = mjw.make_step_workspace(m, d) if prepared else None
-    out = wp.empty_like(d.M)  # the derivative stage no longer has a workspace-owned qDeriv; implicit declares its own
-    if prepared:
+    out = wp.empty_like(d.M)
+    if captured:
       with wp.ScopedCapture() as capture:
-        mjw.validate_step_workspace(workspace, m, d)
         mjw.deriv_smooth_vel(m, d, out)
       wp.capture_launch(capture.graph)
     else:

@@ -22,6 +22,7 @@ import numpy as np
 import warp as wp
 from absl.testing import absltest
 from absl.testing import parameterized
+from gpu_components import scratch as scratch_ops
 
 import mujoco_warp as mjw
 from mujoco_warp import BroadphaseType
@@ -73,6 +74,80 @@ def _assert_eq(a, b, name):
   tol = _TOLERANCE * 10
   err_msg = f"mismatch: {name}"
   np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
+
+
+class CollisionScratchTest(parameterized.TestCase):
+  def test_candidate_columns_follow_their_count_identity(self):
+    with wp.ScopedDevice("cpu"):
+      registry = scratch_ops.allocate_registry("cpu")
+      candidates, ccd = wp.CountParameter(11), wp.CountParameter(11)
+      context = create_collision_context(candidates, registry=registry)
+      specs = scratch_ops.column_specs(registry, candidates)
+      self.assertEqual({spec.name for spec in specs}, {"collision.pair", "collision.pairid", "collision.worldid"})
+      self.assertEqual(scratch_ops.column_specs(registry, ccd), ())
+      arrays = dict(registry.temporaries)
+      scratch_ops.freeze(registry)
+      scratch_ops.prepare(registry, arrays)
+      with mock.patch.object(wp, "empty", side_effect=AssertionError("Prepared candidate allocation")):
+        rebound = create_collision_context(candidates, registry=registry)
+      for field in dataclasses.fields(context):
+        self.assertIs(getattr(context, field.name), getattr(rebound, field.name))
+
+  @parameterized.parameters(
+    (GeomType.BOX, GeomType.BOX, False, 4, 3, 16),
+    (GeomType.CYLINDER, GeomType.MESH, True, 16, 5, 35),
+    (GeomType.MESH, GeomType.MESH, False, 0, 0, 35),
+  )
+  def test_convex_declarations_and_counter_initialization(self, geom1, geom2, multiccd, polygons, degree, iterations):
+    counts = [0] * (len(GeomType) * (len(GeomType) + 1) // 2)
+    counts[upper_trid_index(len(GeomType), geom1.value, geom2.value)] = 1
+    model = mock.Mock(geom_pair_type_count=counts, npolygonmax=7, nmeshdegmax=5)
+    model.opt = mock.Mock(ccd_iterations=35, ccd_tolerance=1e-6, warn_overflow=False)
+    model.opt.disableflags = 0 if multiccd else DisableBit.MULTICCD
+    model.block_dim = mock.Mock(convex_ccd=32)
+    with (
+      wp.ScopedDevice("cpu"),
+      mock.patch.object(collision_convex, "ccd_kernel_builder", return_value=object()),
+      mock.patch.object(collision_convex, "_ccd_grid_size", return_value=2),
+      mock.patch.object(wp, "launch") as launch,
+    ):
+      registry = scratch_ops.allocate_registry("cpu")
+      candidates, ccd = wp.CountParameter(11), wp.CountParameter(11)
+      data = mock.Mock(scratch=registry, naconmax=candidates, naccdmax=ccd, ncollision=wp.zeros(1, dtype=int))
+      collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
+      declarations = registry.declarations
+      for name, declaration in declarations.items():
+        if name != "convex.nccd":
+          self.assertIs(declaration.shape[0], ccd)
+      self.assertEqual(scratch_ops.column_specs(registry, candidates), ())
+      self.assertEqual(declarations["convex.multiccd_polygon"].shape[1:], (2 * polygons,))
+      self.assertEqual(declarations["convex.multiccd_pdist"].shape[1:], (polygons,))
+      self.assertEqual(declarations["convex.multiccd_idx1"].shape[1:], (degree,))
+      self.assertEqual(declarations["convex.epa_vert"].shape[1:], (10 + 2 * iterations,))
+      self.assertIs(declarations["convex.epa_vert"].dtype, wp.vec3)
+      self.assertIs(declarations["convex.multiccd_pdist"].dtype, wp.float32)
+      arrays = dict(registry.temporaries)
+      counter = arrays["convex.nccd"]
+      for _ in range(2):
+        counter.fill_(9)
+        collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
+        np.testing.assert_array_equal(counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
+      scratch_ops.freeze(registry)
+      scratch_ops.prepare(registry, arrays)
+      with mock.patch.object(wp, "empty", side_effect=AssertionError("Prepared convex allocation")):
+        for _ in range(2):
+          counter.fill_(9)
+          collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
+          np.testing.assert_array_equal(counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
+          arguments = launch.call_args.kwargs["inputs"]
+          for array in arrays.values():
+            self.assertTrue(any(argument is array for argument in arguments))
+      data.scratch, data.naconmax, data.naccdmax = None, 11, 11
+      for _ in range(2):
+        collision_convex.convex_narrowphase(model, data, mock.Mock(), [(geom1, geom2)])
+        eager_counter = launch.call_args.kwargs["inputs"][-1]
+        self.assertIsNot(eager_counter, counter)
+        np.testing.assert_array_equal(eager_counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
 
 
 class CollisionTest(parameterized.TestCase):

@@ -23,6 +23,7 @@ import numpy as np
 import warp as wp
 from absl.testing import absltest
 from absl.testing import parameterized
+from gpu_components import scratch as scratch_ops
 
 import mujoco_warp as mjw
 from mujoco_warp import ConeType
@@ -1573,8 +1574,54 @@ def _put_compact(xml: str, nvmax: int | None = None, sparse: bool = False):
   return mjm, mjd, m, d
 
 
+def _prepare_forward_scratch(m, d):
+  """Borrow fixed arrays for the same numerical program used by eager forward."""
+  d.scratch = scratch_ops.allocate_registry(d.qpos.device)
+  mjw.forward(m, d)
+  scratch_ops.freeze(d.scratch)
+  scratch_ops.prepare(
+    d.scratch,
+    {
+      name: wp.empty(scratch_ops.bounded_shape(spec.shape), dtype=spec.dtype, device=d.qpos.device)
+      for name, spec in d.scratch.declarations.items()
+    },
+  )
+
+
 class CompactSolverTest(parameterized.TestCase):
   """Tests for the compacted smooth and constrained solves (solver.py compact path)."""
+
+  @parameterized.parameters(False, True)
+  def test_reused_solver_columns_match_eager(self, compact):
+    """Every solve initializes its required scratch, including after nonfinite reuse."""
+    xml = _COMPACT_CONTACT_XML
+    if compact:
+      xml = xml.replace('iterations="20"/>', 'iterations="20"><flag sleep="enable"/></option>')
+    _, _, m, d = _put_compact(xml)
+    mjw.forward(m, d)
+    self.assertGreater(d.nacon.numpy()[0], 0)
+    solver.solve(m, d)
+    expected = {name: getattr(d, name).numpy().copy() for name in ("qacc", "qfrc_constraint")}
+    registry = scratch_ops.allocate_registry(d.qpos.device)
+    d.scratch = registry
+    solver.solve(m, d)
+    scratch_ops.freeze(registry)
+    columns = {
+      name: wp.empty(scratch_ops.bounded_shape(spec.shape), dtype=spec.dtype, device=d.qpos.device)
+      for name, spec in registry.declarations.items()
+    }
+    scratch_ops.prepare(registry, columns)
+    for _ in range(2):
+      for column in columns.values():
+        if column.dtype == wp.vec3:
+          column.fill_(wp.vec3(float("nan")))
+        else:
+          column.fill_(float("nan") if column.dtype == wp.float32 else -7)
+      solver.solve(m, d)
+      for name, reference in expected.items():
+        actual = getattr(d, name).numpy()
+        self.assertTrue(np.isfinite(reference).all() and np.isfinite(actual).all(), name)
+        np.testing.assert_allclose(actual, reference, rtol=1e-6, atol=1e-6, equal_nan=False, err_msg=name)
 
   @parameterized.product(poison=(17.0, np.nan), prepared=(False, True), warmstart=(False, True))
   def test_unconstrained_compact_force_initialization(self, poison, prepared, warmstart):
@@ -1595,11 +1642,10 @@ class CompactSolverTest(parameterized.TestCase):
     m.opt.graph_conditional = True
     d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
     self.assertTrue(m.is_sparse)
-    workspace = mjw.make_step_workspace(m, d) if prepared else None
     if prepared:
+      _prepare_forward_scratch(m, d)
       with wp.ScopedCapture() as capture:
-        mjw.validate_step_workspace(workspace, m, d)
-        mjw.forward(m, d, scratch=workspace.scratch)
+        mjw.forward(m, d)
     for _ in range(2):
       # This covers both uninitialized nonfinite bytes and stale finite force from an earlier solve.
       d.cqfrc_constraint.fill_(poison)
@@ -2072,7 +2118,9 @@ class IslandFactorTest(parameterized.TestCase):
     m.tree_sleep_policy = wp.array(np.full((4, m.ntree), int(types.SleepPolicy.AUTO_NEVER), dtype=np.int32), dtype=int)
     data = [mjw.put_data(mjm, mjd, nworld=4, nconmax=256, njmax=256, nvmax=mjm.nv) for _ in range(2)]
     prepared = sparse and cone == "pyramidal" and wp.get_device().is_cuda
-    workspaces = [mjw.make_step_workspace(m, d) if prepared else None for d in data]
+    if prepared:
+      for d in data:
+        _prepare_forward_scratch(m, d)
     qpos = np.tile(mjd.qpos.astype(np.float32), (4, 1))
     qvel = np.tile(np.linspace(-0.2, 0.3, mjm.nv, dtype=np.float32), (4, 1))
     original_solve = solver.solve
@@ -2092,8 +2140,8 @@ class IslandFactorTest(parameterized.TestCase):
           d.qvel.assign(qvel)
           sleep.reset_sleep(m, d)
         with mock.patch.object(solver, "solve", side_effect=lambda *a, **k: original_solve(*a, **(k | {"use_islands": False}))):
-          mjw.forward(m, data[0], scratch=None if workspaces[0] is None else workspaces[0].scratch)
-        mjw.forward(m, data[1], scratch=None if workspaces[1] is None else workspaces[1].scratch)
+          mjw.forward(m, data[0])
+        mjw.forward(m, data[1])
         for attribute in ("qacc", "qfrc_constraint", "qacc_smooth"):
           reference, actual = (getattr(d, attribute).numpy() for d in data)
           self.assertTrue(np.isfinite(reference).all() and np.isfinite(actual).all())

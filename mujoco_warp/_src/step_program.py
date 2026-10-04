@@ -53,11 +53,7 @@ class StepBindings:
   recording_failed: bool = False
   bindings: list[GraphKernelBinding] = dataclasses.field(default_factory=list)
   _recording_binding: tuple | None = None
-  # Additional storages whose columns captured launches may touch (scratch columns the
-  # composition prepared after discovery) and plain arrays that are fixed for the graph.
-  # Additive: the composition sets them before the first real recording.
-  extra_storages: tuple = ()
-  extra_fixed_arrays: tuple = ()
+  fixed_arrays: tuple[wp.array, ...] = ()
 
 
 _LAYOUT_REFERENCE = object()
@@ -81,7 +77,7 @@ def _layout(value, memo=None):
     return memo[identity][1]
   if isinstance(value, wp.array):
     memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
-    return value.ptr, value.shape, value.strides, value.dtype, value.device
+    return identity, value.ptr, value.shape, value.strides, value.dtype, value.device
   if dataclasses.is_dataclass(value):
     memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
     result = []
@@ -89,7 +85,10 @@ def _layout(value, memo=None):
       child = getattr(value, field.name)
       cached = memo.get(id(child))
       result.append((field.name, cached[1] if cached is not None else _layout(child, memo)))
-    return tuple(result)
+    return type(value), identity, tuple(result)
+  if isinstance(value, dict):
+    memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
+    return tuple((_layout(key, memo), _layout(child, memo)) for key, child in value.items())
   if isinstance(value, (tuple, list)):
     memo[identity] = value, (_LAYOUT_REFERENCE, len(memo))
     result = []
@@ -102,45 +101,24 @@ def _layout(value, memo=None):
 
 def validate_step_workspace(workspace, model, data):
   """Validate prepared binding before emission and pin owners during graph recording."""
-  if workspace.bindings is not workspace._execution_binding:
-    raise ValueError("Prepared execution binding changed; restore its original bindings before recording")
-  if workspace.bindings is not None:
-    if _binding_layout(workspace.bindings) != workspace._binding_layout:
-      raise ValueError("Prepared native storage or count descriptors changed; prepare a new workspace")
-    _validate_bindings(workspace.bindings)
+  if _binding_layout(workspace.bindings) != workspace._binding_layout:
+    raise ValueError("Prepared native storage or count descriptors changed; prepare a new workspace")
+  _validate_bindings(workspace.bindings)
   if model is not workspace.model or data is not workspace.data:
     raise ValueError("Prepared workspace requires its original model, data and immutable step options")
-  registry = getattr(workspace.execution_data, "scratch", None)
-  discovering = registry is not None and registry.state == scratch_data.DISCOVERING
-  if registry is not None and not discovering and workspace._finalized_layout is None:
-    raise RuntimeError("Finalize the step workspace after preparing its scratch registry")
-  memo = {}
-  if (
-    _layout((data, workspace.execution_data), memo) != workspace._data_layout or _layout(model, memo) != workspace._model_layout
-  ):
-    raise ValueError("Prepared Model/Data descriptors or scalar metadata changed; prepare a new workspace")
-  if (
-    _layout(
-      (tuple(workspace.arrays.items()), workspace.scratch),
-      memo,
-    )
-    != workspace._scratch_layout
-  ):
-    raise ValueError("Prepared scratch descriptors changed; prepare a new workspace")
-  if registry is not None and not discovering and _finalized_layout(workspace) != workspace._finalized_layout:
-    raise ValueError("Finalized scratch relation changed; prepare a new workspace")
+  if workspace.execution_data.scratch.state != scratch_data.PREPARED:
+    raise ValueError("Prepared scratch registry is no longer prepared")
+  if _layout((model, data, workspace.execution_data)) != workspace._layout:
+    raise ValueError("Prepared descriptors or scratch relationship changed; prepare a new workspace")
   owner = graph_ops.current_capture(device=workspace.device)
   if owner is not None:
     try:
-      if workspace.bindings is not None:
-        if workspace.bindings.updates is None:
-          raise RuntimeError("Prepare native graph updates before recording step operations")
-        if not discovering:
-          _retain_bindings(workspace.bindings, owner)
+      if workspace.bindings.updates is None:
+        raise RuntimeError("Prepare native graph updates before recording step operations")
+      _retain_bindings(workspace.bindings, owner)
       graph_ops.retain(owner, workspace)
     except BaseException:
-      if workspace.bindings is not None:
-        workspace.bindings.recording_failed = True
+      workspace.bindings.recording_failed = True
       graph_ops.invalidate(owner)
       raise
 
@@ -154,17 +132,15 @@ def _binding_layout(bindings):
       (bindings.world_storage, bindings.world_storage.protected_count),
       (bindings.contact_storage, bindings.contact_storage.ready_count),
       (bindings.ccd_storage, bindings.ccd_storage.ready_count),
-      *((storage, storage.protected_count) for storage in bindings.extra_storages),
     )
-  ) + (id(bindings.bindings), tuple(id(array) for array in bindings.extra_fixed_arrays))
+  ) + (id(bindings), id(bindings.bindings), _layout(bindings.fixed_arrays))
 
 
-def _finalized_layout(workspace):
-  """Snapshot the prepared scratch relation: declarations, their columns and the fixed arrays."""
-  registry = workspace.execution_data.scratch
-  return _layout(
-    (tuple(registry.declarations.items()), tuple(registry.columns.items()), workspace._execution_binding.extra_fixed_arrays),
-    {},
+def _count_sources(data, bindings):
+  return (
+    (data.nworld, bindings.world_storage.protected_count),
+    (data.naconmax, bindings.contact_storage.ready_count),
+    (data.naccdmax, bindings.ccd_storage.ready_count),
   )
 
 
@@ -174,13 +150,9 @@ def _validate_bindings(bindings):
   if bindings.recording_failed:
     raise RuntimeError("The native step program has a failed recording")
   if not all(
-    isinstance(storage, FieldStorage)
-    for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage, *bindings.extra_storages)
+    isinstance(storage, FieldStorage) for storage in (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
   ):
     raise TypeError("Native capacity domains must borrow FieldStorage records")
-  for storage in bindings.extra_storages:
-    if storage.closed or storage.service_failed:
-      raise RuntimeError("Native scratch storage is closed or quarantined")
   device = bindings.world_storage.device
   for storage, count in (
     (bindings.world_storage, bindings.world_storage.protected_count),
@@ -257,15 +229,9 @@ def bind_step_program(workspace, graph: wp.Graph, launches: tuple[wp.CapturedLau
     if type(launches) is not tuple:
       raise TypeError("Native program launches must be an explicit immutable tuple")
     _retain_bindings(bindings, graph)
-    storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage, *bindings.extra_storages)
-    count_sources = (
-      (workspace.execution_data.nworld, bindings.world_storage.protected_count),
-      (workspace.execution_data.naconmax, bindings.contact_storage.ready_count),
-      (workspace.execution_data.naccdmax, bindings.ccd_storage.ready_count),
-    )
-    fixed_arrays = [workspace.data.nacon, workspace.data.ncollision]
-    fixed_arrays.extend(workspace.arrays[spec.name] for spec in workspace._specs if spec.capacity_domain == "global_counter")
-    fixed_arrays.extend(bindings.extra_fixed_arrays)
+    storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage)
+    count_sources = _count_sources(workspace.execution_data, bindings)
+    fixed_arrays = (workspace.data.nacon, workspace.data.ncollision, *bindings.fixed_arrays)
     fixed_arrays = tuple({(id(a.device), a.ptr, a.shape, a.strides, a.dtype): a for a in fixed_arrays}.values())
     launch_ids = {id(record) for record in launches}
     operations = tuple(op for op in wp.capture_get_memory_operations(graph) if id(op.launch) in launch_ids)

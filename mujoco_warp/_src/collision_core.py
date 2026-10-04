@@ -19,6 +19,7 @@ import dataclasses
 from typing import Any, Tuple
 
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src.math import safe_div
 from mujoco_warp._src.types import MJ_MINMU
@@ -519,10 +520,10 @@ def sap_range(
   range_out[worldid, sortedid] = limit - sortedid
 
 
-def create_collision_context(naconmax: int) -> CollisionContext:
-  """Create a CollisionContext with allocated arrays."""
+def create_collision_context(naconmax: int, *, registry=None) -> CollisionContext:
+  """Create candidate arrays from the execution registry or ordinary allocations."""
   return CollisionContext(
-    collision_pair=wp.empty(naconmax, dtype=wp.vec2i),
-    collision_pairid=wp.empty(naconmax, dtype=wp.vec2i),
-    collision_worldid=wp.empty(naconmax, dtype=int),
+    collision_pair=scratch_array(registry, "collision.pair", (naconmax,), wp.vec2i),
+    collision_pairid=scratch_array(registry, "collision.pairid", (naconmax,), wp.vec2i),
+    collision_worldid=scratch_array(registry, "collision.worldid", (naconmax,), int),
   )

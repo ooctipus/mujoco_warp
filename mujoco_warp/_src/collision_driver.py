@@ -13,13 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
 from typing import Optional
 
 import warp as wp
 from gpu_components.scratch import scratch_array
 
-from mujoco_warp._src.collision_convex import _ConvexScratch
 from mujoco_warp._src.collision_convex import convex_narrowphase
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import create_collision_context
@@ -970,7 +968,7 @@ def nxn_broadphase(
     _launch()
 
 
-def _narrowphase(m: Model, d: Data, ctx: CollisionContext, convex_scratch: _ConvexScratch | None = None):
+def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
   collision_table = MJ_COLLISION_TABLE
   if m.opt.disableflags & DisableBit.NATIVECCD:
     collision_table = collision_table.copy()
@@ -981,29 +979,15 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, convex_scratch: _Conv
 
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
-  convex_narrowphase(m, d, ctx, convex_pairs, scratch=convex_scratch)
+  convex_narrowphase(m, d, ctx, convex_pairs)
   primitive_narrowphase(m, d, ctx, primitive_pairs)
 
   if m.has_sdf_geom:
     sdf_narrowphase(m, d, ctx)
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
-class _CollisionScratch:
-  """Borrowed broadphase candidates and convex scratch."""
-
-  context: CollisionContext
-  convex: _ConvexScratch
-
-
 @event_scope
-def collision(
-  m: Model,
-  d: Data,
-  awake_prev: Optional[wp.array] = None,
-  *,
-  scratch: _CollisionScratch | None = None,
-):
+def collision(m: Model, d: Data, awake_prev: Optional[wp.array] = None):
   """Runs the full collision detection pipeline.
 
   This function orchestrates the broadphase and narrowphase collision detection stages. It
@@ -1028,8 +1012,7 @@ def collision(
     d.nacon.zero_()
     return
 
-  # TODO(team): create context outside collision?
-  ctx = create_collision_context(d.naconmax) if scratch is None else scratch.context
+  ctx = create_collision_context(d.naconmax, registry=d.scratch)
 
   incremental = awake_prev is not None
 
@@ -1047,7 +1030,7 @@ def collision(
   else:
     sap_broadphase(m, d, ctx, awake_prev)
 
-  _narrowphase(m, d, ctx, convex_scratch=None if scratch is None else scratch.convex)
+  _narrowphase(m, d, ctx)
 
   # Flex collision is not sleeping-aware: pass 1 emits every flex contact regardless of awake state,
   # so the incremental pass has nothing to add (and re-running it would duplicate those contacts).

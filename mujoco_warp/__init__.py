@@ -138,8 +138,7 @@ from mujoco_warp._src.types import SolverType as SolverType
 from mujoco_warp._src.types import State as State
 from mujoco_warp._src.types import Statistic as Statistic
 from mujoco_warp._src.types import TrnType as TrnType
-from mujoco_warp._src.workspace import WorkspaceFieldSpec as WorkspaceFieldSpec
-from mujoco_warp._src.workspace import finalize_step_workspace as finalize_step_workspace
+from mujoco_warp._src.workspace import discover_step_scratch as discover_step_scratch
 from mujoco_warp._src.workspace import make_step_workspace as make_step_workspace
-from mujoco_warp._src.workspace import step_workspace_layout as step_workspace_layout
 from mujoco_warp._src.workspace import step_workspace_memory_report as step_workspace_memory_report
+from mujoco_warp._src.workspace import validate_step_model as validate_step_model

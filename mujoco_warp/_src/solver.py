@@ -41,26 +41,10 @@ _BLOCK_CHOLESKY_DIM = 32
 _ISLAND_BLOCK_DIM = 32
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
-class _SolverScratch:
-  """Borrowed compact model/data views and solver context."""
-
-  model: types.Model
-  data: types.Data
-  context: SolverContext
-
-
 def validate_blocked_matrix(array):
   """Check storage alignment required by aligned=True blocked matrix operations."""
   if array.size and (array.ptr % 16 or array.strides[0] % 16 or array.strides[1] % 16):
     raise ValueError("Blocked Cholesky matrix needs 16-byte base, world and matrix-row strides")
-
-
-def validate_solver_scratch(model, scratch):
-  """Check the execution contract of the selected solver's prepared scratch."""
-  if model.nv > _BLOCK_CHOLESKY_DIM:
-    validate_blocked_matrix(scratch.h)
-    validate_blocked_matrix(scratch.hfactor)
 
 
 def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
@@ -87,8 +71,8 @@ def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
   )
 
 
-def _solver_context_layout(m: types.Model, d: types.Data):
-  """Declare solver scratch once for eager and prepared ownership."""
+def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
+  """Request solver temporaries and initialize every value needed by this execution."""
   nworld = d.nworld
   nv = m.nv
   nv_pad = m.nv_pad
@@ -99,7 +83,8 @@ def _solver_context_layout(m: types.Model, d: types.Data):
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
 
-  return (
+  arrays = {}
+  for name, shape, dtype, clear in (
     ("Jaref", (nworld, njmax), float, False),
     ("search_dot", (nworld,), float, False),
     ("done", (nworld,), bool, False),
@@ -124,16 +109,16 @@ def _solver_context_layout(m: types.Model, d: types.Data):
     ("quad_changed_ids", (nworld, njmax if alloc_incremental else 0), int, False),
     ("quad_changed_count", (nworld if alloc_incremental else 0,), int, False),
     ("state_changed_count", (nworld if alloc_incremental else 0,), int, False),
-  )
-
-
-def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
-  """Allocate eager solver scratch; prepared execution supplies borrowed views."""
-  return SolverContext(
-    **{
-      name: (wp.zeros if clear else wp.empty)(shape, dtype=dtype) for name, shape, dtype, clear in _solver_context_layout(m, d)
-    }
-  )
+  ):
+    array = scratch_array(d.scratch, "solver." + name, shape, dtype)
+    if clear:
+      array.zero_(extent=(shape[0], *array.shape[1:]))
+    arrays[name] = array
+  context = SolverContext(**arrays)
+  if m.nv > _BLOCK_CHOLESKY_DIM:
+    validate_blocked_matrix(context.h)
+    validate_blocked_matrix(context.hfactor)
+  return context
 
 
 @wp.func
@@ -3954,14 +3939,7 @@ def init_context(
 
 
 @event_scope
-def solve(
-  m: types.Model,
-  d: types.Data,
-  *,
-  scratch: _SolverScratch | None = None,
-  rebuild_active_dofs: bool = True,
-  use_islands: bool = False,
-):
+def solve(m: types.Model, d: types.Data, *, rebuild_active_dofs: bool = True, use_islands: bool = False):
   """Find constraint forces, optionally using the current position stage's tree islands.
 
   With use_islands=True, tree_island must describe the current constraint support and
@@ -3985,13 +3963,11 @@ def solve(
       island.update_active_dofs(m, d)
     if use_islands:
       island.compute_island_mapping(m, d)
-    solve_compact(m, d, scratch=scratch, use_islands=use_islands)
+    solve_compact(m, d, use_islands=use_islands)
     if m.ntree > 1 and not use_islands:
       island.compute_island_mapping(m, d)
     return
 
-  if scratch is not None:
-    raise ValueError("Compact solver scratch requires sleeping-enabled execution")
   if d.njmax == 0 or m.nv == 0:
     wp.copy(d.qacc, d.qacc_smooth, extent=(d.nworld, *d.qacc.shape[1:]))
     d.solver_niter.fill_(0, extent=(d.nworld,))
@@ -4361,7 +4337,7 @@ def _compact_solver_views(m: types.Model, d: types.Data):
 
 
 @event_scope
-def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | None = None, use_islands: bool = False):
+def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False):
   """Run the dense Newton constraint solver in compacted DOF space.
 
   Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
@@ -4374,18 +4350,10 @@ def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | No
   """
   _compact_gather(m, d)
 
-  if scratch is None:
-    m2, d2 = _compact_solver_views(m, d)
-    sctx = _create_solver_context(m2, d2)
-    # compact kernels read the full-coordinate sparse structures (M, J) through
-    # the compaction maps instead of dense products on gathered blocks
-    sctx.compact_m_full = m
-    sctx.compact_d_full = d
-  else:
-    m2, d2, sctx = scratch.model, scratch.data, scratch.context
-    sctx.grad.zero_(extent=(d.nworld, *sctx.grad.shape[1:]))
-    if sctx.ls_exhausted.size:
-      sctx.ls_exhausted.zero_(extent=(d.nworld,))
+  m2, d2 = _compact_solver_views(m, d)
+  sctx = _create_solver_context(m2, d2)
+  # Compact kernels read the full-coordinate sparse structures through the compaction maps.
+  sctx.compact_m_full, sctx.compact_d_full = m, d
   _solve(m2, d2, sctx, compact=True, use_islands=use_islands)
 
   _compact_scatter(m, d)
