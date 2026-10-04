@@ -75,7 +75,6 @@ from mujoco_warp._src.render_util import create_render_context as create_render_
 from mujoco_warp._src.render_util import get_depth as get_depth
 from mujoco_warp._src.render_util import get_rgb as get_rgb
 from mujoco_warp._src.render_util import get_segmentation as get_segmentation
-from mujoco_warp._src.scratch import scratch_array as scratch_array
 from mujoco_warp._src.sensor import energy_pos as energy_pos
 from mujoco_warp._src.sensor import energy_vel as energy_vel
 from mujoco_warp._src.sensor import sensor_acc as sensor_acc
@@ -140,6 +139,7 @@ from mujoco_warp._src.types import State as State
 from mujoco_warp._src.types import Statistic as Statistic
 from mujoco_warp._src.types import TrnType as TrnType
 from mujoco_warp._src.workspace import WorkspaceFieldSpec as WorkspaceFieldSpec
+from mujoco_warp._src.workspace import finalize_step_workspace as finalize_step_workspace
 from mujoco_warp._src.workspace import make_step_workspace as make_step_workspace
 from mujoco_warp._src.workspace import step_workspace_layout as step_workspace_layout
 from mujoco_warp._src.workspace import step_workspace_memory_report as step_workspace_memory_report

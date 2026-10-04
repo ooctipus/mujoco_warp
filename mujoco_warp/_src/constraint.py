@@ -16,6 +16,7 @@
 from typing import Tuple
 
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -4936,11 +4937,10 @@ def _add_surface_vel(is_pyramidal: bool):
 
 
 @event_scope
-def make_constraint(m: types.Model, d: types.Data, *, efc_nnz: wp.array[int] | None = None):
+def make_constraint(m: types.Model, d: types.Data):
   """Creates constraint jacobians and other supporting data."""
   newton = m.opt.solver == types.SolverType.NEWTON
-  if efc_nnz is None:
-    efc_nnz = wp.empty((d.nworld,), dtype=int)
+  efc_nnz = scratch_array(d.scratch, "constraint.efc_nnz", (d.nworld,), int)
 
   wp.launch(
     _zero_constraint_counts,

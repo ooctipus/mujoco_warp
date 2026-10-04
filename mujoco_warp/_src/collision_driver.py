@@ -17,6 +17,7 @@ import dataclasses
 from typing import Optional
 
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src.collision_convex import _ConvexScratch
 from mujoco_warp._src.collision_convex import convex_narrowphase
@@ -891,8 +892,6 @@ def nxn_broadphase(
   d: Data,
   ctx: CollisionContext,
   awake_prev: Optional[wp.array] = None,
-  *,
-  awake_changed: wp.array[int] | None = None,
 ):
   """Runs broadphase collision detection using a brute-force N-squared approach.
 
@@ -921,7 +920,7 @@ def nxn_broadphase(
   # (nothing sleeps between the passes), so the condition is derived here rather than threaded in.
   cond = None
   if incremental and m.opt.graph_conditional:
-    cond = wp.empty(1, dtype=int) if awake_changed is None else awake_changed
+    cond = scratch_array(d.scratch, "broadphase.awake_changed", (1,), int)
     cond.zero_()
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
 
@@ -991,11 +990,10 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, convex_scratch: _Conv
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class _CollisionScratch:
-  """Borrowed broadphase candidates, convex scratch and wake-change counter."""
+  """Borrowed broadphase candidates and convex scratch."""
 
   context: CollisionContext
   convex: _ConvexScratch
-  awake_changed: wp.array[int]
 
 
 @event_scope
@@ -1045,7 +1043,7 @@ def collision(
     d.nacon.zero_()
 
   if m.opt.broadphase == BroadphaseType.NXN:
-    nxn_broadphase(m, d, ctx, awake_prev, awake_changed=None if scratch is None else scratch.awake_changed)
+    nxn_broadphase(m, d, ctx, awake_prev)
   else:
     sap_broadphase(m, d, ctx, awake_prev)
 

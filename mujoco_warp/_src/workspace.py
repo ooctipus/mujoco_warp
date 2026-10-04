@@ -21,9 +21,9 @@ from typing import get_type_hints
 
 import warp as wp
 from gpu_components import fields as field_ops
+from gpu_components import scratch_data
 
 from mujoco_warp._src import forward
-from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
 from mujoco_warp._src import step_program
 from mujoco_warp._src import types
@@ -61,7 +61,7 @@ class _StepWorkspace:
   device: object
   storage: wp.array | None
   arrays: dict[str, wp.array]
-  scratch: forward._StepScratch
+  scratch: forward._ForwardScratch
   _specs: tuple[WorkspaceFieldSpec, ...]
   _allocation_offsets_bytes: tuple[int, ...] | None
   _execution_binding: object
@@ -69,6 +69,7 @@ class _StepWorkspace:
   _data_layout: object
   _model_layout: object
   _scratch_layout: object
+  _finalized_layout: object
 
 
 def step_workspace_memory_report(workspace):
@@ -199,13 +200,6 @@ def step_workspace_layout(
       (name, convex_shapes[name], hint.dtype, "global_counter" if name == "nccd" else "ccd")
       for name, hint in convex_types.items()
     ),
-    ("awake_prev", d.body_awake.shape, int, "world"),
-    ("awake_changed", (1,), int, "global_counter"),
-    ("efc_nnz", (nw,), int, "world"),
-    ("island_parent", (nw, m.ntree), int, "world"),
-    ("efc_tree", (nw, d.njmax), int, "world"),
-    ("moment_nnz", (nw,), int, "world"),
-    ("nsolving", (1,), int, "global_counter"),
   ]
   specs.extend(("solver." + name, shape, dtype, "world") for name, shape, dtype, _ in solver._solver_context_layout(m2, d2))
   fields = []
@@ -239,7 +233,9 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   and bound row operations in the caller's graph program. Keep the borrowed storage
   owners alive through graph retirement. Binding identity, storage, count descriptors
   and capacities are fixed at preparation. Set bindings.updates before recording;
-  the updater identity is fixed at the first recorded operation. Temporarily detached
+  the updater identity is fixed at the first recorded operation. With a scratch registry,
+  recordings made while it is discovering pin nothing; finalize_step_workspace fixes the
+  complete scratch relation before the recording that is published. Temporarily detached
   bindings must be restored before recording any step. Numerical stages borrow
   workspace.scratch and use ordinary Warp operations. The captured-program composition
   boundary binds their count operands; no global Warp dispatch is replaced.
@@ -328,17 +324,8 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
   )
   solver.validate_solver_scratch(m2, solver_context)
   solver_context.compact_m_full, solver_context.compact_d_full = model, execution_data
-  scratch = forward._StepScratch(
-    forward=forward._ForwardScratch(
-      position=forward._PositionScratch(
-        collision=_CollisionScratch(collision, convex, arrays["awake_changed"]),
-        awake_prev=arrays["awake_prev"],
-        efc_nnz=arrays["efc_nnz"],
-        island_parent=arrays["island_parent"],
-        transmission=smooth._TransmissionScratch(arrays["moment_nnz"], None),
-      ),
-      solver=solver._SolverScratch(m2, d2, solver_context, arrays["nsolving"], arrays["efc_tree"]),
-    ),
+  scratch = forward._ForwardScratch(
+    collision=_CollisionScratch(collision, convex), solver=solver._SolverScratch(m2, d2, solver_context)
   )
   memo = {}
   return _StepWorkspace(
@@ -357,4 +344,51 @@ def make_step_workspace(model: types.Model, data: types.Data, *, arrays=None, bi
     _data_layout=step_program._layout((data, execution_data), memo),
     _model_layout=step_program._layout(model, memo),
     _scratch_layout=step_program._layout((tuple(arrays.items()), scratch), memo),
+    _finalized_layout=None,
   )
+
+
+def finalize_step_workspace(workspace) -> None:
+  """Fix the complete scratch relation of a dynamic workspace after discovery.
+
+  Call once, after the registry is prepared and the binding extras are set, and before
+  the recording that will be published. Every count-led declaration must have one
+  column in exactly one bound storage whose admitted count is that count operand;
+  every count-free declaration must be one of the binding's fixed arrays, and no fixed
+  array may alias a count. The relation is then snapshotted: validate_step_workspace
+  refuses a frozen or unfinalized registry and rejects any later change to the
+  registry, its columns, the fixed arrays or the binding.
+  """
+  bindings, execution = workspace._execution_binding, workspace.execution_data
+  registry = getattr(execution, "scratch", None)
+  if bindings is None or registry is None:
+    raise ValueError("Finalizing requires dynamic execution with a scratch registry")
+  if registry.state != scratch_data.PREPARED:
+    raise RuntimeError("Prepare the scratch registry before finalizing the step workspace")
+  if workspace._finalized_layout is not None:
+    raise RuntimeError("The step workspace is already finalized")
+  step_program._validate_bindings(bindings)
+  admitted = {
+    id(execution.nworld): bindings.world_storage.protected_count,
+    id(execution.naconmax): bindings.contact_storage.ready_count,
+    id(execution.naccdmax): bindings.ccd_storage.ready_count,
+  }
+  storages = (bindings.world_storage, bindings.contact_storage, bindings.ccd_storage, *bindings.extra_storages)
+  fixed = {id(array) for array in bindings.extra_fixed_arrays}
+  for name, declaration in registry.declarations.items():
+    column, lead = registry.columns[name], declaration.shape[0]
+    if isinstance(lead, wp.CountParameter):
+      if not column.size:
+        continue  # an empty column owns no bytes; memory validation ignores it as well
+      owners = [storage for storage in storages if field_ops.lookup(storage, column) is not None]
+      if len(owners) != 1:
+        raise ValueError(f"Scratch column {name!r} must be a field of exactly one bound storage")
+      count = admitted.get(id(lead))
+      if count is None or (count is not owners[0].protected_count and count is not owners[0].ready_count):
+        raise ValueError(f"Scratch column {name!r} is not admitted by its storage's count for that operand")
+    elif id(column) not in fixed:
+      raise ValueError(f"Count-free scratch {name!r} must be one of the binding's fixed arrays")
+  field_ops.validate_disjoint_arrays((*admitted.values(), *bindings.extra_fixed_arrays))
+  workspace._binding_layout = step_program._binding_layout(bindings)
+  workspace._data_layout = step_program._layout((workspace.data, execution), {})
+  workspace._finalized_layout = step_program._finalized_layout(workspace)

@@ -2333,6 +2333,7 @@ class Data:
     overflow: overflow bitmask (OverflowType)                   (nworld,)
     face_xpos: cartesian flex face positions                    (nworld, nflexface, 9, 3)
     face_quat: cartesian flex face orientations                 (nworld, nflexface, 4)
+    scratch: scratch registry of the prepared step; None is the eager path
   """
 
   solver_niter: array("nworld", int)

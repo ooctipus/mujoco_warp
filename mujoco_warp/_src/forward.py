@@ -18,6 +18,7 @@ import functools
 from typing import Optional
 
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import collision_driver
 from mujoco_warp._src import constraint
@@ -31,7 +32,6 @@ from mujoco_warp._src import sleep
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
 from mujoco_warp._src import util_misc
-from mujoco_warp._src.scratch import scratch_array
 from mujoco_warp._src.support import next_act
 from mujoco_warp._src.support import xfrc_accumulate
 from mujoco_warp._src.types import MJ_MINVAL
@@ -56,25 +56,11 @@ wp.set_module_options({"enable_backward": False})
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
-class _PositionScratch:
-  """Borrowed collision, constraint, island and transmission resources."""
+class _ForwardScratch:
+  """Borrowed collision and solver resources of one prepared step."""
 
   collision: collision_driver._CollisionScratch
-  awake_prev: wp.array2d[int]
-  efc_nnz: wp.array[int]
-  island_parent: wp.array2d[int]
-  transmission: smooth._TransmissionScratch
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _ForwardScratch:
-  position: _PositionScratch
   solver: solver._SolverScratch
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _StepScratch:
-  forward: _ForwardScratch
 
 
 @wp.kernel
@@ -1085,14 +1071,14 @@ def fwd_kinematics(m: Model, d: Data):
 
 
 @event_scope
-def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: _PositionScratch | None = None):
+def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: collision_driver._CollisionScratch | None = None):
   """Position-dependent computations.
 
   Args:
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
-    scratch: Optional borrowed position-stage scratch.
+    scratch: Optional borrowed collision scratch.
   """
   if scratch is not None and factorize:
     raise NotImplementedError("Borrowed position scratch requires factorize=False; fwd_acceleration owns compact factorization")
@@ -1108,7 +1094,7 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: _Positio
     raise ValueError("An external collision provider requires run_collision_detection=False.")
   collision = collision_driver.collision if m.opt.run_collision_detection else m.callback.collision
   if scratch is not None and m.opt.run_collision_detection:
-    collision = functools.partial(collision, scratch=scratch.collision)
+    collision = functools.partial(collision, scratch=scratch)
   if collision is not None:
     collision(m, d)
   if sleep_enabled:
@@ -1116,16 +1102,13 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: _Positio
     sleep.wake_collision(m, d)
     awake_prev = None
     if collision is not None:
-      if scratch is None:
-        awake_prev = wp.clone(d.body_awake)
-      else:
-        awake_prev = scratch.awake_prev
-        wp.copy(awake_prev, d.body_awake, extent=(d.nworld, *awake_prev.shape[1:]))
+      awake_prev = scratch_array(d.scratch, "position.awake_prev", (d.nworld, *d.body_awake.shape[1:]), int)
+      wp.copy(awake_prev, d.body_awake, extent=(d.nworld, *awake_prev.shape[1:]))
     sleep.update_sleep(m, d)
     if collision is not None:
       collision(m, d, awake_prev=awake_prev)
 
-  constraint.make_constraint(m, d, efc_nnz=None if scratch is None else scratch.efc_nnz)
+  constraint.make_constraint(m, d)
 
   if sleep_enabled:
     if m.neq > 0:
@@ -1133,8 +1116,8 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, scratch: _Positio
     sleep.update_sleep(m, d)
 
   if sleep_enabled:
-    island.island(m, d, parent=None if scratch is None else scratch.island_parent)
-  smooth.transmission(m, d, scratch=None if scratch is None else scratch.transmission)
+    island.island(m, d)
+  smooth.transmission(m, d)
 
 
 @wp.kernel
@@ -1833,7 +1816,7 @@ def forward(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
     sleep.wake(m, d)
     sleep.update_sleep(m, d)
 
-  fwd_position(m, d, factorize=False, scratch=None if scratch is None else scratch.position)
+  fwd_position(m, d, factorize=False, scratch=None if scratch is None else scratch.collision)
   d.sensordata.zero_()
   sensor.sensor_pos(m, d)
   _energy_pos(m, d)
@@ -1857,9 +1840,9 @@ def forward(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
 
 
 @event_scope
-def step(m: Model, d: Data, *, scratch: _StepScratch | None = None):
+def step(m: Model, d: Data, *, scratch: _ForwardScratch | None = None):
   """Advance simulation."""
-  forward(m, d, scratch=None if scratch is None else scratch.forward)
+  forward(m, d, scratch=scratch)
 
   if m.opt.integrator == IntegratorType.EULER:
     euler(m, d)

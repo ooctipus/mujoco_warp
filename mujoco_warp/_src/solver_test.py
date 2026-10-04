@@ -1599,7 +1599,7 @@ class CompactSolverTest(parameterized.TestCase):
     if prepared:
       with wp.ScopedCapture() as capture:
         mjw.validate_step_workspace(workspace, m, d)
-        mjw.forward(m, d, scratch=workspace.scratch.forward)
+        mjw.forward(m, d, scratch=workspace.scratch)
     for _ in range(2):
       # This covers both uninitialized nonfinite bytes and stale finite force from an earlier solve.
       d.cqfrc_constraint.fill_(poison)
@@ -2092,8 +2092,8 @@ class IslandFactorTest(parameterized.TestCase):
           d.qvel.assign(qvel)
           sleep.reset_sleep(m, d)
         with mock.patch.object(solver, "solve", side_effect=lambda *a, **k: original_solve(*a, **(k | {"use_islands": False}))):
-          mjw.forward(m, data[0], scratch=None if workspaces[0] is None else workspaces[0].scratch.forward)
-        mjw.forward(m, data[1], scratch=None if workspaces[1] is None else workspaces[1].scratch.forward)
+          mjw.forward(m, data[0], scratch=None if workspaces[0] is None else workspaces[0].scratch)
+        mjw.forward(m, data[1], scratch=None if workspaces[1] is None else workspaces[1].scratch)
         for attribute in ("qacc", "qfrc_constraint", "qacc_smooth"):
           reference, actual = (getattr(d, attribute).numpy() for d in data)
           self.assertTrue(np.isfinite(reference).all() and np.isfinite(actual).all())

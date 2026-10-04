@@ -27,6 +27,7 @@ import dataclasses
 import warp as wp
 from gpu_components import fields as field_ops
 from gpu_components import graph as graph_ops
+from gpu_components import scratch_data
 from gpu_components.field_data import FieldStorage
 from gpu_components.graph_data import GraphKernelBinding
 from gpu_components.graph_data import GraphUpdateTable
@@ -109,6 +110,10 @@ def validate_step_workspace(workspace, model, data):
     _validate_bindings(workspace.bindings)
   if model is not workspace.model or data is not workspace.data:
     raise ValueError("Prepared workspace requires its original model, data and immutable step options")
+  registry = getattr(workspace.execution_data, "scratch", None)
+  discovering = registry is not None and registry.state == scratch_data.DISCOVERING
+  if registry is not None and not discovering and workspace._finalized_layout is None:
+    raise RuntimeError("Finalize the step workspace after preparing its scratch registry")
   memo = {}
   if (
     _layout((data, workspace.execution_data), memo) != workspace._data_layout or _layout(model, memo) != workspace._model_layout
@@ -122,13 +127,16 @@ def validate_step_workspace(workspace, model, data):
     != workspace._scratch_layout
   ):
     raise ValueError("Prepared scratch descriptors changed; prepare a new workspace")
+  if registry is not None and not discovering and _finalized_layout(workspace) != workspace._finalized_layout:
+    raise ValueError("Finalized scratch relation changed; prepare a new workspace")
   owner = graph_ops.current_capture(device=workspace.device)
   if owner is not None:
     try:
       if workspace.bindings is not None:
         if workspace.bindings.updates is None:
           raise RuntimeError("Prepare native graph updates before recording step operations")
-        _retain_bindings(workspace.bindings, owner)
+        if not discovering:
+          _retain_bindings(workspace.bindings, owner)
       graph_ops.retain(owner, workspace)
     except BaseException:
       if workspace.bindings is not None:
@@ -146,8 +154,18 @@ def _binding_layout(bindings):
       (bindings.world_storage, bindings.world_storage.protected_count),
       (bindings.contact_storage, bindings.contact_storage.ready_count),
       (bindings.ccd_storage, bindings.ccd_storage.ready_count),
+      *((storage, storage.protected_count) for storage in bindings.extra_storages),
     )
-  ) + (id(bindings.bindings),)
+  ) + (id(bindings.bindings), tuple(id(array) for array in bindings.extra_fixed_arrays))
+
+
+def _finalized_layout(workspace):
+  """Snapshot the prepared scratch relation: declarations, their columns and the fixed arrays."""
+  registry = workspace.execution_data.scratch
+  return _layout(
+    (tuple(registry.declarations.items()), tuple(registry.columns.items()), workspace._execution_binding.extra_fixed_arrays),
+    {},
+  )
 
 
 def _validate_bindings(bindings):

@@ -14,6 +14,7 @@
 # ==============================================================================
 
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -358,7 +359,7 @@ def _zero_island_counts(
 
 
 @event_scope
-def island(m: types.Model, d: types.Data, *, parent: wp.array2d[int] | None = None):
+def island(m: types.Model, d: types.Data):
   """Discover constraint islands."""
   if m.ntree == 0:
     wp.launch(
@@ -368,7 +369,7 @@ def island(m: types.Model, d: types.Data, *, parent: wp.array2d[int] | None = No
     )
     return
 
-  direct_dsu(m, d, wp.empty((d.nworld, m.ntree), dtype=int) if parent is None else parent)
+  direct_dsu(m, d, scratch_array(d.scratch, "island.parent", (d.nworld, m.ntree), int))
 
 
 @wp.kernel
@@ -741,7 +742,7 @@ def _init_efc_arrays(
 
 
 @event_scope
-def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree: wp.array2d[int] | None = None):
+def compute_island_mapping(m: types.Model, d: types.Data):
   """Compute DOF/constraint island mappings after island discovery.
 
   Populates d.dof_island, d.efc.island, d.island_idofadr, d.island_dofadr,
@@ -752,7 +753,6 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree: wp.array2
   Args:
     m: Model.
     d: Data.
-    efc_tree: Optional prepared constraint-to-tree scratch.
   """
   # Ensure dof_islandid / efc_islandid are allocated at the right shape
   if d.dof_islandid.shape[1] != m.nv:
@@ -774,8 +774,7 @@ def compute_island_mapping(m: types.Model, d: types.Data, *, efc_tree: wp.array2
     inputs=[],
     outputs=[d.dof_island, d.map_dof2idof, d.map_idof2dof, d.dof_islandid],
   )
-  if efc_tree is None:
-    efc_tree = wp.empty((d.nworld, d.njmax), dtype=int)
+  efc_tree = scratch_array(d.scratch, "island.efc_tree", (d.nworld, d.njmax), int)
   wp.launch(
     _init_efc_arrays,
     dim=(d.nworld, d.njmax),

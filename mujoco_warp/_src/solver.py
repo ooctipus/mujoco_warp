@@ -18,6 +18,7 @@ from math import ceil
 from typing import Any
 
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import island
 from mujoco_warp._src import math
@@ -42,13 +43,11 @@ _ISLAND_BLOCK_DIM = 32
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class _SolverScratch:
-  """Borrowed compact model/data views and solver scratch arrays."""
+  """Borrowed compact model/data views and solver context."""
 
   model: types.Model
   data: types.Data
   context: SolverContext
-  nsolving: wp.array[int]
-  efc_tree: wp.array2d[int]
 
 
 def validate_blocked_matrix(array):
@@ -3985,10 +3984,10 @@ def solve(
     if rebuild_active_dofs:
       island.update_active_dofs(m, d)
     if use_islands:
-      island.compute_island_mapping(m, d, efc_tree=None if scratch is None else scratch.efc_tree)
+      island.compute_island_mapping(m, d)
     solve_compact(m, d, scratch=scratch, use_islands=use_islands)
     if m.ntree > 1 and not use_islands:
-      island.compute_island_mapping(m, d, efc_tree=None if scratch is None else scratch.efc_tree)
+      island.compute_island_mapping(m, d)
     return
 
   if scratch is not None:
@@ -4001,7 +4000,7 @@ def solve(
     _solve(m, d, ctx)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, nsolving=None, use_islands=False):
+def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, use_islands=False):
   """Finds forces that satisfy constraints."""
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
@@ -4029,8 +4028,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       block_dim=m.block_dim.solve_init_search_cg,
     )
 
-  if nsolving is None:
-    nsolving = wp.empty(shape=(1,), dtype=int)
+  nsolving = scratch_array(d.scratch, "solver.nsolving", (1,), int)
   nsolving.fill_(d.nworld)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
@@ -4388,7 +4386,7 @@ def solve_compact(m: types.Model, d: types.Data, *, scratch: _SolverScratch | No
     sctx.grad.zero_(extent=(d.nworld, *sctx.grad.shape[1:]))
     if sctx.ls_exhausted.size:
       sctx.ls_exhausted.zero_(extent=(d.nworld,))
-  _solve(m2, d2, sctx, compact=True, nsolving=None if scratch is None else scratch.nsolving, use_islands=use_islands)
+  _solve(m2, d2, sctx, compact=True, use_islands=use_islands)
 
   _compact_scatter(m, d)
 

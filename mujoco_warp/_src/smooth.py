@@ -14,9 +14,8 @@
 # ==============================================================================
 
 
-import dataclasses
-
 import warp as wp
+from gpu_components.scratch import scratch_array
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -3219,23 +3218,15 @@ def _transmission_body_moment_scale(
     actuator_moment_out[worldid, rowadr + dofid] /= -float(ncon)
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
-class _TransmissionScratch:
-  """Borrowed nonzero and body-contact counters for actuator transmissions."""
-
-  moment_nnz: wp.array[int]
-  body_ncon: wp.array2d[int] | None
-
-
 @event_scope
-def transmission(m: Model, d: Data, *, scratch: _TransmissionScratch | None = None):
+def transmission(m: Model, d: Data):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  moment_nnz = wp.empty((d.nworld,), dtype=int) if scratch is None else scratch.moment_nnz
+  moment_nnz = scratch_array(d.scratch, "transmission.moment_nnz", (d.nworld,), int)
   moment_nnz.zero_(extent=(d.nworld, *moment_nnz.shape[1:]))
   wp.launch(
     _transmission,
@@ -3277,8 +3268,8 @@ def transmission(m: Model, d: Data, *, scratch: _TransmissionScratch | None = No
 
   if m.nacttrnbody:
     # compute moments
-    body_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int) if scratch is None else scratch.body_ncon
-    body_ncon.zero_()
+    body_ncon = scratch_array(d.scratch, "transmission.body_ncon", (d.nworld, m.nacttrnbody), int)
+    body_ncon.zero_(extent=(d.nworld, *body_ncon.shape[1:]))
 
     wp.launch(
       _transmission_body_moment,
