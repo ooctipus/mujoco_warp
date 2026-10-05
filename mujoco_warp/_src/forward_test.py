@@ -51,15 +51,15 @@ def _assert_eq(a, b, name):
 
 
 class ForwardTest(parameterized.TestCase):
-  @parameterized.parameters(False, True)
-  def test_sleep_compact_maps_built_once_per_forward(self, split_step):
+  @parameterized.product(split_step=(False, True), integrator=("Euler", "discrete"))
+  def test_sleep_compact_maps_built_once_per_forward(self, split_step, integrator):
     """Reuse smooth-stage maps; standalone solve must still repair invalid maps."""
     _, _, m, d = test_data.fixture(
-      xml="""<mujoco><option><flag sleep="enable" island="enable"/></option><worldbody>
+      xml=f'''<mujoco><option integrator="{integrator}"><flag sleep="enable" island="enable"/></option><worldbody>
         <geom type="plane" size="10 10 .1"/>
         <body pos="0 0 .09"><joint type="slide" axis="0 0 1"/><geom type="sphere" size=".1"/></body>
         <body pos="2 0 1"><joint type="slide" axis="1 0 0"/><geom type="sphere" size=".1"/></body>
-      </worldbody></mujoco>""",
+      </worldbody></mujoco>''',
       nworld=2,
     )
     m.tree_sleep_policy.assign(np.array([[types.SleepPolicy.AUTO, types.SleepPolicy.ALWAYS]], dtype=np.int32))
