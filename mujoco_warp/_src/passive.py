@@ -1374,11 +1374,11 @@ def passive(m: Model, d: Data):
   dsbl_damper = m.opt.disableflags & DisableBit.DAMPER
 
   if dsbl_spring and dsbl_damper:
-    d.qfrc_spring.zero_()
-    d.qfrc_damper.zero_()
-    d.qfrc_gravcomp.zero_()
-    d.qfrc_fluid.zero_()
-    d.qfrc_passive.zero_()
+    d.qfrc_spring.zero_(extent=(d.nworld, *d.qfrc_spring.shape[1:]))
+    d.qfrc_damper.zero_(extent=(d.nworld, *d.qfrc_damper.shape[1:]))
+    d.qfrc_gravcomp.zero_(extent=(d.nworld, *d.qfrc_gravcomp.shape[1:]))
+    d.qfrc_fluid.zero_(extent=(d.nworld, *d.qfrc_fluid.shape[1:]))
+    d.qfrc_passive.zero_(extent=(d.nworld, *d.qfrc_passive.shape[1:]))
     return
 
   wp.launch(
@@ -1547,7 +1547,7 @@ def passive(m: Model, d: Data):
     )
 
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
-  d.qfrc_gravcomp.zero_()
+  d.qfrc_gravcomp.zero_(extent=(d.nworld, *d.qfrc_gravcomp.shape[1:]))
   if gravity_enabled:
     wp.launch(
       _gravity_force,
@@ -1613,7 +1613,7 @@ def passive(m: Model, d: Data):
   if m.has_fluid:
     _fluid(m, d)
 
-  d.qfrc_adhesion.zero_()
+  d.qfrc_adhesion.zero_(extent=(d.nworld, *d.qfrc_adhesion.shape[1:]))
   if m.flg_adhesion and (not (m.opt.disableflags & DisableBit.CONTACT)) and m.nv > 0:
     wp.launch(
       _qfrc_adhesion,

@@ -1051,13 +1051,13 @@ def crb(m: Model, d: Data):
   Accumulates composite rigid body inertias up the kinematic tree and computes the
   joint-space inertia matrix in either sparse or dense format, depending on model options.
   """
-  wp.copy(d.crb, d.cinert)
+  wp.copy(d.crb, d.cinert, extent=(d.nworld, *d.crb.shape[1:]))
 
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
     wp.launch(_crb_accumulate, dim=(d.nworld, body_tree.size), inputs=[m.body_parentid, d.crb, body_tree], outputs=[d.crb])
 
-  d.M.zero_()
+  d.M.zero_(extent=(d.nworld, *d.M.shape[1:]))
   wp.launch(
     _M,
     dim=(d.nworld, m.nv),
@@ -1191,7 +1191,7 @@ def _qLDiag_div(
 
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
-  wp.copy(L, M)
+  wp.copy(L, M, extent=(d.nworld, *L.shape[1:]))
 
   for i in reversed(range(len(m.qLD_updates))):
     qLD_updates = m.qLD_updates[i]
@@ -1331,7 +1331,7 @@ def _cacc_world(
 
 def _rne_cacc_world(m: Model, d: Data):
   if m.opt.disableflags & DisableBit.GRAVITY:
-    d.cacc.zero_()
+    d.cacc.zero_(extent=(d.nworld, *d.cacc.shape[1:]))
   else:
     wp.launch(_cacc_world, dim=[d.nworld], inputs=[m.opt.gravity], outputs=[d.cacc])
 
@@ -2454,6 +2454,9 @@ def tendon_bias(m: Model, d: Data, qfrc: wp.array2d[float]):
     d: The data object containing the current state and output arrays.
     qfrc: Force.
   """
+  if not m.ntendon:
+    return
+
   # time derivative of tendon Jacobian
   ten_Jdot = wp.zeros((d.nworld, m.nJten), dtype=float)
   wp.launch(
@@ -3222,8 +3225,8 @@ def transmission(m: Model, d: Data):
   and tendon transmissions.
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  moment_nnz = wp.zeros((d.nworld,), dtype=int)
-
+  moment_nnz = wp.empty((d.nworld,), dtype=int, device=d.qpos.device)
+  moment_nnz.zero_(extent=(d.nworld, *moment_nnz.shape[1:]))
   wp.launch(
     _transmission,
     dim=(d.nworld, m.nactuator),
@@ -3264,7 +3267,8 @@ def transmission(m: Model, d: Data):
 
   if m.nacttrnbody:
     # compute moments
-    ncon = wp.zeros((d.nworld, m.nacttrnbody), dtype=int)
+    body_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int, device=d.qpos.device)
+    body_ncon.zero_(extent=(d.nworld, *body_ncon.shape[1:]))
 
     wp.launch(
       _transmission_body_moment,
@@ -3296,14 +3300,14 @@ def transmission(m: Model, d: Data):
         d.nacon,
         m.is_sparse,
       ],
-      outputs=[d.actuator_moment, ncon],
+      outputs=[d.actuator_moment, body_ncon],
     )
 
     # scale moments
     wp.launch(
       _transmission_body_moment_scale,
       dim=(d.nworld, m.nacttrnbody, m.nv),
-      inputs=[m.actuator_trntype_body_adr, d.moment_rowadr, ncon],
+      inputs=[m.actuator_trntype_body_adr, d.moment_rowadr, body_ncon],
       outputs=[d.actuator_moment],
     )
 

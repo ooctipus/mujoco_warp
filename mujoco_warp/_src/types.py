@@ -2330,6 +2330,7 @@ class Data:
     overflow: overflow bitmask (OverflowType)                   (nworld,)
     face_xpos: cartesian flex face positions                    (nworld, nflexface, 9, 3)
     face_quat: cartesian flex face orientations                 (nworld, nflexface, 4)
+    scratch: scratch registry of the prepared step; None is the eager path
   """
 
   solver_niter: array("nworld", int)
@@ -2461,9 +2462,10 @@ class Data:
   cqfrc_constraint: array("nworld", "nvmax_pad", float)
 
   # warp only fields:
-  nworld: int
-  naconmax: int
-  naccdmax: int
+  # Concrete descriptors allocate storage; prepared execution may borrow count operands.
+  nworld: int | wp.CountParameter
+  naconmax: int | wp.CountParameter
+  naccdmax: int | wp.CountParameter
   njmax: int
   nvmax: int
   nvmax_pad: int
@@ -2491,8 +2493,8 @@ class InverseContext:
   state_changed_count: wp.array[int]
   ls_exhausted: wp.array[bool]
   # the full-coordinate Data, set by solve_compact (None natively)
-  compact_m_full: Optional["Model"] = None
-  compact_d_full: Optional["Data"] = None
+  compact_m_full: Optional["Model"] = dataclasses.field(default=None, metadata={"array_fields": False})
+  compact_d_full: Optional["Data"] = dataclasses.field(default=None, metadata={"array_fields": False})
 
 
 @dataclasses.dataclass
@@ -2523,9 +2525,10 @@ class SolverContext:
   hfactor: wp.array3d[float]
   quad_changed_ids: wp.array2d[int]
   quad_changed_count: wp.array[int]
+  nsolving: wp.array[int]
   # the full-coordinate Data, set by solve_compact (None natively)
-  compact_m_full: Optional["Model"] = None
-  compact_d_full: Optional["Data"] = None
+  compact_m_full: Optional["Model"] = dataclasses.field(default=None, metadata={"array_fields": False})
+  compact_d_full: Optional["Data"] = dataclasses.field(default=None, metadata={"array_fields": False})
 
 
 @dataclasses.dataclass

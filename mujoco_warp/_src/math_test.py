@@ -13,6 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 
+import inspect
+
 import numpy as np
 import warp as wp
 from absl.testing import absltest
@@ -171,9 +173,21 @@ class ClosestSegmentSegmentPointsTest(absltest.TestCase):
         arr.append(upper_trid_index(10, i, j))
     self.assertEqual(arr, list(range(0, 55)))
 
-  def test_upper_trid_index10(self):
+  def test_upper_trid_index_symmetric(self):
     """Tests upper_trid_index works with symmetric matrix."""
     self.assertEqual(upper_trid_index(10, 1, 5), upper_trid_index(10, 5, 1))
+
+  def test_upper_trid_index_host_dispatch(self):
+    """Host collision dispatch must not pay Warp function overload and argument-packing costs."""
+    self.assertTrue(inspect.isfunction(upper_trid_index))
+    n = len(types.GeomType)
+    index = 0
+    for i in range(n):
+      for j in range(i, n):
+        self.assertEqual(upper_trid_index(n, i, j), index)
+        self.assertEqual(upper_trid_index(n, j, i), index)
+        index += 1
+    self.assertEqual(index, n * (n + 1) // 2)
 
 
 class DenseLUTest(parameterized.TestCase):

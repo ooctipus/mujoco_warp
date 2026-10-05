@@ -35,6 +35,7 @@ from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import EnableBit
 from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import Model
+from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.types import SleepPolicy
 from mujoco_warp._src.types import SleepState
 from mujoco_warp._src.types import mat23
@@ -280,7 +281,13 @@ def _obb_filter(
   return True
 
 
-def _broadphase_filter(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound: int, ngeom_margin: int, ngeom_gap: int):
+def _broadphase_filter(
+  opt_broadphase_filter: int,
+  batched_geom_aabb: bool,
+  batched_geom_rbound: bool,
+  batched_geom_margin: bool,
+  batched_geom_gap: bool,
+):
   @wp.func
   def func(
     # Model:
@@ -301,15 +308,33 @@ def _broadphase_filter(opt_broadphase_filter: int, ngeom_aabb: int, ngeom_rbound
     # 4: aabb
     # 8: obb
 
-    aabb_id = worldid % ngeom_aabb if wp.static(ngeom_aabb > 1) else 0
+    # Specialize on layout, not population size, so resizing reuses compiled kernels.
+    # Full-world batches avoid a runtime integer division; smaller batches remain cyclic.
+    aabb_id = (
+      (worldid if geom_aabb.shape[0] == geom_xpos_in.shape[0] else worldid % geom_aabb.shape[0])
+      if wp.static(batched_geom_aabb)
+      else 0
+    )
     center1, center2 = geom_aabb[aabb_id, geom1, 0], geom_aabb[aabb_id, geom2, 0]  # kernel_analyzer: ignore
     size1, size2 = geom_aabb[aabb_id, geom1, 1], geom_aabb[aabb_id, geom2, 1]  # kernel_analyzer: ignore
 
-    rbound_id = worldid % ngeom_rbound if wp.static(ngeom_rbound > 1) else 0
+    rbound_id = (
+      (worldid if geom_rbound.shape[0] == geom_xpos_in.shape[0] else worldid % geom_rbound.shape[0])
+      if wp.static(batched_geom_rbound)
+      else 0
+    )
     rbound1, rbound2 = geom_rbound[rbound_id, geom1], geom_rbound[rbound_id, geom2]  # kernel_analyzer: ignore
-    margin_id = worldid % ngeom_margin if wp.static(ngeom_margin > 1) else 0
+    margin_id = (
+      (worldid if geom_margin.shape[0] == geom_xpos_in.shape[0] else worldid % geom_margin.shape[0])
+      if wp.static(batched_geom_margin)
+      else 0
+    )
     margin1, margin2 = geom_margin[margin_id, geom1], geom_margin[margin_id, geom2]  # kernel_analyzer: ignore
-    gap_id = worldid % ngeom_gap if wp.static(ngeom_gap > 1) else 0
+    gap_id = (
+      (worldid if geom_gap.shape[0] == geom_xpos_in.shape[0] else worldid % geom_gap.shape[0])
+      if wp.static(batched_geom_gap)
+      else 0
+    )
     gap1, gap2 = geom_gap[gap_id, geom1], geom_gap[gap_id, geom2]  # kernel_analyzer: ignore
     effective_margin1 = margin1 + gap1
     effective_margin2 = margin2 + gap2
@@ -361,6 +386,7 @@ def _add_geom_pair(
   pairid: wp.vec2i,
   # Data out:
   ncollision_out: wp.array[int],
+  overflow_out: wp.array[int],
   # Out:
   collision_pair_out: wp.array[wp.vec2i],
   collision_pairid_out: wp.array[wp.vec2i],
@@ -369,6 +395,7 @@ def _add_geom_pair(
   cid = wp.atomic_add(ncollision_out, 0, 1)
 
   if cid >= naconmax_in:
+    wp.atomic_or(overflow_out, worldid, wp.static(OverflowType.BROADPHASE))
     return
 
   if type1 > type2:
@@ -382,7 +409,7 @@ def _add_geom_pair(
 
 
 @cache_kernel
-def _sap_project(opt_broadphase: int, ngeom_dataid: int):
+def _sap_project(opt_broadphase: int, batched_geom_dataid: bool):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def sap_project(
     # Model:
@@ -412,9 +439,9 @@ def _sap_project(opt_broadphase: int, ngeom_dataid: int):
         if worldid == nworld_in - 1:
           segmented_index_out[nworld_in] = nworld_in * ngeom
 
-    if wp.static(ngeom_dataid > 1):
+    if wp.static(batched_geom_dataid):
       # an inverted interval at the end of the axis: no bounded geom sweeps over a missing mesh
-      if _mesh_missing(geom_dataid, geomid, geom_type[geomid], worldid % ngeom_dataid):
+      if _mesh_missing(geom_dataid, geomid, geom_type[geomid], worldid % geom_dataid.shape[0]):
         projection_lower_out[worldid, geomid] = MJ_MAXVAL
         projection_upper_out[worldid, geomid] = -MJ_MAXVAL
         return
@@ -442,11 +469,11 @@ def _sap_project(opt_broadphase: int, ngeom_dataid: int):
 @cache_kernel
 def _sap_broadphase(
   opt_broadphase_filter: int,
-  ngeom_aabb: int,
-  ngeom_rbound: int,
-  ngeom_margin: int,
-  ngeom_gap: int,
-  ngeom_dataid: int,
+  batched_geom_aabb: bool,
+  batched_geom_rbound: bool,
+  batched_geom_margin: bool,
+  batched_geom_gap: bool,
+  batched_geom_dataid: bool,
   enable_sleep: bool = False,
   incremental: bool = False,
 ):
@@ -477,6 +504,7 @@ def _sap_broadphase(
     body_awake_prev_in: wp.array2d[int],
     # Data out:
     ncollision_out: wp.array[int],
+    overflow_out: wp.array[int],
     # Out:
     collision_pair_out: wp.array[wp.vec2i],
     collision_pairid_out: wp.array[wp.vec2i],
@@ -517,8 +545,8 @@ def _sap_broadphase(
       type1 = geom_type[geom1]
       type2 = geom_type[geom2]
 
-      if wp.static(ngeom_dataid > 1):
-        dataid_id = worldid % ngeom_dataid
+      if wp.static(batched_geom_dataid):
+        dataid_id = worldid if geom_dataid.shape[0] == geom_xpos_in.shape[0] else worldid % geom_dataid.shape[0]
         if _mesh_missing(geom_dataid, geom1, type1, dataid_id) or _mesh_missing(geom_dataid, geom2, type2, dataid_id):
           continue
 
@@ -554,9 +582,11 @@ def _sap_broadphase(
             continue
 
       if (
-        wp.static(_broadphase_filter(opt_broadphase_filter, ngeom_aabb, ngeom_rbound, ngeom_margin, ngeom_gap))(
-          geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid
-        )
+        wp.static(
+          _broadphase_filter(
+            opt_broadphase_filter, batched_geom_aabb, batched_geom_rbound, batched_geom_margin, batched_geom_gap
+          )
+        )(geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid)
         or pairid[1] >= 0
       ):
         _add_geom_pair(
@@ -568,6 +598,7 @@ def _sap_broadphase(
           worldid,
           pairid,
           ncollision_out,
+          overflow_out,
           collision_pair_out,
           collision_pairid_out,
           collision_worldid_out,
@@ -650,7 +681,7 @@ def sap_broadphase(
   segmented_index = wp.empty(d.nworld + 1 if m.opt.broadphase == BroadphaseType.SAP_SEGMENTED else 0, dtype=int)
 
   wp.launch(
-    kernel=_sap_project(m.opt.broadphase, m.geom_dataid.shape[0]),
+    kernel=_sap_project(m.opt.broadphase, m.geom_dataid.shape[0] > 1),
     dim=(d.nworld, m.ngeom),
     inputs=[m.ngeom, m.geom_type, m.geom_dataid, m.geom_rbound, m.geom_margin, m.geom_gap, d.geom_xpos, d.nworld, direction],
     outputs=[
@@ -690,11 +721,11 @@ def sap_broadphase(
   wp.launch(
     kernel=_sap_broadphase(
       m.opt.broadphase_filter,
-      m.geom_aabb.shape[0],
-      m.geom_rbound.shape[0],
-      m.geom_margin.shape[0],
-      m.geom_gap.shape[0],
-      m.geom_dataid.shape[0],
+      m.geom_aabb.shape[0] > 1,
+      m.geom_rbound.shape[0] > 1,
+      m.geom_margin.shape[0] > 1,
+      m.geom_gap.shape[0] > 1,
+      m.geom_dataid.shape[0] > 1,
       enable_sleep,
       incremental,
     ),
@@ -721,18 +752,18 @@ def sap_broadphase(
       nsweep,
       awake_prev_in,
     ],
-    outputs=[d.ncollision, ctx.collision_pair, ctx.collision_pairid, ctx.collision_worldid],
+    outputs=[d.ncollision, d.overflow, ctx.collision_pair, ctx.collision_pairid, ctx.collision_worldid],
   )
 
 
 @cache_kernel
 def _nxn_broadphase(
   opt_broadphase_filter: int,
-  ngeom_aabb: int,
-  ngeom_rbound: int,
-  ngeom_margin: int,
-  ngeom_gap: int,
-  ngeom_dataid: int,
+  batched_geom_aabb: bool,
+  batched_geom_rbound: bool,
+  batched_geom_margin: bool,
+  batched_geom_gap: bool,
+  batched_geom_dataid: bool,
   enable_sleep: bool = False,
   incremental: bool = False,
 ):
@@ -759,6 +790,7 @@ def _nxn_broadphase(
     body_awake_prev_in: wp.array2d[int],
     # Data out:
     ncollision_out: wp.array[int],
+    overflow_out: wp.array[int],
     # Out:
     collision_pair_out: wp.array[wp.vec2i],
     collision_pairid_out: wp.array[wp.vec2i],
@@ -772,8 +804,8 @@ def _nxn_broadphase(
     type1 = geom_type[geom1]
     type2 = geom_type[geom2]
 
-    if wp.static(ngeom_dataid > 1):
-      dataid_id = worldid % ngeom_dataid
+    if wp.static(batched_geom_dataid):
+      dataid_id = worldid if geom_dataid.shape[0] == geom_xpos_in.shape[0] else worldid % geom_dataid.shape[0]
       if _mesh_missing(geom_dataid, geom1, type1, dataid_id) or _mesh_missing(geom_dataid, geom2, type2, dataid_id):
         return
 
@@ -813,9 +845,9 @@ def _nxn_broadphase(
 
     pairid = nxn_pairid[elementid]
     if (
-      wp.static(_broadphase_filter(opt_broadphase_filter, ngeom_aabb, ngeom_rbound, ngeom_margin, ngeom_gap))(
-        geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid
-      )
+      wp.static(
+        _broadphase_filter(opt_broadphase_filter, batched_geom_aabb, batched_geom_rbound, batched_geom_margin, batched_geom_gap)
+      )(geom_aabb, geom_rbound, geom_margin, geom_gap, geom_xpos_in, geom_xmat_in, geom1, geom2, worldid)
       or pairid[1] >= 0
     ):
       _add_geom_pair(
@@ -827,6 +859,7 @@ def _nxn_broadphase(
         worldid,
         pairid,
         ncollision_out,
+        overflow_out,
         collision_pair_out,
         collision_pairid_out,
         collision_worldid_out,
@@ -884,18 +917,18 @@ def nxn_broadphase(
   # (nothing sleeps between the passes), so the condition is derived here rather than threaded in.
   cond = None
   if incremental and m.opt.graph_conditional:
-    cond = wp.zeros(1, dtype=int)
+    cond = wp.zeros(1, dtype=int, device=d.ncollision.device)
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
 
   def _launch():
     wp.launch(
       _nxn_broadphase(
         m.opt.broadphase_filter,
-        m.geom_aabb.shape[0],
-        m.geom_rbound.shape[0],
-        m.geom_margin.shape[0],
-        m.geom_gap.shape[0],
-        m.geom_dataid.shape[0],
+        m.geom_aabb.shape[0] > 1,
+        m.geom_rbound.shape[0] > 1,
+        m.geom_margin.shape[0] > 1,
+        m.geom_gap.shape[0] > 1,
+        m.geom_dataid.shape[0] > 1,
         enable_sleep,
         incremental,
       ),
@@ -920,6 +953,7 @@ def nxn_broadphase(
       ],
       outputs=[
         d.ncollision,
+        d.overflow,
         ctx.collision_pair,
         ctx.collision_pairid,
         ctx.collision_worldid,
@@ -933,13 +967,14 @@ def nxn_broadphase(
 
 
 def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
-  collision_table = MJ_COLLISION_TABLE
-  if m.opt.disableflags & DisableBit.NATIVECCD:
-    collision_table = collision_table.copy()
-    collision_table[(GeomType.BOX, GeomType.BOX)] = CollisionType.PRIMITIVE
-
-  convex_pairs = [key for key, value in collision_table.items() if value == CollisionType.CONVEX]
-  primitive_pairs = [key for key, value in collision_table.items() if value == CollisionType.PRIMITIVE]
+  convex_pairs, primitive_pairs = [], []
+  for pair, kind in MJ_COLLISION_TABLE.items():
+    if pair == (GeomType.BOX, GeomType.BOX) and m.opt.disableflags & DisableBit.NATIVECCD:
+      kind = CollisionType.PRIMITIVE
+    if kind == CollisionType.CONVEX:
+      convex_pairs.append(pair)
+    elif kind == CollisionType.PRIMITIVE:
+      primitive_pairs.append(pair)
 
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
@@ -951,11 +986,7 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
 
 
 @event_scope
-def collision(
-  m: Model,
-  d: Data,
-  awake_prev: Optional[wp.array] = None,
-):
+def collision(m: Model, d: Data, awake_prev: Optional[wp.array] = None):
   """Runs the full collision detection pipeline.
 
   This function orchestrates the broadphase and narrowphase collision detection stages. It
@@ -976,12 +1007,11 @@ def collision(
   incremental sleeping pass: contacts are appended to the existing buffer and only pairs involving
   a newly-awakened body are emitted.
   """
-  if d.naconmax == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
+  if wp.upper_bound(d.naconmax) == 0 or m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT):
     d.nacon.zero_()
     return
 
-  # TODO(team): create context outside collision?
-  ctx = create_collision_context(d.naconmax)
+  ctx = create_collision_context(d.naconmax, device=d.ncollision.device)
 
   incremental = awake_prev is not None
 

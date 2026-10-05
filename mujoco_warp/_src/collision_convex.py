@@ -1233,7 +1233,7 @@ def _ccd_grid_size(kernel, naconmax: int, device) -> int:
 
 
 @event_scope
-def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]]):
+def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table):
   """Runs narrowphase collision detection for convex geom pairs.
 
   This function handles collision detection for pairs of convex geometries that were
@@ -1249,60 +1249,52 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
   computations for non-existent pair types.
   """
 
-  def _pair_count(p1: int, p2: int) -> Tuple[int, int]:
+  def _pair_count(p1, p2):
     idx = upper_trid_index(len(GeomType), p1, p2)
     return m.geom_pair_type_count[idx], idx
 
-  ncollision = sum(_pair_count(g[0].value, g[1].value)[0] for g in collision_table)
-  # no convex collisions, early return
-
-  if ncollision == 0:
-    return
-
-  # compute npolygonmax and nmeshdegmax given the geom pairs for the model
-  nboxbox, _ = _pair_count(GeomType.BOX.value, GeomType.BOX.value)
-  if (GeomType.BOX, GeomType.BOX) not in collision_table:
-    nboxbox = 0
-  nboxmesh, _ = _pair_count(GeomType.BOX.value, GeomType.MESH.value)
-  nmeshmesh, _ = _pair_count(GeomType.MESH.value, GeomType.MESH.value)
-  ncylcyl, _ = _pair_count(GeomType.CYLINDER.value, GeomType.CYLINDER.value)
-  ncylbox, _ = _pair_count(GeomType.CYLINDER.value, GeomType.BOX.value)
-  ncylmesh, _ = _pair_count(GeomType.CYLINDER.value, GeomType.MESH.value)
-
+  ncollision = sum(_pair_count(*pair)[0] for pair in collision_table)
+  nboxbox = _pair_count(GeomType.BOX, GeomType.BOX)[0] if (GeomType.BOX, GeomType.BOX) in collision_table else 0
+  nboxmesh = _pair_count(GeomType.BOX, GeomType.MESH)[0]
+  nmeshmesh = _pair_count(GeomType.MESH, GeomType.MESH)[0]
+  ncylcyl = _pair_count(GeomType.CYLINDER, GeomType.CYLINDER)[0]
+  ncylbox = _pair_count(GeomType.CYLINDER, GeomType.BOX)[0]
+  ncylmesh = _pair_count(GeomType.CYLINDER, GeomType.MESH)[0]
   epa_iterations = 16 if nboxbox == ncollision else m.opt.ccd_iterations
-
-  # set to true to enable multiccd
   use_multiccd = (m.opt.disableflags & DisableBit.MULTICCD) == 0
 
-  # note: box<->box multicontact is independent of the use_multiccd flag
-  # need at least 4 (square sides) if there's a box collision needing multiccd
+  # Box-box clipping remains enabled independently of the MULTICCD flag.
   npolygonmax = 4 if nboxbox > 0 else 0
   nmeshdegmax = 3 if nboxbox > 0 else 0
-
-  # need to allocate more memory if there are cylinders or meshes
   if use_multiccd and ncylcyl + ncylbox + ncylmesh > 0:
     npolygonmax = max(m.npolygonmax, 16)
     nmeshdegmax = max(m.nmeshdegmax, 3)
   elif use_multiccd and nmeshmesh + nboxmesh > 0:
-    minval = 4 if nboxmesh else npolygonmax
-    npolygonmax = max(m.npolygonmax, minval)
+    npolygonmax = max(m.npolygonmax, 4 if nboxmesh else npolygonmax)
     nmeshdegmax = max(m.nmeshdegmax, 3)
 
-  # ccd collider count
-  nccd = wp.zeros(len(GeomType) * (len(GeomType) + 1) // 2, dtype=int)
-
-  # epa_vert: vertices in EPA polytope
-  epa_vert = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=wp.vec3)
-  # epa_vert_index: vertex indices in EPA polytope
-  epa_vert_index = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=int)
-  # epa_face: faces of polytope represented by three indices
-  epa_face = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int)
-  # epa_pr: projection of origin on polytope faces
-  epa_pr = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3)
-  # epa_norm2: epa_pr * epa_pr
-  epa_norm2 = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float)
-  # epa_horizon: index pair (i j) of edges on horizon
-  epa_horizon = wp.empty(shape=(d.naccdmax, MJ_MAX_EPAHORIZON), dtype=int)
+  if not ncollision:
+    return
+  device = d.ncollision.device
+  nccd = wp.empty(len(GeomType) * (len(GeomType) + 1) // 2, dtype=int, device=device)
+  epa_vert = wp.empty((d.naccdmax, 10 + 2 * epa_iterations), dtype=wp.vec3, device=device)
+  epa_vert_index = wp.empty((d.naccdmax, 10 + 2 * epa_iterations), dtype=int, device=device)
+  epa_face = wp.empty((d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int, device=device)
+  epa_pr = wp.empty((d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3, device=device)
+  epa_norm2 = wp.empty((d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float, device=device)
+  epa_horizon = wp.empty((d.naccdmax, MJ_MAX_EPAHORIZON), dtype=int, device=device)
+  multiccd_polygon = wp.empty((d.naccdmax, 2 * npolygonmax), dtype=wp.vec3, device=device)
+  multiccd_clipped = wp.empty((d.naccdmax, 2 * npolygonmax), dtype=wp.vec3, device=device)
+  multiccd_pnormal = wp.empty((d.naccdmax, npolygonmax), dtype=wp.vec3, device=device)
+  multiccd_pdist = wp.empty((d.naccdmax, npolygonmax), dtype=float, device=device)
+  multiccd_idx1 = wp.empty((d.naccdmax, nmeshdegmax), dtype=int, device=device)
+  multiccd_idx2 = wp.empty((d.naccdmax, nmeshdegmax), dtype=int, device=device)
+  multiccd_n1 = wp.empty((d.naccdmax, nmeshdegmax), dtype=wp.vec3, device=device)
+  multiccd_n2 = wp.empty((d.naccdmax, nmeshdegmax), dtype=wp.vec3, device=device)
+  multiccd_endvert = wp.empty((d.naccdmax, nmeshdegmax), dtype=wp.vec3, device=device)
+  multiccd_face1 = wp.empty((d.naccdmax, npolygonmax), dtype=wp.vec3, device=device)
+  multiccd_face2 = wp.empty((d.naccdmax, npolygonmax), dtype=wp.vec3, device=device)
+  nccd.zero_()
 
   # Contact outputs
   contact_outputs = [
@@ -1394,30 +1386,6 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
         outputs=contact_outputs + [d.overflow],
       )
 
-  # Allocate multiccd arrays only for non-heightfield collisions
-  # multiccd_polygon: clipped contact surface
-  multiccd_polygon = wp.empty(shape=(d.naccdmax, 2 * npolygonmax), dtype=wp.vec3)
-  # multiccd_clipped: clipped contact surface (intermediate)
-  multiccd_clipped = wp.empty(shape=(d.naccdmax, 2 * npolygonmax), dtype=wp.vec3)
-  # multiccd_pnormal: plane normal of clipping polygon
-  multiccd_pnormal = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=wp.vec3)
-  # multiccd_pdist: plane distance of clipping polygon
-  multiccd_pdist = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=float)
-  # multiccd_idx1: list of normal index candidates for Geom 1
-  multiccd_idx1 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=int)
-  # multiccd_idx2: list of normal index candidates for Geom 2
-  multiccd_idx2 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=int)
-  # multiccd_n1: list of normal candidates for Geom 1
-  multiccd_n1 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=wp.vec3)
-  # multiccd_n2: list of normal candidates for Geom 1
-  multiccd_n2 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=wp.vec3)
-  # multiccd_endvert: list of edge vertices candidates
-  multiccd_endvert = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=wp.vec3)
-  # multiccd_face1: contact face
-  multiccd_face1 = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=wp.vec3)
-  # multiccd_face2: contact face
-  multiccd_face2 = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=wp.vec3)
-
   # Launch non-heightfield collision kernels (no hfield args, 78 args total)
   for geom_pair in collision_table:
     g1 = geom_pair[0].value
@@ -1434,7 +1402,7 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
         m.block_dim.convex_ccd,
         int(m.opt.warn_overflow),
       )
-      ccd_grid = _ccd_grid_size(ccd_k, d.naconmax, d.ncollision.device)
+      ccd_grid = _ccd_grid_size(ccd_k, wp.upper_bound(d.naconmax), d.ncollision.device)
       wp.launch(
         ccd_k,
         dim=ccd_grid,
