@@ -23,27 +23,6 @@ import warp as wp
 _STACK = None
 
 
-def allocate_work_arrays(layout, arrays=None, *, device=None):
-  """Allocate or bind native work fields from their sole numerical layout declaration.
-
-  Layout entries are ``name: (shape, dtype)``. Symbolic dimensions retain their
-  identity in the declaration and are bounded only when validating storage.
-  Supplied arrays are borrowed without initializing their payload.
-  """
-  device = wp.get_device(device)
-  if arrays is not None and arrays.keys() != layout.keys():
-    raise ValueError("Native work bindings must match the declared fields exactly")
-  result = {}
-  for name, (shape, dtype) in layout.items():
-    shape = tuple(wp.upper_bound(axis) for axis in shape)
-    dtype = {int: wp.int32, float: wp.float32, bool: wp.bool}.get(dtype, dtype)
-    array = wp.empty(shape, dtype=dtype, device=device) if arrays is None else arrays[name]
-    if not isinstance(array, wp.array) or (array.shape, array.dtype, array.device) != (shape, dtype, device):
-      raise ValueError(f"Native work field {name!r} has an incompatible shape, dtype or device")
-    result[name] = array
-  return result
-
-
 def is_array_spec(typ) -> bool:
   """Check if a type annotation is an array spec (wp.array instance or bracket annotation)."""
   return isinstance(typ, wp.array) or type(typ).__name__ == "_ArrayAnnotation"

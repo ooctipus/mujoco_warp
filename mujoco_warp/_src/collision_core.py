@@ -27,7 +27,6 @@ from mujoco_warp._src.types import ContactType
 from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import mat63
 from mujoco_warp._src.types import vec5
-from mujoco_warp._src.warp_util import allocate_work_arrays
 
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
@@ -484,7 +483,6 @@ class CollisionContext:
   collision_pair: wp.array
   collision_pairid: wp.array
   collision_worldid: wp.array
-  awake_changed: wp.array
 
 
 @wp.func
@@ -521,16 +519,10 @@ def sap_range(
   range_out[worldid, sortedid] = limit - sortedid
 
 
-def collision_context_layout(naconmax):
-  """Declare candidate operands; the leading dimension identifies candidate capacity."""
-  return {
-    "collision_pair": ((naconmax,), wp.vec2i),
-    "collision_pairid": ((naconmax,), wp.vec2i),
-    "collision_worldid": ((naconmax,), int),
-    "awake_changed": ((1,), int),
-  }
-
-
-def create_collision_context(naconmax: int, arrays=None, *, device=None) -> CollisionContext:
-  """Allocate or borrow candidate operands without assigning backing ownership."""
-  return CollisionContext(**allocate_work_arrays(collision_context_layout(naconmax), arrays, device=device))
+def create_collision_context(naconmax: int, *, device=None) -> CollisionContext:
+  """Allocate the candidate arrays shared by broadphase and narrowphase."""
+  return CollisionContext(
+    collision_pair=wp.empty(naconmax, dtype=wp.vec2i, device=device),
+    collision_pairid=wp.empty(naconmax, dtype=wp.vec2i, device=device),
+    collision_worldid=wp.empty(naconmax, dtype=int, device=device),
+  )

@@ -13,13 +13,10 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
 from typing import Optional
 
 import warp as wp
 
-from mujoco_warp._src import collision_convex
-from mujoco_warp._src import collision_core
 from mujoco_warp._src import collision_driver
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
@@ -45,168 +42,14 @@ from mujoco_warp._src.types import IntegratorType
 from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import Model
 from mujoco_warp._src.types import OverflowType
-from mujoco_warp._src.types import SolverContext
 from mujoco_warp._src.types import TrnType
 from mujoco_warp._src.types import mat66
 from mujoco_warp._src.types import vec6
 from mujoco_warp._src.types import vec10
-from mujoco_warp._src.warp_util import allocate_work_arrays
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False})
-
-
-@dataclasses.dataclass
-class PositionContext:
-  """Work shared by collision, island discovery and transmission within a position stage."""
-
-  collision: collision_core.CollisionContext | None
-  convex: collision_convex.ConvexContext | None
-  awake_prev: wp.array
-  parent: wp.array
-  efc_tree: wp.array
-  efc_nnz: wp.array
-  moment_nnz: wp.array
-  body_ncon: wp.array
-
-
-@dataclasses.dataclass
-class IntegrationContext:
-  """Velocity integration operands; unused equation branches have no allocated field."""
-
-  qacc: wp.array | None = None
-  matrix: wp.array | None = None
-  damping_deriv: wp.array | None = None
-  qLD: wp.array | None = None
-  qLDiagInv: wp.array | None = None
-  actuator_vel: wp.array | None = None
-  island_can_sleep: wp.array | None = None
-
-
-@dataclasses.dataclass
-class StepWork:
-  """Native numerical operands, independent of storage ownership and graph lifetime."""
-
-  position: PositionContext
-  solver: SolverContext
-  integration: IntegrationContext
-
-
-def position_work_layout(m, d):
-  """Compose the position stage's native declarations without allocating payload."""
-  layout = {
-    "awake_prev": ((d.nworld, m.nbody), int),
-    **island.island_work_layout(m, d),
-    **constraint.constraint_work_layout(m, d),
-    **smooth.transmission_work_layout(m, d),
-  }
-  if m.opt.run_collision_detection and not (m.opt.disableflags & (DisableBit.CONSTRAINT | DisableBit.CONTACT)):
-    layout.update({"collision." + name: spec for name, spec in collision_core.collision_context_layout(d.naconmax).items()})
-    pairs, _ = collision_driver.collision_pairs(m)
-    layout.update({"convex." + name: spec for name, spec in collision_convex.convex_context_layout(m, d, pairs).items()})
-  return layout
-
-
-def make_position_context(m, d, arrays=None):
-  """Allocate or borrow the complete position-stage operands."""
-  arrays = allocate_work_arrays(position_work_layout(m, d), arrays, device=d.qpos.device)
-  candidate = {name.removeprefix("collision."): value for name, value in arrays.items() if name.startswith("collision.")}
-  convex = {name.removeprefix("convex."): value for name, value in arrays.items() if name.startswith("convex.")}
-  return PositionContext(
-    collision=collision_core.CollisionContext(**candidate) if candidate else None,
-    convex=collision_convex.ConvexContext(**convex) if convex else None,
-    **{name: value for name, value in arrays.items() if "." not in name},
-  )
-
-
-def integration_work_layout(m, d, *, integrator=None):
-  """Declare the operands required by the selected integration equations."""
-  integrator = m.opt.integrator if integrator is None else integrator
-  layout = {"island_can_sleep": ((d.nworld, m.ntree), int)}
-  if integrator in (IntegratorType.EULER, IntegratorType.RK4):
-    if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
-      layout.update(
-        qacc=((d.nworld, m.nv), float),
-        matrix=((d.nworld, *d.M.shape[1:]), float),
-        qLD=((d.nworld, *d.qLD.shape[1:]), float),
-        qLDiagInv=((d.nworld, m.nv), float),
-        damping_deriv=((d.nworld, m.nv), float),
-      )
-  elif integrator == IntegratorType.IMPLICIT:
-    layout.update(qacc=((d.nworld, m.nv), float), matrix=((d.nworld, m.nC), float))
-  elif integrator == IntegratorType.IMPLICITFAST:
-    flags = DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
-    if (m.opt.disableflags & flags) != flags:
-      layout.update(
-        qacc=((d.nworld, m.nv), float),
-        matrix=((d.nworld, m.nC), float),
-        qLD=((d.nworld, *d.qLD.shape[1:]), float),
-        qLDiagInv=((d.nworld, m.nv), float),
-        actuator_vel=((d.nworld, m.nactuator), float),
-      )
-  else:
-    raise NotImplementedError(f"integrator {integrator} not implemented")
-  return layout
-
-
-def make_integration_context(m, d, arrays=None, *, integrator=None):
-  """Allocate or borrow velocity-integration operands."""
-  return IntegrationContext(
-    **allocate_work_arrays(integration_work_layout(m, d, integrator=integrator), arrays, device=d.qpos.device)
-  )
-
-
-def step_work_layout(m, d):
-  """Return ``path: (shape, dtype)`` for native step work, retaining count identities.
-
-  Paths bind typed fields during preparation only. They do not participate in numerical
-  execution. The composing caller owns backing and resolves each symbolic leading axis.
-  """
-  sm, sd = solver._compact_solver_views(m, d) if m.opt.enableflags & EnableBit.SLEEP else (m, d)
-  return {
-    prefix + "." + name: spec
-    for prefix, layout in (
-      ("position", position_work_layout(m, d)),
-      ("solver", solver.solver_context_layout(sm, sd)),
-      ("integration", integration_work_layout(m, d)),
-    )
-    for name, spec in layout.items()
-  }
-
-
-def step_work_alignments(m, d):
-  """Alignment required by the solver's blocked numerical matrix operations."""
-  return {"solver.h": solver.BLOCKED_MATRIX_ALIGNMENT, "solver.hfactor": solver.BLOCKED_MATRIX_ALIGNMENT}
-
-
-def make_step_work(m, d, arrays=None) -> StepWork:
-  """Prepare native work using ordinary allocations or a complete borrowed binding."""
-  arrays = allocate_work_arrays(step_work_layout(m, d), arrays, device=d.qpos.device)
-  position = {name.removeprefix("position."): value for name, value in arrays.items() if name.startswith("position.")}
-  solving = {name.removeprefix("solver."): value for name, value in arrays.items() if name.startswith("solver.")}
-  integration = {name.removeprefix("integration."): value for name, value in arrays.items() if name.startswith("integration.")}
-  sm, sd = solver._compact_solver_views(m, d) if m.opt.enableflags & EnableBit.SLEEP else (m, d)
-  ctx = solver.create_solver_context(sm, sd, solving)
-  if m.opt.enableflags & EnableBit.SLEEP:
-    ctx.compact_m_full, ctx.compact_d_full = m, d
-  return StepWork(make_position_context(m, d, position), ctx, make_integration_context(m, d, integration))
-
-
-def validate_step_work(m, d, work):
-  """Validate native array contracts without making claims about backing or admission."""
-  from mujoco_warp._src.io import array_fields
-
-  if not isinstance(work, StepWork):
-    raise TypeError("Native step work must be a StepWork record")
-  arrays = {name: array for name, array, _ in array_fields(work)}
-  allocate_work_arrays(step_work_layout(m, d), arrays, device=d.qpos.device)
-  solver.validate_blocked_matrix(d.cM)
-  solver.validate_blocked_matrix(d.cqLD)
-  sm, _ = solver._compact_solver_views(m, d) if m.opt.enableflags & EnableBit.SLEEP else (m, d)
-  if sm.nv > solver._BLOCK_CHOLESKY_DIM:
-    solver.validate_blocked_matrix(work.solver.h)
-    solver.validate_blocked_matrix(work.solver.hfactor)
 
 
 @wp.kernel
@@ -448,7 +291,7 @@ def _next_time_builder(warn_overflow: int):
   return _next_time
 
 
-def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None, *, island_can_sleep=None):
+def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None):
   """Advance state and time given activation derivatives and acceleration."""
   # TODO(team): can we assume static timesteps?
 
@@ -519,7 +362,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None,
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
-    sleep.sleep(m, d, island_can_sleep=island_can_sleep)
+    sleep.sleep(m, d)
     fwd_velocity(m, d)
     sleep.update_sleep(m, d)
 
@@ -560,15 +403,14 @@ def _euler_damp_qfrc(
 
 
 @event_scope
-def euler(m: Model, d: Data, *, work=None):
+def euler(m: Model, d: Data):
   """Euler integrator, semi-implicit in velocity."""
-  work = make_integration_context(m, d, integrator=IntegratorType.EULER) if work is None else work
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
-    qacc = work.qacc
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
 
     # Compute damping derivative
-    damp_deriv = work.damping_deriv
+    damp_deriv = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     wp.launch(
       _compute_damping_deriv,
       dim=(d.nworld, m.nv),
@@ -578,10 +420,10 @@ def euler(m: Model, d: Data, *, work=None):
 
     # Clone M, add the damping to the diagonal, and factor-solve. factor_solve_i factors each block
     # per-block (packed dense and/or sparse LDL); the scratch qLD matches d.qLD.
-    M = work.matrix
+    M = wp.empty((d.nworld, *d.M.shape[1:]), dtype=float, device=d.qpos.device)
     wp.copy(M, d.M, extent=(d.nworld, *d.M.shape[1:]))
-    qLD = work.qLD
-    qLDiagInv = work.qLDiagInv
+    qLD = wp.empty((d.nworld, *d.qLD.shape[1:]), dtype=float, device=d.qpos.device)
+    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     wp.launch(
       _euler_damp_qfrc,
       dim=(d.nworld, m.nv),
@@ -589,9 +431,9 @@ def euler(m: Model, d: Data, *, work=None):
       outputs=[M],
     )
     smooth.factor_solve_i(m, d, M, qLD, qLDiagInv, qacc, d.efc.Ma)
-    _advance(m, d, qacc, island_can_sleep=work.island_can_sleep)
+    _advance(m, d, qacc)
   else:
-    _advance(m, d, d.qacc, island_can_sleep=work.island_can_sleep)
+    _advance(m, d, d.qacc)
 
 
 def _rk_perturb_state(
@@ -1142,12 +984,11 @@ def _launch_implicit_free_body_solve(m: Model, d: Data, qacc: wp.array2d[float])
 
 
 @event_scope
-def implicit(m: Model, d: Data, *, work=None):
+def implicit(m: Model, d: Data):
   """Integrates fully implicit in velocity."""
-  work = make_integration_context(m, d) if work is None else work
   if m.opt.integrator == IntegratorType.IMPLICIT:
     # 1. Smooth velocity derivatives into M-structure
-    qH_M = work.matrix
+    qH_M = wp.empty((d.nworld, m.nC), dtype=float, device=d.qpos.device)
     derivative.deriv_smooth_vel(m, d, qH_M)
 
     # 2. Map qH_M (M-structure) to qLU (D-structure) via mapM2D.
@@ -1164,19 +1005,18 @@ def implicit(m: Model, d: Data, *, work=None):
     derivative.deriv_rne_vel(m, d, d.qLU)
 
     # 4. Factorize and solve: qacc = qLU \ Ma
-    qacc = work.qacc
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     smooth.factor_solve_lu(m, d, d.qLU, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
-    _advance(m, d, qacc, island_can_sleep=work.island_can_sleep)
+    _advance(m, d, qacc)
   elif (m.opt.disableflags & (DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)) != (
     DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
   ):
     # qDeriv is in M-structure; qLD matches d.qLD (per-block).
-    qDeriv = work.matrix
-    qLD = work.qLD
-    qLDiagInv = work.qLDiagInv
-    actuator_vel = work.actuator_vel
-    derivative.deriv_smooth_vel(m, d, qDeriv, actuator_vel=actuator_vel)
+    qDeriv = wp.empty((d.nworld, m.nC), dtype=float, device=d.qpos.device)
+    qLD = wp.empty((d.nworld, *d.qLD.shape[1:]), dtype=float, device=d.qpos.device)
+    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
+    derivative.deriv_smooth_vel(m, d, qDeriv)
     if m.body_freeadr.size > 0:
       wp.launch(
         _implicit_free_body_reset_m,
@@ -1190,12 +1030,12 @@ def implicit(m: Model, d: Data, *, work=None):
         ],
         outputs=[qDeriv],
       )
-    qacc = work.qacc
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
-    _advance(m, d, qacc, island_can_sleep=work.island_can_sleep)
+    _advance(m, d, qacc)
   else:
-    _advance(m, d, d.qacc, island_can_sleep=work.island_can_sleep)
+    _advance(m, d, d.qacc)
 
 
 @event_scope
@@ -1219,16 +1059,14 @@ def fwd_kinematics(m: Model, d: Data):
 
 
 @event_scope
-def fwd_position(m: Model, d: Data, factorize: bool = True, *, work=None):
+def fwd_position(m: Model, d: Data, factorize: bool = True):
   """Position-dependent computations.
 
   Args:
     m: The model containing kinematic and dynamic information.
     d: The data object containing the current state and output arrays.
     factorize: Flag to factorize inertia matrix.
-    work: Optional native position-stage operands.
   """
-  work = make_position_context(m, d) if work is None else work
   fwd_kinematics(m, d)
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
@@ -1241,25 +1079,19 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, work=None):
     raise ValueError("An external collision provider requires run_collision_detection=False.")
   collision = collision_driver.collision if m.opt.run_collision_detection else m.callback.collision
   if collision is not None:
-    if m.opt.run_collision_detection:
-      collision(m, d, ctx=work.collision, convex=work.convex)
-    else:
-      collision(m, d)
+    collision(m, d)
   if sleep_enabled:
     # Contact provenance does not change wake policy or the timing of the support pass.
     sleep.wake_collision(m, d)
     awake_prev = None
     if collision is not None:
-      awake_prev = work.awake_prev
+      awake_prev = wp.empty((d.nworld, m.nbody), dtype=int, device=d.qpos.device)
       wp.copy(awake_prev, d.body_awake, extent=(d.nworld, *awake_prev.shape[1:]))
     sleep.update_sleep(m, d)
     if collision is not None:
-      if m.opt.run_collision_detection:
-        collision(m, d, awake_prev=awake_prev, ctx=work.collision, convex=work.convex)
-      else:
-        collision(m, d, awake_prev=awake_prev)
+      collision(m, d, awake_prev=awake_prev)
 
-  constraint.make_constraint(m, d, efc_nnz=work.efc_nnz)
+  constraint.make_constraint(m, d)
 
   if sleep_enabled:
     if m.neq > 0:
@@ -1267,8 +1099,8 @@ def fwd_position(m: Model, d: Data, factorize: bool = True, *, work=None):
     sleep.update_sleep(m, d)
 
   if sleep_enabled:
-    island.island(m, d, parent=work.parent)
-  smooth.transmission(m, d, moment_nnz=work.moment_nnz, body_ncon=work.body_ncon)
+    island.island(m, d)
+  smooth.transmission(m, d)
 
 
 @wp.kernel
@@ -1960,16 +1792,14 @@ def _energy_vel(m: Model, d: Data):
 
 
 @event_scope
-def forward(m: Model, d: Data, *, work=None):
+def forward(m: Model, d: Data):
   """Forward dynamics."""
-  position = make_position_context(m, d) if work is None else work.position
-  ctx = None if work is None else work.solver
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
     sleep.wake(m, d)
     sleep.update_sleep(m, d)
 
-  fwd_position(m, d, factorize=False, work=position)
+  fwd_position(m, d, factorize=False)
   d.sensordata.zero_()
   sensor.sensor_pos(m, d)
   _energy_pos(m, d)
@@ -1984,32 +1814,31 @@ def forward(m: Model, d: Data, *, work=None):
   fwd_actuation(m, d)
   fwd_acceleration(m, d, factorize=True)
 
-  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled, ctx=ctx, efc_tree=position.efc_tree)
+  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
     smooth.rne_postconstraint(m, d)
   sensor.sensor_acc(m, d, skip_rne_postconstraint=True)
 
 
 @event_scope
-def step(m: Model, d: Data, *, work=None):
+def step(m: Model, d: Data):
   """Advance simulation."""
-  work = make_step_work(m, d) if work is None else work
-  forward(m, d, work=work)
+  forward(m, d)
 
   if m.opt.integrator == IntegratorType.EULER:
-    euler(m, d, work=work.integration)
+    euler(m, d)
   elif m.opt.integrator == IntegratorType.RK4:
     rungekutta4(m, d)
   elif m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
-    implicit(m, d, work=work.integration)
+    implicit(m, d)
   else:
     raise NotImplementedError(f"integrator {m.opt.integrator} not implemented.")
 
 
 @event_scope
-def step1(m: Model, d: Data, *, work=None):
+def step1(m: Model, d: Data):
   """Advance simulation in two phases: before input is set by user."""
-  fwd_position(m, d, work=None if work is None else work.position)
+  fwd_position(m, d)
   d.sensordata.zero_()
   sensor.sensor_pos(m, d)
 
@@ -2026,22 +1855,19 @@ def step1(m: Model, d: Data, *, work=None):
 
 
 @event_scope
-def step2(m: Model, d: Data, *, work=None):
+def step2(m: Model, d: Data):
   """Advance simulation in two phases: after input is set by user."""
-  ctx = None if work is None else work.solver
-  efc_tree = None if work is None else work.position.efc_tree
-  integration = None if work is None else work.integration
   fwd_actuation(m, d)
   fwd_acceleration(m, d)
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
-  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled, ctx=ctx, efc_tree=efc_tree)
+  solver.solve(m, d, rebuild_active_dofs=not sleep_enabled, use_islands=sleep_enabled)
   if m.opt.run_rne_postconstraint or (not (m.opt.disableflags & DisableBit.SENSOR) and m.sensor_rne_postconstraint):
     smooth.rne_postconstraint(m, d)
   sensor.sensor_acc(m, d, skip_rne_postconstraint=True)
 
   # integrate with Euler or implicitfast
   if m.opt.integrator in (IntegratorType.IMPLICITFAST, IntegratorType.IMPLICIT):
-    implicit(m, d, work=integration)
+    implicit(m, d)
   else:
     # note: RK4 defaults to Euler
-    euler(m, d, work=integration)
+    euler(m, d)

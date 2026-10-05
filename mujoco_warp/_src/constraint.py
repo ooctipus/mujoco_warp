@@ -26,16 +26,10 @@ from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import vec5
 from mujoco_warp._src.types import vec6
 from mujoco_warp._src.types import vec11
-from mujoco_warp._src.warp_util import allocate_work_arrays
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
-
-
-def constraint_work_layout(m, d):
-  """Declare the per-world nonzero counter initialized by make_constraint."""
-  return {"efc_nnz": ((d.nworld,), int)}
 
 
 @wp.func
@@ -4942,11 +4936,10 @@ def _add_surface_vel(is_pyramidal: bool):
 
 
 @event_scope
-def make_constraint(m: types.Model, d: types.Data, *, efc_nnz=None):
+def make_constraint(m: types.Model, d: types.Data):
   """Creates constraint jacobians and other supporting data."""
   newton = m.opt.solver == types.SolverType.NEWTON
-  if efc_nnz is None:
-    efc_nnz = allocate_work_arrays(constraint_work_layout(m, d), device=d.qpos.device)["efc_nnz"]
+  efc_nnz = wp.empty((d.nworld,), dtype=int, device=d.qpos.device)
 
   wp.launch(
     _zero_constraint_counts,

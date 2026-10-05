@@ -15,6 +15,8 @@
 
 """Tests for smooth dynamics functions."""
 
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -890,10 +892,23 @@ class SmoothTest(parameterized.TestCase):
     _assert_eq(d.cvel.numpy()[0], mjd.cvel, "cvel")
     _assert_eq(d.cdof_dot.numpy()[0], mjd.cdof_dot, "cdof_dot")
 
-  @parameterized.parameters("pendula.xml", "actuation/site.xml", "actuation/slidercrank.xml", "actuation/adhesion.xml")
-  def test_transmission(self, xml):
-    """Tests transmission."""
-    mjm, mjd, m, d = test_data.fixture(xml)
+  @parameterized.parameters(
+    "pendula.xml",
+    "actuation/site.xml",
+    "actuation/slidercrank.xml",
+    "actuation/adhesion.xml",
+    ("actuation/adhesion.xml", True),
+    ("actuation/adhesion.xml", False, True),
+    ("actuation/adhesion.xml", True, True),
+  )
+  def test_transmission(self, xml, disable_contacts=False, captured=False):
+    """Tests transmission with dirty local counters, including body transmissions."""
+    if captured and not wp.get_device().is_cuda:
+      self.skipTest("Transparent allocation capture requires CUDA")
+    overrides = {"opt.disableflags": DisableBit.CONTACT} if disable_contacts else {}
+    mjm, mjd, m, d = test_data.fixture(xml, overrides=overrides, nworld=2)
+    if disable_contacts:
+      self.assertEqual(mjd.ncon, 0)
 
     for arr in (d.actuator_length, d.actuator_moment):
       arr.fill_(wp.inf)
@@ -907,19 +922,54 @@ class SmoothTest(parameterized.TestCase):
       mjd.moment_colind,
     )
 
-    mjw.transmission(m, d)
+    allocate = wp.empty
+
+    def poisoned_empty(*args, **kwargs):
+      array = allocate(*args, **kwargs)
+      array.fill_(-7)
+      return array
+
+    if captured:
+      record = lambda: wp.capture_transient(lambda: mjw.transmission(m, d), assume_nonescaping=True)
+      with wp.ScopedCapture(record_launches=True, record_allocations=True) as discovery:
+        record()
+      bindings, backing = [], []
+      for request in wp.capture_get_allocations(discovery.graph):
+        # Pad every row so replay must honor the supplied descriptor, not dense indexing.
+        owner = wp.empty((request.shape[0], 8 + int(np.prod(request.shape[1:]))), dtype=request.dtype)
+        array = wp.array(
+          ptr=owner.ptr,
+          shape=request.shape,
+          strides=(owner.strides[0], *owner.strides[1 : len(request.shape)]),
+          dtype=request.dtype,
+          device=d.qpos.device,
+        )
+        backing.append(owner)
+        bindings.append((request, array))
+      with wp.ScopedCapture(record_launches=True, allocation_bindings=bindings) as replay:
+        record()
+      for _ in range(2):
+        for owner in backing:
+          owner.fill_(-7)
+        wp.capture_launch(replay.graph)
+        wp.synchronize_stream()
+      for owner in backing:
+        np.testing.assert_array_equal(owner.numpy()[:, -8:], -7)
+    else:
+      with mock.patch.object(wp, "empty", side_effect=poisoned_empty):
+        mjw.transmission(m, d)
 
     actuator_moment = np.zeros((mjm.nu, mjm.nv))
-    mujoco.mju_sparse2dense(
-      actuator_moment,
-      d.actuator_moment.numpy()[0],
-      d.moment_rownnz.numpy()[0],
-      d.moment_rowadr.numpy()[0],
-      d.moment_colind.numpy()[0],
-    )
-
-    _assert_eq(d.actuator_length.numpy()[0], mjd.actuator_length, "actuator_length")
-    _assert_eq(actuator_moment, mj_actuator_moment, "actuator_moment")
+    for world in range(d.nworld):
+      mujoco.mju_sparse2dense(
+        actuator_moment,
+        d.actuator_moment.numpy()[world],
+        d.moment_rownnz.numpy()[world],
+        d.moment_rowadr.numpy()[world],
+        d.moment_colind.numpy()[world],
+      )
+      _assert_eq(d.actuator_length.numpy()[world], mjd.actuator_length, "actuator_length")
+      _assert_eq(actuator_moment, mj_actuator_moment, "actuator_moment")
 
   @parameterized.product(
     keyframe=list(range(4)), cone=list(ConeType), jacobian=[mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE]

@@ -1153,14 +1153,13 @@ def _qderiv_box_fluid(
 
 
 @event_scope
-def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel: wp.array2d[float] | None = None):
+def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
   """Analytical derivative of smooth forces w.r.t. velocities.
 
   Args:
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     out: M - dt * qDeriv (derivatives of smooth forces w.r.t velocities).
-    actuator_vel: Optional borrowed actuator-velocity scratch.
   """
   Mi = m.M_fullm_i
   Mj = m.M_fullm_j
@@ -1170,8 +1169,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], *, actuator_vel:
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
     out.zero_(extent=(d.nworld, *out.shape[1:]))
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
-      if actuator_vel is None:
-        actuator_vel = wp.empty((d.nworld, m.nactuator), dtype=float)
+      actuator_vel = wp.empty((d.nworld, m.nactuator), dtype=float, device=d.qpos.device)
       wp.launch(
         _qderiv_actuator_passive_vel,
         dim=(d.nworld, m.nactuator),

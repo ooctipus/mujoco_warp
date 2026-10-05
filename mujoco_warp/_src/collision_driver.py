@@ -917,8 +917,7 @@ def nxn_broadphase(
   # (nothing sleeps between the passes), so the condition is derived here rather than threaded in.
   cond = None
   if incremental and m.opt.graph_conditional:
-    cond = ctx.awake_changed
-    cond.zero_()
+    cond = wp.zeros(1, dtype=int, device=d.ncollision.device)
     wp.launch(_any_awake_changed, dim=(d.nworld, m.nbody), inputs=[d.body_awake, awake_prev], outputs=[cond])
 
   def _launch():
@@ -967,25 +966,19 @@ def nxn_broadphase(
     _launch()
 
 
-def collision_pairs(m):
-  """Select the native convex and primitive geometry programs in one place."""
-  convex, primitive = [], []
+def _narrowphase(m: Model, d: Data, ctx: CollisionContext):
+  convex_pairs, primitive_pairs = [], []
   for pair, kind in MJ_COLLISION_TABLE.items():
     if pair == (GeomType.BOX, GeomType.BOX) and m.opt.disableflags & DisableBit.NATIVECCD:
       kind = CollisionType.PRIMITIVE
     if kind == CollisionType.CONVEX:
-      convex.append(pair)
+      convex_pairs.append(pair)
     elif kind == CollisionType.PRIMITIVE:
-      primitive.append(pair)
-  return convex, primitive
-
-
-def _narrowphase(m: Model, d: Data, ctx: CollisionContext, convex=None):
-  convex_pairs, primitive_pairs = collision_pairs(m)
+      primitive_pairs.append(pair)
 
   # TODO(team): we should reject far-away contacts in the narrowphase instead of constraint
   #             partitioning because we can move some pressure of the atomics
-  convex_narrowphase(m, d, ctx, convex_pairs, work=convex)
+  convex_narrowphase(m, d, ctx, convex_pairs)
   primitive_narrowphase(m, d, ctx, primitive_pairs)
 
   if m.has_sdf_geom:
@@ -993,7 +986,7 @@ def _narrowphase(m: Model, d: Data, ctx: CollisionContext, convex=None):
 
 
 @event_scope
-def collision(m: Model, d: Data, awake_prev: Optional[wp.array] = None, *, ctx=None, convex=None):
+def collision(m: Model, d: Data, awake_prev: Optional[wp.array] = None):
   """Runs the full collision detection pipeline.
 
   This function orchestrates the broadphase and narrowphase collision detection stages. It
@@ -1018,7 +1011,7 @@ def collision(m: Model, d: Data, awake_prev: Optional[wp.array] = None, *, ctx=N
     d.nacon.zero_()
     return
 
-  ctx = create_collision_context(d.naconmax, device=d.ncollision.device) if ctx is None else ctx
+  ctx = create_collision_context(d.naconmax, device=d.ncollision.device)
 
   incremental = awake_prev is not None
 
@@ -1036,7 +1029,7 @@ def collision(m: Model, d: Data, awake_prev: Optional[wp.array] = None, *, ctx=N
   else:
     sap_broadphase(m, d, ctx, awake_prev)
 
-  _narrowphase(m, d, ctx, convex)
+  _narrowphase(m, d, ctx)
 
   # Flex collision is not sleeping-aware: pass 1 emits every flex contact regardless of awake state,
   # so the incremental pass has nothing to add (and re-running it would duplicate those contacts).

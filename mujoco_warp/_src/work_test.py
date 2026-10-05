@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Native work contracts, dependency boundaries and numerical reuse."""
+"""Ordinary numerical allocation, captured reuse and dependency boundaries."""
 
 import ast
 import dataclasses
+import inspect
 from pathlib import Path
 from unittest import mock
 
@@ -27,7 +28,10 @@ from absl.testing import parameterized
 
 import mujoco_warp as mjw
 from mujoco_warp import test_data
-from mujoco_warp._src import forward
+from mujoco_warp._src import collision_convex
+from mujoco_warp._src import collision_core
+from mujoco_warp._src import island
+from mujoco_warp._src import sleep
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
 
@@ -46,10 +50,24 @@ _SLEEPING_BOXES = """
 """
 
 
-class NativeWorkTest(parameterized.TestCase):
-  def test_package_has_no_managed_runtime_dependency(self):
+class NativeAllocationTest(parameterized.TestCase):
+  def test_package_has_one_numerical_path_without_managed_work(self):
     root = Path(mjw.__file__).parent
-    forbidden = {"StepBindings", "ScratchRegistry", "scratch_array"}
+    forbidden = {
+      "StepWork",
+      "PositionContext",
+      "IntegrationContext",
+      "ConvexContext",
+      "StepBindings",
+      "ScratchRegistry",
+      "scratch_array",
+      "allocate_work_arrays",
+      "make_step_work",
+      "validate_step_work",
+      "make_position_context",
+      "make_integration_context",
+      "step_work_alignments",
+    }
     for path in root.rglob("*.py"):
       if path.name.endswith("_test.py") or path.name == "conftest.py" or "test_data" in path.parts:
         continue
@@ -59,140 +77,128 @@ class NativeWorkTest(parameterized.TestCase):
           self.assertFalse({item.name for item in node.names} & forbidden, str(path))
         elif isinstance(node, ast.Import):
           self.assertFalse(any(item.name.startswith("gpu_components") for item in node.names), str(path))
-        elif isinstance(node, (ast.Name, ast.Attribute)):
-          self.assertNotIn(node.id if isinstance(node, ast.Name) else node.attr, forbidden, str(path))
-    for name in ("workspace.py", "step_program.py", "step_execution.py"):
+        elif isinstance(node, (ast.Name, ast.Attribute, ast.FunctionDef, ast.ClassDef)):
+          name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else node.name
+          self.assertNotIn(name, forbidden, str(path))
+          self.assertFalse(name.endswith(("_work_layout", "_context_layout")), str(path))
+    for name in ("workspace.py", "step_program.py", "step_execution.py", "scratch.py"):
       self.assertFalse((root / "_src" / name).exists(), name)
     self.assertNotIn("scratch", {field.name for field in dataclasses.fields(types.Data)})
-    self.assertNotIn("gpu-components", (root.parent / "pyproject.toml").read_text())
-    self.assertNotIn("gpu-components", (root.parent / "uv.lock").read_text())
+    for path in (root.parent / "pyproject.toml", root.parent / "uv.lock"):
+      self.assertNotIn("gpu-components", path.read_text())
 
-  def test_symbolic_layout_binding_and_count_identity(self):
-    _, _, m, d = test_data.fixture(xml=_SLEEPING_BOXES, nworld=2)
-    worlds, candidates, ccd = (wp.CountParameter(11) for _ in range(3))
-    execution = dataclasses.replace(d, nworld=worlds, naconmax=candidates, naccdmax=ccd)
-    layout = mjw.step_work_layout(m, execution)
-    self.assertIs(layout["position.moment_nnz"][0][0], worlds)
-    self.assertIs(layout["position.collision.collision_pair"][0][0], candidates)
-    self.assertIs(layout["position.convex.epa_vert"][0][0], ccd)
-    self.assertEqual(layout["solver.nsolving"][0], (1,))
-    arrays = {name: wp.empty(tuple(wp.upper_bound(x) for x in shape), dtype=dtype) for name, (shape, dtype) in layout.items()}
-    with mock.patch.object(wp, "empty", side_effect=AssertionError("Borrowed preparation allocated payload")):
-      work = mjw.make_step_work(m, execution, arrays)
-    self.assertEqual({name for name, _, _ in mjw.array_fields(work)}, layout.keys())
-    for name, array, _ in mjw.array_fields(work):
-      self.assertIs(array, arrays[name])
-    incomplete = dict(arrays)
-    incomplete.pop("solver.nsolving")
-    with self.assertRaisesRegex(ValueError, "exactly"):
-      mjw.make_step_work(m, execution, incomplete)
-    wrong = dict(arrays, **{"solver.nsolving": wp.empty(2, dtype=int)})
-    with self.assertRaisesRegex(ValueError, "incompatible"):
-      mjw.make_step_work(m, execution, wrong)
-    before = mjw.metadata_signature((m, d, execution, work))
-    execution.nworld = wp.CountParameter(11)
-    self.assertNotEqual(before, mjw.metadata_signature((m, d, execution, work)))
+  def test_stage_signatures_do_not_accept_borrowed_scratch(self):
+    stages = (
+      mjw.step,
+      mjw.step1,
+      mjw.step2,
+      mjw.forward,
+      mjw.fwd_position,
+      mjw.euler,
+      mjw.implicit,
+      mjw.transmission,
+      mjw.make_constraint,
+      mjw.collision,
+      solver.solve,
+      solver.solve_compact,
+      island.island,
+      island.compute_island_mapping,
+      sleep.sleep,
+      mjw.deriv_smooth_vel,
+      collision_core.create_collision_context,
+      collision_convex.convex_narrowphase,
+    )
+    forbidden = {
+      "work",
+      "arrays",
+      "convex",
+      "parent",
+      "efc_tree",
+      "efc_nnz",
+      "moment_nnz",
+      "body_ncon",
+      "island_can_sleep",
+      "actuator_vel",
+    }
+    for stage in stages:
+      self.assertFalse(forbidden & inspect.signature(stage).parameters.keys(), stage.__name__)
+    for stage in (solver.solve, solver.solve_compact, mjw.collision):
+      self.assertNotIn("ctx", inspect.signature(stage).parameters)
 
-  def test_metadata_signature_covers_work_aliases_and_native_options(self):
+  def test_metadata_signature_covers_native_aliases_and_count_identity(self):
     _, _, m, d = test_data.fixture(xml=_SLEEPING_BOXES)
-    work = mjw.make_step_work(m, d)
-    signature = mjw.metadata_signature((m, d, work))
-    self.assertEqual(signature, mjw.metadata_signature((m, d, work)))
-    self.assertFalse(any("compact_m_full" in name or "compact_d_full" in name for name, _, _ in mjw.array_fields(work)))
+    signature = mjw.metadata_signature((m, d))
     m.opt.ccd_iterations += 1
-    self.assertNotEqual(signature, mjw.metadata_signature((m, d, work)))
+    self.assertNotEqual(signature, mjw.metadata_signature((m, d)))
     m.opt.ccd_iterations -= 1
-    work.position.efc_nnz = work.position.moment_nnz
-    self.assertNotEqual(signature, mjw.metadata_signature((m, d, work)))
+    d.cdof_dot = d.cvel
+    self.assertNotEqual(signature, mjw.metadata_signature((m, d)))
+    execution = dataclasses.replace(d, nworld=wp.CountParameter(d.nworld))
+    signature = mjw.metadata_signature(execution)
+    execution.nworld = wp.CountParameter(d.nworld)
+    self.assertNotEqual(signature, mjw.metadata_signature(execution))
 
   @parameterized.parameters(mjw.IntegratorType.EULER, mjw.IntegratorType.IMPLICITFAST, mjw.IntegratorType.IMPLICIT)
-  def test_integration_reuses_native_operands(self, integrator):
+  def test_local_temporaries_are_initialized_on_each_step(self, integrator):
     mjm, mjd, _, _ = test_data.fixture(
       "pendula.xml", overrides={"opt.integrator": integrator, "opt.disableflags": mjw.DisableBit.CONTACT}
     )
     mjd.qvel[:] = np.linspace(-0.01, 0.01, mjm.nv)
     mujoco.mj_forward(mjm, mjd)
     m = mjw.put_model(mjm)
-    eager, borrowed = (mjw.put_data(mjm, mjd) for _ in range(2))
-    work = mjw.make_step_work(m, borrowed)
+    eager, dirty = (mjw.put_data(mjm, mjd) for _ in range(2))
+    allocate = wp.empty
+
+    def poisoned_empty(*args, **kwargs):
+      array = allocate(*args, **kwargs)
+      scalar = getattr(array.dtype, "_wp_scalar_type_", array.dtype)
+      value = float("nan") if scalar == wp.float32 else -7
+      array.fill_(array.dtype(value) if scalar != array.dtype else value)
+      return array
+
     for _ in range(2):
-      for _, array, _ in mjw.array_fields(work):
-        scalar = getattr(array.dtype, "_wp_scalar_type_", array.dtype)
-        poison = float("nan") if scalar == wp.float32 else -7
-        array.fill_(array.dtype(poison) if scalar != array.dtype else poison)
       mjw.step(m, eager)
-      mjw.step(m, borrowed, work=work)
+      with mock.patch.object(wp, "empty", side_effect=poisoned_empty):
+        mjw.step(m, dirty)
       for name in ("qpos", "qvel", "qacc", "qfrc_constraint"):
-        actual, expected = getattr(borrowed, name).numpy(), getattr(eager, name).numpy()
+        actual, expected = getattr(dirty, name).numpy(), getattr(eager, name).numpy()
         self.assertTrue(np.isfinite(actual).all() and np.isfinite(expected).all(), name)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5, equal_nan=False)
 
-  def test_poisoned_sleeping_collision_work_matches_ordinary(self):
+  def test_captured_step_reinitializes_poisoned_temporaries(self):
+    if not wp.get_device().is_cuda:
+      self.skipTest("Transparent allocation capture requires CUDA")
     mjm, mjd, m, _ = test_data.fixture(xml=_SLEEPING_BOXES)
     m.opt.broadphase = mjw.BroadphaseType.NXN
     m.opt.graph_conditional = True
-    eager, borrowed = (mjw.put_data(mjm, mjd, nworld=2) for _ in range(2))
-    work = mjw.make_step_work(m, borrowed)
-    mjw.validate_step_work(m, borrowed, work)
-    before = mjw.metadata_signature((m, borrowed, work))
+    eager, captured = (mjw.put_data(mjm, mjd, nworld=2) for _ in range(2))
+    # Compile before recording; Data and all stage temporaries keep ordinary numerical semantics.
+    mjw.step(m, eager)
+    captured = mjw.put_data(mjm, mjd, nworld=2)
+    eager = mjw.put_data(mjm, mjd, nworld=2)
+    record = lambda: wp.capture_transient(lambda: mjw.step(m, captured), assume_nonescaping=True)
+    with wp.ScopedCapture(record_launches=True, record_allocations=True) as discovery:
+      record()
+    bindings = tuple((r, wp.empty(r.shape, dtype=r.dtype)) for r in wp.capture_get_allocations(discovery.graph))
+    with wp.ScopedCapture(record_launches=True, allocation_bindings=bindings) as replay:
+      record()
     for _ in range(2):
-      for _, array, _ in mjw.array_fields(work):
+      for _, array in bindings:
         scalar = getattr(array.dtype, "_wp_scalar_type_", array.dtype)
-        poison = float("nan") if scalar == wp.float32 else -7
-        array.fill_(array.dtype(poison) if scalar != array.dtype else poison)
-      mjw.forward(m, eager)
-      mjw.forward(m, borrowed, work=work)
-      for name in ("qacc", "qfrc_constraint", "nefc", "nacon", "nisland"):
-        actual, expected = getattr(borrowed, name).numpy(), getattr(eager, name).numpy()
+        value = float("nan") if scalar == wp.float32 else -7
+        array.fill_(array.dtype(value) if scalar != array.dtype else value)
+      mjw.step(m, eager)
+      wp.capture_launch(replay.graph)
+      for name in ("qpos", "qvel", "qacc", "qfrc_constraint", "nefc", "nacon", "nisland"):
+        actual, expected = getattr(captured, name).numpy(), getattr(eager, name).numpy()
         self.assertTrue(np.isfinite(actual).all() and np.isfinite(expected).all(), name)
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5, equal_nan=False)
-      self.assertEqual(before, mjw.metadata_signature((m, borrowed, work)))
 
-  @parameterized.parameters(mjw.IntegratorType.EULER, mjw.IntegratorType.IMPLICIT)
-  def test_sleeping_integration_does_not_reallocate_supplied_work(self, integrator):
-    mjm, mjd, m, _ = test_data.fixture(
-      xml="""<mujoco><option><flag sleep="enable" contact="disable"/></option>
-        <worldbody><body><joint damping=".1"/><geom type="capsule" size=".1" fromto="0 0 0 0 0 1"/>
-        </body></worldbody></mujoco>""",
-      overrides={"opt.integrator": integrator},
-    )
-    eager, borrowed = (mjw.put_data(mjm, mjd) for _ in range(2))
-    work = mjw.make_step_work(m, borrowed)
-    work.integration.island_can_sleep.fill_(-7)
-    mjw.step(m, eager)
-    with mock.patch.object(wp, "ones", side_effect=AssertionError("Supplied sleep work was ignored")):
-      mjw.step(m, borrowed, work=work)
-    for name in ("qpos", "qvel", "tree_asleep"):
-      np.testing.assert_allclose(getattr(borrowed, name).numpy(), getattr(eager, name).numpy(), rtol=1e-5, atol=1e-5)
-
-  def test_standalone_stages_allocate_only_consumed_work(self):
+  def test_standalone_position_does_not_allocate_solver_state(self):
     _, _, m, d = test_data.fixture("pendula.xml")
-    with (
-      mock.patch.object(forward, "make_step_work", side_effect=AssertionError("Stage allocated complete step work")),
-      mock.patch.object(forward, "make_integration_context", side_effect=AssertionError("Stage allocated integration work")),
-    ):
-      with mock.patch.object(solver, "create_solver_context", side_effect=AssertionError("step1 allocated solver work")):
-        mjw.step1(m, d)
-      mjw.forward(m, d)
-    with mock.patch.object(forward, "make_position_context", side_effect=AssertionError("step2 allocated position work")):
-      mjw.step2(m, d)
-
-  def test_native_backing_defaults_are_not_episode_reset(self):
-    mjm = mujoco.MjModel.from_xml_string(_SLEEPING_BOXES)
-    m, d = mjw.put_model(mjm), mjw.make_data(mjm, nworld=2)
-    defaults = mjw.data_field_defaults(m, d)
-    self.assertEqual(defaults["contact.efc_address"], -1)
-    self.assertEqual(defaults["island_dofadr"], m.nv)
-    np.testing.assert_array_equal(d.contact.efc_address.numpy(), -1)
-    np.testing.assert_array_equal(d.island_dofadr.numpy(), m.nv)
-    np.testing.assert_array_equal(d.qpos.numpy(), np.tile(mjm.qpos0.astype(np.float32), (2, 1)))
-    d.nacon.fill_(7)
-    d.ncollision.fill_(9)
-    mjw.invalidate_contact_cache(d)
-    np.testing.assert_array_equal(d.nacon.numpy(), [0])
-    np.testing.assert_array_equal(d.ncollision.numpy(), [0])
+    with mock.patch.object(solver, "create_solver_context", side_effect=AssertionError("step1 allocated solver state")):
+      mjw.step1(m, d)
 
 
 if __name__ == "__main__":
-  wp.init()
   absltest.main()

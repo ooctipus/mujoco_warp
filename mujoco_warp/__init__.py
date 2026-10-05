@@ -38,7 +38,6 @@ from mujoco_warp._src.collision_primitive import primitive_narrowphase as primit
 from mujoco_warp._src.collision_sdf import sdf_narrowphase as sdf_narrowphase
 from mujoco_warp._src.constraint import make_constraint as make_constraint
 from mujoco_warp._src.derivative import deriv_smooth_vel as deriv_smooth_vel
-from mujoco_warp._src.forward import StepWork as StepWork
 from mujoco_warp._src.forward import euler as euler
 from mujoco_warp._src.forward import forward as forward
 from mujoco_warp._src.forward import fwd_acceleration as fwd_acceleration
@@ -47,13 +46,9 @@ from mujoco_warp._src.forward import fwd_kinematics as fwd_kinematics
 from mujoco_warp._src.forward import fwd_position as fwd_position
 from mujoco_warp._src.forward import fwd_velocity as fwd_velocity
 from mujoco_warp._src.forward import implicit as implicit
-from mujoco_warp._src.forward import make_step_work as make_step_work
 from mujoco_warp._src.forward import rungekutta4 as rungekutta4
 from mujoco_warp._src.forward import step1 as step1
 from mujoco_warp._src.forward import step2 as step2
-from mujoco_warp._src.forward import step_work_alignments as step_work_alignments
-from mujoco_warp._src.forward import step_work_layout as step_work_layout
-from mujoco_warp._src.forward import validate_step_work as validate_step_work
 from mujoco_warp._src.history import init_ctrl_history as init_ctrl_history
 from mujoco_warp._src.history import init_sensor_history as init_sensor_history
 from mujoco_warp._src.history import read_ctrl as read_ctrl

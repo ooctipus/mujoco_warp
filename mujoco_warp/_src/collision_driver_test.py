@@ -32,7 +32,6 @@ from mujoco_warp._src import collision_convex
 from mujoco_warp._src import collision_driver
 from mujoco_warp._src import types
 from mujoco_warp._src.collision_core import Geom
-from mujoco_warp._src.collision_core import collision_context_layout
 from mujoco_warp._src.collision_core import create_collision_context
 from mujoco_warp._src.collision_driver import MJ_COLLISION_TABLE
 from mujoco_warp._src.collision_primitive import plane_convex
@@ -76,28 +75,31 @@ def _assert_eq(a, b, name):
   np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
 
 
-class CollisionWorkTest(parameterized.TestCase):
+class CollisionAllocationTest(parameterized.TestCase):
   def test_candidate_columns_follow_their_count_identity(self):
     with wp.ScopedDevice("cpu"):
       candidates, ccd = wp.CountParameter(11), wp.CountParameter(11)
-      layout = collision_context_layout(candidates)
-      for name, (shape, _) in layout.items():
-        if name != "awake_changed":
-          self.assertIs(shape[0], candidates)
-          self.assertIsNot(shape[0], ccd)
-      context = create_collision_context(candidates)
-      arrays = {field.name: getattr(context, field.name) for field in dataclasses.fields(context)}
-      with mock.patch.object(wp, "empty", side_effect=AssertionError("Borrowed candidate allocation")):
-        rebound = create_collision_context(candidates, arrays)
-      for name, array in arrays.items():
-        self.assertIs(getattr(rebound, name), array)
+      with wp.ScopedCapture(record_allocations=True) as discovery:
+        context = create_collision_context(candidates)
+      requests = wp.capture_get_allocations(discovery.graph)
+      self.assertLen(requests, 3)
+      for request in requests:
+        self.assertIs(request.shape[0], candidates)
+        self.assertIsNot(request.shape[0], ccd)
+      arrays = tuple(wp.empty((11,), dtype=request.dtype) for request in requests)
+      with wp.ScopedCapture(allocation_bindings=tuple(zip(requests, arrays, strict=True))):
+        context = create_collision_context(candidates)
+      for supplied, actual in zip(
+        arrays, (context.collision_pair, context.collision_pairid, context.collision_worldid), strict=True
+      ):
+        self.assertIs(actual, supplied)
 
   @parameterized.parameters(
     (GeomType.BOX, GeomType.BOX, False, 4, 3, 16),
     (GeomType.CYLINDER, GeomType.MESH, True, 16, 5, 35),
     (GeomType.MESH, GeomType.MESH, False, 0, 0, 35),
   )
-  def test_convex_declarations_and_counter_initialization(self, geom1, geom2, multiccd, polygons, degree, iterations):
+  def test_convex_local_allocations_and_counter_initialization(self, geom1, geom2, multiccd, polygons, degree, iterations):
     counts = [0] * (len(GeomType) * (len(GeomType) + 1) // 2)
     counts[upper_trid_index(len(GeomType), geom1.value, geom2.value)] = 1
     model = mock.Mock(geom_pair_type_count=counts, npolygonmax=7, nmeshdegmax=5)
@@ -113,23 +115,29 @@ class CollisionWorkTest(parameterized.TestCase):
       candidates, ccd = wp.CountParameter(11), wp.CountParameter(11)
       data = mock.Mock(naconmax=candidates, naccdmax=ccd, ncollision=wp.zeros(1, dtype=int))
       pairs = [(geom1, geom2)]
-      layout = collision_convex.convex_context_layout(model, data, pairs)
-      for name, (shape, _) in layout.items():
-        if name != "nccd":
-          self.assertIs(shape[0], ccd)
-      self.assertEqual(layout["multiccd_polygon"][0][1:], (2 * polygons,))
-      self.assertEqual(layout["multiccd_pdist"][0][1:], (polygons,))
-      self.assertEqual(layout["multiccd_idx1"][0][1:], (degree,))
-      self.assertEqual(layout["epa_vert"][0][1:], (10 + 2 * iterations,))
-      work = collision_convex.create_convex_context(model, data, pairs)
-      with mock.patch.object(wp, "empty", side_effect=AssertionError("Borrowed convex allocation")):
-        for _ in range(2):
-          work.nccd.fill_(9)
-          collision_convex.convex_narrowphase(model, data, mock.Mock(), pairs, work=work)
-          np.testing.assert_array_equal(work.nccd.numpy(), np.zeros(work.nccd.shape, dtype=np.int32))
-          arguments = launch.call_args.kwargs["inputs"]
-          for field in dataclasses.fields(work):
-            self.assertTrue(any(argument is getattr(work, field.name) for argument in arguments))
+      with wp.ScopedCapture(record_allocations=True) as discovery:
+        collision_convex.convex_narrowphase(model, data, mock.Mock(), pairs)
+      requests = wp.capture_get_allocations(discovery.graph)
+      self.assertLen(requests, 18)
+      for request in requests[1:]:
+        self.assertIs(request.shape[0], ccd)
+        self.assertIsNot(request.shape[0], candidates)
+      self.assertEqual(requests[7].shape[1:], (2 * polygons,))
+      self.assertEqual(requests[10].shape[1:], (polygons,))
+      self.assertEqual(requests[11].shape[1:], (degree,))
+      self.assertEqual(requests[1].shape[1:], (10 + 2 * iterations,))
+      arrays = tuple(
+        wp.empty(tuple(wp.upper_bound(axis) for axis in request.shape), dtype=request.dtype) for request in requests
+      )
+      with wp.ScopedCapture(allocation_bindings=tuple(zip(requests, arrays, strict=True))) as final:
+        collision_convex.convex_narrowphase(model, data, mock.Mock(), pairs)
+      arguments = launch.call_args.kwargs["inputs"]
+      self.assertTrue(all(any(argument is array for argument in arguments) for array in arrays))
+      counter = arrays[0]
+      for _ in range(2):
+        counter.fill_(9)
+        wp.capture_launch(final.graph)
+        np.testing.assert_array_equal(counter.numpy(), np.zeros(counter.shape, dtype=np.int32))
 
 
 class CollisionTest(parameterized.TestCase):
