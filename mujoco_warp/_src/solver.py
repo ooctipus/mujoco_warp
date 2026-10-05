@@ -4068,9 +4068,11 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 
 
 @event_scope
-def solve(m: types.Model, d: types.Data):
+def solve(m: types.Model, d: types.Data, *, rebuild_active_dofs: bool = True):
   if m.opt.enableflags & types.EnableBit.SLEEP:
-    island.update_active_dofs(m, d)
+    # Discrete acceleration does not build this map; callers must request its rebuild.
+    if rebuild_active_dofs:
+      island.update_active_dofs(m, d)
     if m.opt.integrator != types.IntegratorType.DISCRETE:
       solve_compact(m, d)
       if m.opt.noslip_iterations > 0:
