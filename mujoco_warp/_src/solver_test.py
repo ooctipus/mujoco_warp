@@ -2001,7 +2001,12 @@ class IslandFactorTest(parameterized.TestCase):
       ("solver", types.SolverType.CG),
     ):
       m = SimpleNamespace(
-        opt=SimpleNamespace(enableflags=types.EnableBit.SLEEP, disableflags=0, solver=types.SolverType.NEWTON),
+        opt=SimpleNamespace(
+          enableflags=types.EnableBit.SLEEP,
+          disableflags=0,
+          solver=types.SolverType.NEWTON,
+          integrator=types.IntegratorType.IMPLICITFAST,
+        ),
         ntree=2,
         ntendon=0,
         nflex=0,
