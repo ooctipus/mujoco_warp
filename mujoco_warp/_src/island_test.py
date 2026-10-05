@@ -26,6 +26,45 @@ from mujoco_warp._src import island
 from mujoco_warp._src import types
 
 
+class ActiveDofCompactionTest(absltest.TestCase):
+  def test_stable_prefix_and_overflow(self):
+    """Tree chunks preserve integer maps, padding, clipping, and existing overflow bits."""
+    rng = np.random.default_rng(882)
+    for sizes in ([], [114], [6] + [1] * 108, rng.integers(0, 8, size=301)):
+      sizes = np.asarray(sizes, dtype=np.int32)
+      ntree, nv = len(sizes), int(sizes.sum())
+      starts = np.concatenate(([0], np.cumsum(sizes)[:-1])).astype(np.int32) if ntree else sizes
+      awake = rng.integers(0, 3, size=(4, ntree), dtype=np.int32)
+      awake[0], awake[1] = 1, 0
+      for limit in (nv, nv // 2):
+        with self.subTest(ntree=ntree, nvmax=limit):
+          ncdof = wp.full(4, -1, dtype=int)
+          dof_cdof, cdof_dof = wp.full((4, nv), -1, dtype=int), wp.full((4, nv + 7), -1, dtype=int)
+          overflow = wp.full(4, 2, dtype=int)
+          wp.launch_tiled(
+            island._compact_dofs_builder(0),
+            dim=4,
+            inputs=[ntree, wp.array(starts, dtype=int), wp.array(sizes, dtype=int), wp.array(awake, dtype=int), limit],
+            outputs=[ncdof, dof_cdof, cdof_dof, overflow],
+            block_dim=32,
+          )
+          expected_ncdof, expected_overflow = np.zeros(4, dtype=np.int32), np.full(4, 2, dtype=np.int32)
+          expected_forward, expected_inverse = np.full((4, nv), -1), np.full((4, nv + 7), -1)
+          for world in range(4):
+            active = [
+              dof for tree in range(ntree) if awake[world, tree] == 1 for dof in range(starts[tree], starts[tree] + sizes[tree])
+            ]
+            selected = active[:limit]
+            expected_ncdof[world] = len(selected)
+            expected_forward[world, selected] = np.arange(len(selected))
+            expected_inverse[world, : len(selected)] = selected
+            if len(active) > limit:
+              expected_overflow[world] |= int(types.OverflowType.NVMAX)
+          expected = expected_ncdof, expected_forward, expected_inverse, expected_overflow
+          for actual, reference in zip((ncdof, dof_cdof, cdof_dof, overflow), expected):
+            np.testing.assert_array_equal(actual.numpy(), reference)
+
+
 class IslandDiscoveryTopologyTest(absltest.TestCase):
   """Tests island discovery across fundamental graph topologies."""
 

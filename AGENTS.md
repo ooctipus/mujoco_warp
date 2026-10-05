@@ -10,3 +10,18 @@ See [README.md](README.md#tips-for-developers) for development setup.
   points listing changes are fine, but avoid section headers, structured templates, and emojis. A good PR description reads like
   a short paragraph to a colleague, not a form.
 - PR and commit messages are rendered on GitHub, so don't hard-wrap them at 88 columns. Let each sentence flow on one line.
+- Push branches to your own fork, not to the google-deepmind/mujoco_warp repo directly.
+- Do not add AI assistants (e.g. Claude) as commit co-authors. The mujoco_warp CLA check requires all commit authors to have signed the CLA, and AI tools cannot sign it.
+- Amending commits is fine before a PR has reviewers looking at it. Once a PR is under review, use new commits so reviewers can see what changed.
+- When responding to PR review comments:
+  - Reply to each comment individually confirming what you did (or why you didn't).
+  - Resolve comment threads that are addressed.
+  - Add a summary comment on the PR after responding, covering what was applied and what was intentionally skipped.
+
+# Code Style
+
+- Numerical island factoring requires a fresh structural partition of the current inertia and constraint support. Full stages provide that ordering through an explicit numerical option; standalone solve defaults must not infer freshness from active-DOF reuse or retained scratch. Reuse existing island CSR, never infer independence from observed zero Hessian entries. A new solve always refactors before cached factors may be reused.
+- Cooperative stages must cover every tile entry even when `launch_tiled` uses one CPU lane. Use block-uniform loop bounds and masked tile accesses so every lane reaches collective barriers; do not assume a lane exists for every logical entry.
+
+- Line length limit is 128 characters. Docstring length limit is 100 characters.
+- Prefer targeted, efficient tests over exhaustive edge-case coverage.
