@@ -771,8 +771,8 @@ def _set_inertia0(m: types.Model, d: types.Data):
     m.actuator_acc0.zero_()
 
 
-def _restore(m: types.Model, d: types.Data, groups: int):
-  """Restore state fields in d to correspond to d.qpos."""
+def restore_const_state(m: types.Model, d: types.Data, groups: int = types.SetConstGroup.ALL):
+  """Refresh current-position outputs after installing prepared constants, without changing state."""
   smooth.kinematics(m, d)
   smooth.com_pos(m, d)
   smooth.tendon(m, d)
@@ -886,7 +886,7 @@ def set_const(
       wp.copy(d.nacon, nacon_saved)
 
     if restore:
-      _restore(m, d, groups)
+      restore_const_state(m, d, groups)
 
 
 # TODO(team): remove in future version
