@@ -15,6 +15,8 @@
 
 """Tests for forward dynamics functions."""
 
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -30,7 +32,9 @@ from mujoco_warp import EnableBit
 from mujoco_warp import GainType
 from mujoco_warp import IntegratorType
 from mujoco_warp import test_data
+from mujoco_warp._src import island
 from mujoco_warp._src import sleep
+from mujoco_warp._src import solver
 from mujoco_warp._src import types
 
 # tolerance for difference between MuJoCo and mjwarp smooth calculations - mostly
@@ -45,6 +49,41 @@ def _assert_eq(a, b, name):
 
 
 class ForwardTest(parameterized.TestCase):
+  @parameterized.parameters(False, True)
+  def test_sleep_compact_maps_built_once_per_forward(self, split_step):
+    """Reuse smooth-stage maps; standalone solve must still repair invalid maps."""
+    _, _, m, d = test_data.fixture(
+      xml="""<mujoco><option><flag sleep="enable" island="enable"/></option><worldbody>
+        <geom type="plane" size="10 10 .1"/>
+        <body pos="0 0 .09"><joint type="slide" axis="0 0 1"/><geom type="sphere" size=".1"/></body>
+        <body pos="2 0 1"><joint type="slide" axis="1 0 0"/><geom type="sphere" size=".1"/></body>
+      </worldbody></mujoco>""",
+      nworld=2,
+    )
+    m.tree_sleep_policy.assign(np.array([[types.SleepPolicy.AUTO, types.SleepPolicy.ALWAYS]], dtype=np.int32))
+    if split_step:
+      mjw.step1(m, d)
+    with mock.patch.object(island, "update_active_dofs", wraps=island.update_active_dofs) as rebuild:
+      (mjw.step2 if split_step else mjw.forward)(m, d)
+      self.assertEqual(rebuild.call_count, 1)
+    if split_step:
+      return
+    names = ("ncdof", "dof_cdof", "cdof_dof", "qacc", "qfrc_constraint")
+    expected = {name: getattr(d, name).numpy().copy() for name in names}
+    self.assertTrue(np.all(expected["ncdof"] == 1))
+    d.ncdof.zero_()
+    d.dof_cdof.fill_(-7)
+    d.cdof_dof.fill_(-7)
+    with mock.patch.object(island, "update_active_dofs", wraps=island.update_active_dofs) as rebuild:
+      solver.solve(m, d)
+      self.assertEqual(rebuild.call_count, 1)
+    for name in names:
+      actual = getattr(d, name).numpy()
+      if np.issubdtype(actual.dtype, np.integer):
+        np.testing.assert_array_equal(actual, expected[name])
+      else:
+        np.testing.assert_allclose(actual, expected[name], rtol=2e-5, atol=2e-6)
+
   @parameterized.product(xml=["humanoid/humanoid.xml", "pendula.xml"])
   def test_fwd_velocity(self, xml):
     _, mjd, m, d = test_data.fixture(xml, qvel_noise=0.01, ctrl_noise=0.1)
