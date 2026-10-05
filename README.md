@@ -11,6 +11,24 @@ MJWarp is maintained by [Google DeepMind](https://deepmind.google/) and [NVIDIA]
 
 # Getting started
 
+This experimental branch exposes reusable native numerical work through
+`step_work_layout(model, data)`, `make_step_work(model, data, arrays=None)` and
+`step(model, data, work=work)`. Ordinary and supplied arrays execute the same numerical
+stages. Layout entries are `path: (shape, dtype)`; names are resolved during preparation,
+while execution receives typed contexts. `array_fields(work)` enumerates their arrays.
+GPU Components is not a dependency of MJWarp; a composing engine can choose its own
+storage, admission and graph lifecycle.
+
+Symbolic execution still requires the custom Warp `capture-launches` features:
+`CountParameter`, recorded operands and explicit memory-operation extents. The caller
+preserves each count identity, supplies arrays bounded by its maximum, and binds device
+count sources at its own composition boundary. `validate_step_work`, native alignment
+requirements and `metadata_signature` describe numerical contracts; they do not prove
+backing readiness, capture dependency order or graph retirement. Neutral
+`data_field_defaults` initialize backing bytes, not an episode: use native reset and
+state-transfer operations for physical state. Prepared feature admission belongs to the
+composing engine.
+
 MuJoCo Warp requires an NVIDIA GPU for fast simulation but supports CPU for development and debugging.
 
 **Try it now:** view a simulation of a dancing humanoid robot locally on your machine:

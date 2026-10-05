@@ -149,7 +149,8 @@ _KERNEL_CACHE = {}
 
 
 def cache_kernel(func):
-  # caching kernels to avoid crashes in graph_conditional code
+  cache = {}
+
   @functools.wraps(func)
   def wrapper(*args):
     def _hash_arg(a):
@@ -159,12 +160,19 @@ def cache_kernel(func):
         return hash(tuple(a))
       return hash(a)
 
-    key = tuple(_hash_arg(a) for a in args) + (func.__module__, func.__name__)
-    if key not in _KERNEL_CACHE:
-      _KERNEL_CACHE[key] = func(*args)
-    return _KERNEL_CACHE[key]
+    key = tuple(_hash_arg(a) for a in args)
+    if key not in cache:
+      cache[key] = func(*args)
+    return cache[key]
 
+  _KERNEL_CACHE[wrapper] = cache
   return wrapper
+
+
+def clear_kernel_cache():
+  """Regenerate future specializations without changing kernels retained by callers."""
+  for cache in _KERNEL_CACHE.values():
+    cache.clear()
 
 
 def check_toolkit_driver():

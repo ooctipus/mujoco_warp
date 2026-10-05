@@ -40,8 +40,10 @@ def _assert_eq(a, b, name):
 
 
 class DerivativeTest(parameterized.TestCase):
-  @parameterized.product(disable_actuation=(False, True), disable_damper=(False, True), disable_spring=(False, True))
-  def test_independent_actuation_and_damper_flags(self, disable_actuation, disable_damper, disable_spring):
+  @parameterized.product(
+    disable_actuation=(False, True), disable_damper=(False, True), disable_spring=(False, True), captured=(False, True)
+  )
+  def test_independent_actuation_and_damper_flags(self, disable_actuation, disable_damper, disable_spring, captured):
     """Disabling either velocity-force source must retain the other source's derivative."""
     mjm = mujoco.MjModel.from_xml_string(
       '<mujoco><option timestep="0.005" solver="Newton" integrator="implicitfast" jacobian="sparse">'
@@ -62,7 +64,12 @@ class DerivativeTest(parameterized.TestCase):
     d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
     mjw.forward(m, d)
     out = wp.empty_like(d.M)
-    mjw.deriv_smooth_vel(m, d, out)
+    if captured:
+      with wp.ScopedCapture() as capture:
+        mjw.deriv_smooth_vel(m, d, out)
+      wp.capture_launch(capture.graph)
+    else:
+      mjw.deriv_smooth_vel(m, d, out)
     expected = 0.01 + 0.005 * (0.1 * (not disable_damper) + 0.3 * (not disable_actuation))
     np.testing.assert_allclose(out.numpy(), expected, rtol=1e-6, atol=1e-8, equal_nan=False)
 

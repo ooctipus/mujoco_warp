@@ -519,10 +519,10 @@ def sap_range(
   range_out[worldid, sortedid] = limit - sortedid
 
 
-def create_collision_context(naconmax: int) -> CollisionContext:
-  """Create a CollisionContext with allocated arrays."""
+def create_collision_context(naconmax: int, *, device=None) -> CollisionContext:
+  """Allocate the candidate arrays shared by broadphase and narrowphase."""
   return CollisionContext(
-    collision_pair=wp.empty(naconmax, dtype=wp.vec2i),
-    collision_pairid=wp.empty(naconmax, dtype=wp.vec2i),
-    collision_worldid=wp.empty(naconmax, dtype=int),
+    collision_pair=wp.empty(naconmax, dtype=wp.vec2i, device=device),
+    collision_pairid=wp.empty(naconmax, dtype=wp.vec2i, device=device),
+    collision_worldid=wp.empty(naconmax, dtype=int, device=device),
   )

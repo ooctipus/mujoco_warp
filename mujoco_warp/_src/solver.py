@@ -37,8 +37,16 @@ from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
+BLOCKED_MATRIX_ALIGNMENT = 16
 _BLOCK_CHOLESKY_DIM = 32
 _ISLAND_BLOCK_DIM = 32
+
+
+def validate_blocked_matrix(array):
+  """Check storage alignment required by aligned=True blocked matrix operations."""
+  alignment = BLOCKED_MATRIX_ALIGNMENT
+  if array.size and (array.ptr % alignment or array.strides[0] % alignment or array.strides[1] % alignment):
+    raise ValueError("Blocked Cholesky matrix needs 16-byte base, world and matrix-row strides")
 
 
 def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
@@ -65,23 +73,13 @@ def create_inverse_context(m: types.Model, d: types.Data) -> InverseContext:
   )
 
 
-def _create_solver_context(
-  m: types.Model,
-  d: types.Data,
-) -> SolverContext:
-  """Create a SolverContext with allocated workspace arrays.
-
-  Args:
-    m: Model.
-    d: Data.
-
-  Returns:
-    SolverContext with allocated arrays.
-  """
+def create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
+  """Allocate algorithm-local solver state; every solve initializes required values."""
   nworld = d.nworld
   nv = m.nv
   nv_pad = m.nv_pad
   njmax = d.njmax
+  device = d.qpos.device
 
   alloc_h = m.opt.solver == types.SolverType.NEWTON
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
@@ -91,34 +89,41 @@ def _create_solver_context(
     alloc_mgrad and d.qLD.shape[1] > m.qLD_block_total and bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
   )
 
-  return SolverContext(
-    Jaref=wp.empty((nworld, njmax), dtype=float),
-    search_dot=wp.empty((nworld,), dtype=float),
-    done=wp.empty((nworld,), dtype=bool),
-    grad=wp.zeros((nworld, nv_pad), dtype=float),
-    grad_dot=wp.empty((nworld,), dtype=float),
-    newton_decrement=wp.empty((nworld,), dtype=float),
-    Mgrad=wp.empty((nworld, nv_pad), dtype=float) if alloc_mgrad else wp.empty((nworld, 0), dtype=float),
-    search=wp.empty((nworld, nv), dtype=float),
-    mv=wp.empty((nworld, nv), dtype=float),
-    jv=wp.empty((nworld, njmax), dtype=float),
-    quad=wp.empty((nworld, njmax), dtype=wp.vec3),
-    alpha=wp.empty((nworld,), dtype=float),
-    grad_scale=wp.empty((nworld,), dtype=float),
-    improvement=wp.empty((nworld,), dtype=float),
-    ls_exhausted=wp.zeros((nworld,), dtype=bool),
-    search_unchanged=wp.empty((nworld,), dtype=bool),
-    prev_grad=wp.empty((nworld, nv), dtype=float) if alloc_mgrad else wp.empty((nworld, 0), dtype=float),
-    prev_Mgrad=wp.empty((nworld, nv), dtype=float) if alloc_mgrad else wp.empty((nworld, 0), dtype=float),
-    beta=wp.empty((nworld,), dtype=float) if alloc_mgrad else wp.empty((0,), dtype=float),
-    h=wp.empty((nworld, nv_pad, nv_pad), dtype=float) if alloc_h else wp.empty((nworld, 0, 0), dtype=float),
-    hfactor=wp.empty((nworld, nv_pad, nv_pad), dtype=float) if alloc_hfactor else wp.empty((nworld, 0, 0), dtype=float),
-    quad_changed_ids=wp.empty((nworld, njmax), dtype=int) if alloc_incremental else wp.empty((nworld, 0), dtype=int),
-    quad_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
-    state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
-    solve_ld_scratch=wp.empty((nworld, nv_pad), dtype=float) if alloc_solve_ld_scratch else None,
-    inertia_scale=wp.empty((nworld,), dtype=float),
+  nh = nv_pad if alloc_h else 0
+  nhfactor = nv_pad if alloc_hfactor else 0
+  context = SolverContext(
+    Jaref=wp.empty((nworld, njmax), dtype=float, device=device),
+    search_dot=wp.empty((nworld,), dtype=float, device=device),
+    done=wp.empty((nworld,), dtype=bool, device=device),
+    grad=wp.empty((nworld, nv_pad), dtype=float, device=device),
+    grad_dot=wp.empty((nworld,), dtype=float, device=device),
+    newton_decrement=wp.empty((nworld,), dtype=float, device=device),
+    Mgrad=wp.empty((nworld, nv_pad if alloc_mgrad else 0), dtype=float, device=device),
+    search=wp.empty((nworld, nv), dtype=float, device=device),
+    mv=wp.empty((nworld, nv), dtype=float, device=device),
+    jv=wp.empty((nworld, njmax), dtype=float, device=device),
+    quad=wp.empty((nworld, njmax), dtype=wp.vec3, device=device),
+    alpha=wp.empty((nworld,), dtype=float, device=device),
+    grad_scale=wp.empty((nworld,), dtype=float, device=device),
+    improvement=wp.empty((nworld,), dtype=float, device=device),
+    ls_exhausted=wp.empty((nworld,), dtype=bool, device=device),
+    search_unchanged=wp.empty((nworld,), dtype=bool, device=device),
+    prev_grad=wp.empty((nworld, nv if alloc_mgrad else 0), dtype=float, device=device),
+    prev_Mgrad=wp.empty((nworld, nv if alloc_mgrad else 0), dtype=float, device=device),
+    beta=wp.empty((nworld if alloc_mgrad else 0,), dtype=float, device=device),
+    h=wp.empty((nworld, nh, nh), dtype=float, device=device),
+    hfactor=wp.empty((nworld, nhfactor, nhfactor), dtype=float, device=device),
+    quad_changed_ids=wp.empty((nworld, njmax if alloc_incremental else 0), dtype=int, device=device),
+    quad_changed_count=wp.empty((nworld if alloc_incremental else 0,), dtype=int, device=device),
+    state_changed_count=wp.empty((nworld if alloc_incremental else 0,), dtype=int, device=device),
+    nsolving=wp.empty((1,), dtype=int, device=device),
+    inertia_scale=wp.empty((nworld,), dtype=float, device=device),
+    solve_ld_scratch=wp.empty((nworld, nv_pad), dtype=float, device=device) if alloc_solve_ld_scratch else None,
   )
+  if m.nv > _BLOCK_CHOLESKY_DIM:
+    validate_blocked_matrix(context.h)
+    validate_blocked_matrix(context.hfactor)
+  return context
 
 
 @wp.kernel
@@ -1467,12 +1472,7 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
   """
   wp.launch_tiled(
     _linesearch_iterative_kernel(
-      m.opt.ls_iterations,
-      m.opt.cone,
-      fuse_jv,
-      m.is_sparse,
-      _use_incremental(m),
-      int(m.opt.warn_overflow),
+      m.opt.ls_iterations, m.opt.cone, fuse_jv, m.is_sparse, _use_incremental(m), int(m.opt.warn_overflow)
     ),
     dim=d.nworld,
     inputs=[
@@ -2203,11 +2203,7 @@ def _update_gradient_h_incremental_sparse(compact: bool, max_records: int = 0, d
 
 
 def _update_constraint(
-  m: types.Model,
-  d: types.Data,
-  ctx: SolverContext | InverseContext,
-  track_changes: bool = False,
-  stable_fast: bool = False,
+  m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, track_changes: bool = False, stable_fast: bool = False
 ):
   """Update constraint arrays after each solve iteration."""
   efc_inputs = [
@@ -3330,8 +3326,11 @@ def _cholesky_factorize_solve(
       block_dim=m.block_dim.update_gradient_cholesky,
     )
   else:
-    grad_column = ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1))
-    search_column = ctx.search.reshape(shape=(d.nworld, m.nv, 1))
+    grad_column, search_column = (
+      wp.array(ptr=array.ptr, dtype=array.dtype, shape=(*array.shape, 1), strides=(*array.strides, 4), device=array.device)
+      for array in (ctx.grad, ctx.search)
+    )
+    grad_column._ref, search_column._ref = ctx.grad, ctx.search
     if use_islands:
       mf, df = ctx.compact_m_full, ctx.compact_d_full
       wp.launch_tiled(
@@ -3364,14 +3363,14 @@ def _cholesky_factorize_solve(
         dim=d.nworld,
         inputs=[
           ctx.done,
-          ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)),
+          grad_column,
           ctx.h,
           ctx.quad_changed_count,
           ctx.state_changed_count if skip_noflip else ctx.quad_changed_count,
           ctx.hfactor,
         ],
         outputs=[
-          ctx.search.reshape(shape=(d.nworld, m.nv, 1)),
+          search_column,
           ctx.search_dot,
           ctx.newton_decrement,
         ],
@@ -3381,9 +3380,9 @@ def _cholesky_factorize_solve(
       wp.launch_tiled(
         _update_gradient_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad, m.nv),
         dim=d.nworld,
-        inputs=[ctx.done, ctx.grad.reshape(shape=(d.nworld, ctx.grad.shape[1], 1)), ctx.h, ctx.hfactor],
+        inputs=[ctx.done, grad_column, ctx.h, ctx.hfactor],
         outputs=[
-          ctx.search.reshape(shape=(d.nworld, m.nv, 1)),
+          search_column,
           ctx.search_dot,
           ctx.newton_decrement,
         ],
@@ -3727,7 +3726,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       threads_per_group = 1 if elliptic and wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP
       block_dim = threads_per_group if elliptic else mj.block_dim.update_gradient_JTDAJ_sparse
       jtdaj_kernel = _JTDACJ_sparse(sc, m.opt.cone, max_condim, block_dim)
-      groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax, jtdaj_kernel)
+      groups_per_world = _jtdaj_groups_per_world(wp.upper_bound(d.nworld), d.njmax, jtdaj_kernel)
       if bool(m.opt.deterministic & types.DeterminismType.ATOMICS):
         entries_per_lane = ceil((mj.nv * (mj.nv + 1) // 2) / threads_per_group)
         max_records = ceil(d.njmax / groups_per_world) * entries_per_lane
@@ -3934,7 +3933,7 @@ def _update_gradient_incremental(
     mj = ctx.compact_m_full if sc else m
     dj = ctx.compact_d_full if sc else d
     inc_kernel = _update_gradient_h_incremental_sparse(sc)
-    slots = _jtdaj_groups_per_world(d.nworld, ctx.quad_changed_ids.shape[1], inc_kernel)
+    slots = _jtdaj_groups_per_world(wp.upper_bound(d.nworld), ctx.quad_changed_ids.shape[1], inc_kernel)
     if det_atomics:
       entries_per_lane = ceil((mj.nv * (mj.nv + 1) // 2) / _JTDAJ_THREADS_PER_GROUP)
       max_records = ceil(ctx.quad_changed_ids.shape[1] / slots) * entries_per_lane
@@ -4328,7 +4327,7 @@ def init_context(
     threads_per_efc = ceil(m.nv / dofs_per_thread)
   # we need to clear the jaref array if we're doing atomic adds.
   if threads_per_efc > 1:
-    ctx.Jaref.zero_()
+    ctx.Jaref.zero_(extent=(d.nworld, *ctx.Jaref.shape[1:]))
 
   sc = _sparse_compact(ctx)
   dj = ctx.compact_d_full if sc else d
@@ -4354,13 +4353,7 @@ def init_context(
 
 
 @event_scope
-def solve(
-  m: types.Model,
-  d: types.Data,
-  *,
-  rebuild_active_dofs: bool = True,
-  use_islands: bool = False,
-):
+def solve(m: types.Model, d: types.Data, *, rebuild_active_dofs=True, use_islands=False):
   """Find constraint forces, optionally using the current position stage's tree islands.
 
   With use_islands=True, tree_island must describe the current constraint support and
@@ -4392,10 +4385,10 @@ def solve(
       return
 
   if d.njmax == 0 or m.nv == 0:
-    wp.copy(d.qacc, d.qacc_smooth)
-    d.solver_niter.fill_(0)
+    wp.copy(d.qacc, d.qacc_smooth, extent=(d.nworld, *d.qacc.shape[1:]))
+    d.solver_niter.fill_(0, extent=(d.nworld,))
   else:
-    ctx = _create_solver_context(m, d)
+    ctx = create_solver_context(m, d)
     _solve(m, d, ctx)
     if m.opt.noslip_iterations > 0:
       noslip(m, d)
@@ -4406,6 +4399,8 @@ def solve(
 
 def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, *, use_islands=False):
   """Finds forces that satisfy constraints."""
+  ctx.grad.zero_(extent=(d.nworld, *ctx.grad.shape[1:]))
+  ctx.ls_exhausted.zero_(extent=(d.nworld,))
   if m.opt.integrator == types.IntegratorType.DISCRETE:
     qfrc_smooth_eff = wp.zeros((d.nworld, m.nv_pad), dtype=float, device=d.qacc.device)
     wp.launch(
@@ -4441,9 +4436,10 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   if _use_incremental(m):
     # A new solve computes a new search direction: invalidate the mv/jv reuse
     # left over from the previous solve.
-    ctx.search_unchanged.zero_()
+    ctx.search_unchanged.zero_(extent=(d.nworld, *ctx.search_unchanged.shape[1:]))
 
-  nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
+  nsolving = ctx.nsolving
+  nsolving.fill_(d.nworld)
 
   # CG search = -Mgrad
   if m.opt.solver == types.SolverType.CG:
@@ -4775,26 +4771,14 @@ def _gather_J_dense(
       J_c_out[worldid, efcid, cj] = J_in[worldid, efcid, j]
 
 
-@event_scope
-def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False):
-  """Run the dense Newton constraint solver in compacted DOF space.
-
-  Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
-  into nvmax_pad-sized dense workspaces, runs the stock dense Newton solver on a
-  shallow-replaced (m, d) at nvmax_pad, then scatters qacc/qfrc_constraint back.
-  Inactive DOFs are frozen to 0. On the incremental Newton path the solver
-  kernels read the sparse M and J directly through the compaction maps. With use_islands=True,
-  the caller must supply current compact maps and an island CSR partition of both inertia
-  and constraint support. Public solve applies the feature gates and builds that CSR.
-  """
-  _compact_gather(m, d)
-
+def _compact_solver_views(m: types.Model, d: types.Data):
+  """Express compact numerical fields in the dense solver's coordinates."""
   # shallow-replace (m, d) so the stock dense Newton solver runs at nvmax_pad.
   # Keep graph-conditional early-exit on CUDA (matches baseline: stops at convergence
   # instead of running all iterations); fall back to the plain loop on CPU.
   nvp = d.nvmax_pad
-  gc = m.opt.graph_conditional and wp.get_device().is_cuda
-  opt2 = dataclasses.replace(m.opt, graph_conditional=gc)
+  gc = m.opt.graph_conditional and d.qpos.device.is_cuda
+  opt2 = dataclasses.replace(m.opt, graph_conditional=gc, tolerance=d.ctol, ls_tolerance=d.cls_tol)
   m2 = dataclasses.replace(
     m, opt=opt2, nv=nvp, nv_pad=nvp, is_sparse=False, dof_tri_row=d.cdof_tri_row, dof_tri_col=d.cdof_tri_col
   )
@@ -4809,12 +4793,27 @@ def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False):
     qfrc_constraint=d.cqfrc_constraint,
     efc=efc2,
   )
+  return m2, d2
 
-  sctx = _create_solver_context(m2, d2)
-  # compact kernels read the full-coordinate sparse structures (M, J) through
-  # the compaction maps instead of dense products on gathered blocks
-  sctx.compact_m_full = m
-  sctx.compact_d_full = d
+
+@event_scope
+def solve_compact(m: types.Model, d: types.Data, *, use_islands: bool = False):
+  """Run the dense Newton constraint solver in compacted DOF space.
+
+  Gathers the active-DOF inertia, constraint Jacobian, and smooth/warmstart vectors
+  into nvmax_pad-sized dense workspaces, runs the stock dense Newton solver on a
+  shallow-replaced (m, d) at nvmax_pad, then scatters qacc/qfrc_constraint back.
+  Inactive DOFs are frozen to 0. On the incremental Newton path the solver
+  kernels read the sparse M and J directly through the compaction maps. With use_islands=True,
+  the caller must supply current compact maps and an island CSR partition of both inertia
+  and constraint support. Public solve applies the feature gates and builds that CSR.
+  """
+  _compact_gather(m, d)
+
+  m2, d2 = _compact_solver_views(m, d)
+  sctx = create_solver_context(m2, d2)
+  # Compact kernels read the full-coordinate sparse structures through the compaction maps.
+  sctx.compact_m_full, sctx.compact_d_full = m, d
   _solve(m2, d2, sctx, compact=True, use_islands=use_islands)
 
   _compact_scatter(m, d)
@@ -4838,7 +4837,7 @@ def _compact_gather(m: types.Model, d: types.Data):
       inputs=[m.M_rownnz, m.M_rowadr, m.M_colind, d.M, d.dof_cdof],
       outputs=[d.cM],
     )
-    d.cJ.zero_()
+    d.cJ.zero_(extent=(d.nworld, *d.cJ.shape[1:]))
     wp.launch(
       _gather_J_dense,
       dim=(d.nworld, d.njmax),

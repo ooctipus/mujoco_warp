@@ -578,7 +578,7 @@ class SolverTest(parameterized.TestCase):
       # solve with 0 iterations just initializes constraints and then exits
       d.efc.force.fill_(wp.inf)
       d.qfrc_constraint.fill_(wp.inf)
-      ctx = solver._create_solver_context(m, d)
+      ctx = solver.create_solver_context(m, d)
       solver._solve(m, d, ctx)
 
       # Get the ordering indices based on efc_force, efc_state for MJWarp
@@ -627,7 +627,7 @@ class SolverTest(parameterized.TestCase):
       mjw.step(m, d)
 
       # Create a SolverContext to access internal solver arrays
-      ctx = solver._create_solver_context(m, d)
+      ctx = solver.create_solver_context(m, d)
       solver._solve(m, d, ctx)
 
       # Calculate target values
@@ -692,7 +692,7 @@ class SolverTest(parameterized.TestCase):
     )
 
     # Create SolverContext and initialize
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     solver.init_context(m, d, ctx, grad=True)
 
     # Calculate Mgrad with Mujoco C
@@ -715,7 +715,7 @@ class SolverTest(parameterized.TestCase):
       },
     )
 
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     _set_inertia_scale(m, d, ctx)
 
     d.ne = wp.array([0], dtype=int)
@@ -784,7 +784,7 @@ class SolverTest(parameterized.TestCase):
         "opt.ls_iterations": 50,
       },
     )
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
 
     # Exercise derivative convergence with a loose scaled tolerance.
     ctx.inertia_scale.fill_(1.0 / (1.0e9 * m.nv))
@@ -1006,7 +1006,7 @@ class SolverTest(parameterized.TestCase):
       nworld=nworld,
       njmax=2,
     )
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     _set_inertia_scale(m, d, ctx)
 
     # cost 0.5 * (alpha - target)^2 from an equality row plus 0.5 * (alpha - 1)^2 from an
@@ -1059,7 +1059,7 @@ class SolverTest(parameterized.TestCase):
         "opt.ls_iterations": 0,
       },
     )
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
 
     ctx.inertia_scale.fill_(1.0 / (1.0e9 * m.nv))
     d.ne = wp.array([1], dtype=int)
@@ -1176,7 +1176,7 @@ class SolverTest(parameterized.TestCase):
     self.assertEqual(set(mjd.contact.dim[: mjd.ncon]), set(condims))
 
     d = mjw.put_data(mjm, mjd)
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     solver.init_context(m, d, ctx, grad=True)
     fused_h = ctx.h.numpy().copy()
 
@@ -1282,7 +1282,7 @@ class SolverTest(parameterized.TestCase):
     self.assertEqual(set(mjd.contact.dim[: mjd.ncon]), set(condims))
 
     d = mjw.put_data(mjm, mjd)
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     solver.init_context(m, d, ctx, grad=True)
     ctx.h.zero_()
     ctx.done.fill_(False)
@@ -1344,7 +1344,7 @@ class SolverTest(parameterized.TestCase):
     mujoco.mj_forward(mjm, mjd)
 
     d = mjw.put_data(mjm, mjd)
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     solver.init_context(m, d, ctx, grad=True)
     jaref = ctx.Jaref.numpy().copy()
 
@@ -2042,7 +2042,7 @@ class SolverTest(parameterized.TestCase):
         d.qacc.zero_()
         d.qfrc_constraint.zero_()
         d.efc.force.zero_()
-        ctx = solver._create_solver_context(m, d)
+        ctx = solver.create_solver_context(m, d)
         solver.init_context(m, d, ctx, grad=True)
         any_changes = False
         ctx.search_unchanged.fill_(False)
@@ -2399,8 +2399,58 @@ def _put_compact(xml: str, nvmax: int | None = None, sparse: bool = False):
 class CompactSolverTest(parameterized.TestCase):
   """Tests for the compacted smooth and constrained solves (solver.py compact path)."""
 
-  @parameterized.product(poison=(17.0, np.nan), warmstart=(False, True))
-  def test_unconstrained_compact_force_initialization(self, poison, warmstart):
+  @parameterized.parameters(0, 1)
+  def test_local_solver_rejects_unaligned_hessian(self, matrix_index):
+    """Allocation substitution must preserve both Hessian and factor alignment."""
+    model = SimpleNamespace(nv=40, nv_pad=64, opt=SimpleNamespace(solver=SolverType.NEWTON, cone=ConeType.PYRAMIDAL))
+    data = SimpleNamespace(nworld=2, njmax=3, qpos=wp.empty((2, 40), dtype=float))
+    backing = wp.empty(2 * 64 * 64 + 1, dtype=float, device=data.qpos.device)
+    misaligned = wp.array(ptr=backing.ptr + 4, shape=(2, 64, 64), dtype=float, device=data.qpos.device)
+    allocate, matrices = wp.empty, []
+
+    def substitute(shape, **kwargs):
+      if len(shape) == 3 and all(shape):
+        matrices.append(shape)
+        if len(matrices) - 1 == matrix_index:
+          return misaligned
+      return allocate(shape, **kwargs)
+
+    with mock.patch.object(wp, "empty", side_effect=substitute):
+      with self.assertRaisesRegex(ValueError, "16-byte"):
+        solver.create_solver_context(model, data)
+
+  @parameterized.parameters(False, True)
+  def test_poisoned_solver_state_matches_clean(self, compact):
+    """Every solve initializes its local algorithm state, including dirty allocation bytes."""
+    xml = _COMPACT_CONTACT_XML
+    if compact:
+      xml = xml.replace('iterations="20"/>', 'iterations="20"><flag sleep="enable"/></option>')
+    _, _, m, d = _put_compact(xml)
+    mjw.forward(m, d)
+    self.assertGreater(d.nacon.numpy()[0], 0)
+    solver.solve(m, d)
+    expected = {name: getattr(d, name).numpy().copy() for name in ("qacc", "qfrc_constraint")}
+    allocate = solver.create_solver_context
+
+    def poisoned_context(model, data):
+      context = allocate(model, data)
+      for _, column, _ in mjw.array_fields(context):
+        if column.dtype == wp.vec3:
+          column.fill_(wp.vec3(float("nan")))
+        else:
+          column.fill_(float("nan") if column.dtype == wp.float32 else -7)
+      return context
+
+    with mock.patch.object(solver, "create_solver_context", side_effect=poisoned_context):
+      for _ in range(2):
+        solver.solve(m, d)
+        for name, reference in expected.items():
+          actual = getattr(d, name).numpy()
+          self.assertTrue(np.isfinite(reference).all() and np.isfinite(actual).all(), name)
+          np.testing.assert_allclose(actual, reference, rtol=1e-6, atol=1e-6, equal_nan=False, err_msg=name)
+
+  @parameterized.product(poison=(17.0, np.nan), captured=(False, True), warmstart=(False, True))
+  def test_unconstrained_compact_force_initialization(self, poison, captured, warmstart):
     """A compact sparse solve owns its zero-constraint force, including on reused allocations."""
     bodies = "".join(
       f'<body pos="{i * 0.1} 0 1"><joint type="slide" axis="0 0 1"/><geom type="sphere" size="0.02" mass="1"/></body>'
@@ -2418,10 +2468,18 @@ class CompactSolverTest(parameterized.TestCase):
     m.opt.graph_conditional = True
     d = mjw.make_data(mjm, nworld=2, nconmax=64, nccdmax=64, njmax=64)
     self.assertTrue(m.is_sparse)
+    if captured:
+      if not d.qpos.device.is_cuda:
+        self.skipTest("CUDA graph replay requires a CUDA device")
+      with wp.ScopedCapture() as capture:
+        mjw.forward(m, d)
     for _ in range(2):
       # This covers both uninitialized nonfinite bytes and stale finite force from an earlier solve.
       d.cqfrc_constraint.fill_(poison)
-      mjw.forward(m, d)
+      if captured:
+        wp.capture_launch(capture.graph)
+      else:
+        mjw.forward(m, d)
       np.testing.assert_array_equal(d.nefc.numpy(), [0, 0])
       np.testing.assert_array_equal(d.cqfrc_constraint.numpy(), np.zeros(d.cqfrc_constraint.shape))
       np.testing.assert_allclose(d.qfrc_constraint.numpy(), 0.0, atol=1e-6, equal_nan=False)
@@ -2573,7 +2631,7 @@ class CompactSolverTest(parameterized.TestCase):
     solver.derivative.eff_build(m, d)
     efm_L_unfolded = d.efm_L.numpy().copy()
 
-    ctx = solver._create_solver_context(m, d)
+    ctx = solver.create_solver_context(m, d)
     solver.init_context(m, d, ctx, grad=True)
     efm_L_folded = d.efm_L.numpy()
     self.assertFalse(np.allclose(efm_L_unfolded, efm_L_folded))

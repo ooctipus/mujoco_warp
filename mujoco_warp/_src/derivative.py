@@ -1283,9 +1283,9 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
   velocity_force_flags = DisableBit.ACTUATION | DisableBit.DAMPER
   if (m.opt.disableflags & velocity_force_flags) != velocity_force_flags:
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
-    out.zero_()
+    out.zero_(extent=(d.nworld, *out.shape[1:]))
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
-      vel = wp.empty((d.nworld, m.nactuator), dtype=float)
+      actuator_vel = wp.empty((d.nworld, m.nactuator), dtype=float, device=d.qpos.device)
       wp.launch(
         _qderiv_actuator_passive_vel,
         dim=(d.nworld, m.nactuator),
@@ -1314,7 +1314,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
           d.actuator_velocity,
           d.actuator_force,
         ],
-        outputs=[vel],
+        outputs=[actuator_vel],
       )
       # out (qDeriv) is in M-structure.
       det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
@@ -1327,7 +1327,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
           d.moment_rowadr,
           d.moment_colind,
           d.actuator_moment,
-          vel,
+          actuator_vel,
         ],
         outputs=[out],
       )
@@ -1357,7 +1357,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
     )
   else:
     # TODO(team): directly utilize M for these settings
-    wp.copy(out, d.M)
+    wp.copy(out, d.M, extent=(d.nworld, *out.shape[1:]))
 
   if not (m.opt.disableflags & DisableBit.DAMPER):
     wp.launch(
