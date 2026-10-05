@@ -22,5 +22,7 @@
 - Numerical island factoring requires a fresh structural partition of the current inertia and constraint support. Full stages provide that ordering through an explicit numerical option; standalone solve defaults must not infer freshness from active-DOF reuse or retained scratch. Reuse existing island CSR, never infer independence from observed zero Hessian entries. A new solve always refactors before cached factors may be reused.
 - Cooperative stages must cover every tile entry even when `launch_tiled` uses one CPU lane. Use block-uniform loop bounds and masked tile accesses so every lane reaches collective barriers; do not assume a lane exists for every logical entry.
 
+- Initialize physical quantities according to their equations, independently of compact/sparse storage flags. Test first-write behavior with poisoned storage and reject nonfinite values in numerical parity checks.
+
 - Line length limit is 128 characters. Docstring length limit is 100 characters.
 - Prefer targeted, efficient tests over exhaustive edge-case coverage.

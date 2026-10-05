@@ -1194,7 +1194,8 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
   Mi = m.M_fullm_i
   Mj = m.M_fullm_j
 
-  if not (m.opt.disableflags & (DisableBit.ACTUATION | DisableBit.DAMPER)):
+  velocity_force_flags = DisableBit.ACTUATION | DisableBit.DAMPER
+  if (m.opt.disableflags & velocity_force_flags) != velocity_force_flags:
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
     out.zero_()
     if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):

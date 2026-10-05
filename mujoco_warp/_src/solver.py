@@ -1627,9 +1627,8 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext):
 
 
 @cache_kernel
-def _solve_init_dof(warmstart: bool, sparse: bool):
+def _solve_init_dof(warmstart: bool):
   WARMSTART = warmstart
-  SPARSE = sparse
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
@@ -1651,9 +1650,10 @@ def _solve_init_dof(warmstart: bool, sparse: bool):
     else:
       qacc_out[worldid, dofid] = qacc_smooth_in[worldid, dofid]
 
-    if wp.static(SPARSE):
-      if nefc_in[worldid] == 0:
-        qfrc_constraint_out[worldid, dofid] = 0.0
+    # Constraint-free worlds have no accumulation pass to initialize this force.
+    # This invariant also holds for dense compact views of sparse full models.
+    if nefc_in[worldid] == 0:
+      qfrc_constraint_out[worldid, dofid] = 0.0
 
   return kernel
 
@@ -4262,7 +4262,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
 
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
-    _solve_init_dof(warmstart, m.is_sparse),
+    _solve_init_dof(warmstart),
     dim=(d.nworld, m.nv),
     inputs=[d.nefc, d.qacc_warmstart, d.qacc_smooth],
     outputs=[d.qacc, d.qfrc_constraint],
