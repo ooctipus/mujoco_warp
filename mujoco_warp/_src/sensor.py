@@ -813,7 +813,7 @@ def _sensor_collision(
 @event_scope
 def sensor_pos(m: Model, d: Data):
   """Compute position-dependent sensor values."""
-  if m.opt.disableflags & DisableBit.SENSOR:
+  if not m.nsensor or m.opt.disableflags & DisableBit.SENSOR:
     return
 
   # rangefinder
@@ -1435,7 +1435,7 @@ def _sensor_vel(
 @event_scope
 def sensor_vel(m: Model, d: Data):
   """Compute velocity-dependent sensor values."""
-  if m.opt.disableflags & DisableBit.SENSOR:
+  if not m.nsensor or m.opt.disableflags & DisableBit.SENSOR:
     return
 
   if m.sensor_subtree_vel:
@@ -2582,7 +2582,7 @@ def _contact_sort(maxmatch: int):
 @event_scope
 def sensor_acc(m: Model, d: Data, skip_rne_postconstraint: bool = False):
   """Compute acceleration-dependent sensor values."""
-  if m.opt.disableflags & DisableBit.SENSOR:
+  if not m.nsensor or m.opt.disableflags & DisableBit.SENSOR:
     return
 
   wp.launch(

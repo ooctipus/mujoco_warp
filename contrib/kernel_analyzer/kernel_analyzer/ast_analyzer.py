@@ -408,6 +408,9 @@ def analyze(source: str, filename: str, type_source: str) -> List[Issue]:
           expected_type = "float"
         elif "wp.bool" in param_type:
           expected_type = "bool"
+      elif {member.strip() for member in expected_type.split("|")} == {"int", "wp.CountParameter"}:
+        # Host count operands lower to int32 values before kernel invocation.
+        expected_type = "int"
       elif expected_type.startswith("array("):
         # array(...) is our custom annotation that we can translate to wp.array
         expected_dtype = expected_type[expected_type.rfind(" ") + 1 : -1]

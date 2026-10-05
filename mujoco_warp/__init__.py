@@ -56,12 +56,22 @@ from mujoco_warp._src.history import read_ctrl as read_ctrl
 from mujoco_warp._src.history import read_sensor as read_sensor
 from mujoco_warp._src.history import reset_history as reset_history
 from mujoco_warp._src.inverse import inverse as inverse
+from mujoco_warp._src.io import array_fields as array_fields
+from mujoco_warp._src.io import copy_worlds as copy_worlds
+from mujoco_warp._src.io import data_field_alignments as data_field_alignments
+from mujoco_warp._src.io import data_field_defaults as data_field_defaults
 from mujoco_warp._src.io import get_data_into as get_data_into
+from mujoco_warp._src.io import invalidate_contact_cache as invalidate_contact_cache
 from mujoco_warp._src.io import make_data as make_data
+from mujoco_warp._src.io import metadata_signature as metadata_signature
 from mujoco_warp._src.io import put_data as put_data
 from mujoco_warp._src.io import put_model as put_model
+from mujoco_warp._src.io import replace_arrays as replace_arrays
+from mujoco_warp._src.io import replicate_data as replicate_data
+from mujoco_warp._src.io import replicate_model as replicate_model
 from mujoco_warp._src.io import reset_data as reset_data
 from mujoco_warp._src.io import reset_data_keyframe as reset_data_keyframe
+from mujoco_warp._src.io import validate_data_layout as validate_data_layout
 from mujoco_warp._src.island import island as island
 from mujoco_warp._src.passive import passive as passive
 from mujoco_warp._src.ray import ray as ray
@@ -100,6 +110,7 @@ from mujoco_warp._src.smooth import tendon as tendon
 from mujoco_warp._src.smooth import transmission as transmission
 from mujoco_warp._src.solver import solve as solve
 from mujoco_warp._src.support import contact_force as contact_force
+from mujoco_warp._src.support import contact_force_fn as contact_force_fn
 from mujoco_warp._src.support import get_state as get_state
 from mujoco_warp._src.support import jac as jac
 from mujoco_warp._src.support import mul_m as mul_m
@@ -131,3 +142,4 @@ from mujoco_warp._src.types import SolverType as SolverType
 from mujoco_warp._src.types import State as State
 from mujoco_warp._src.types import Statistic as Statistic
 from mujoco_warp._src.types import TrnType as TrnType
+from mujoco_warp._src.types import vec5 as vec5

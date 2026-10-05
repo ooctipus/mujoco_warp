@@ -385,7 +385,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
     outputs=[d.time, d.overflow],
   )
 
-  wp.copy(d.qacc_warmstart, d.qacc)
+  wp.copy(d.qacc_warmstart, d.qacc, extent=(d.nworld, *d.qacc_warmstart.shape[1:]))
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
@@ -434,10 +434,10 @@ def euler(m: Model, d: Data):
   """Euler integrator, semi-implicit in velocity."""
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
 
     # Compute damping derivative
-    damp_deriv = wp.empty((d.nworld, m.nv), dtype=float)
+    damp_deriv = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     wp.launch(
       _compute_damping_deriv,
       dim=(d.nworld, m.nv),
@@ -447,9 +447,10 @@ def euler(m: Model, d: Data):
 
     # Clone M, add the damping to the diagonal, and factor-solve. factor_solve_i factors each block
     # per-block (packed dense and/or sparse LDL); the scratch qLD matches d.qLD.
-    M = wp.clone(d.M)
-    qLD = wp.empty_like(d.qLD)
-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
+    M = wp.empty((d.nworld, *d.M.shape[1:]), dtype=float, device=d.qpos.device)
+    wp.copy(M, d.M, extent=(d.nworld, *d.M.shape[1:]))
+    qLD = wp.empty((d.nworld, *d.qLD.shape[1:]), dtype=float, device=d.qpos.device)
+    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     wp.launch(
       _euler_damp_qfrc,
       dim=(d.nworld, m.nv),
@@ -1244,7 +1245,7 @@ def implicit(m: Model, d: Data):
   """Integrates fully implicit in velocity."""
   if m.opt.integrator == IntegratorType.IMPLICIT:
     # 1. Smooth velocity derivatives into M-structure
-    qH_M = wp.empty((d.nworld, m.nC), dtype=float)
+    qH_M = wp.empty((d.nworld, m.nC), dtype=float, device=d.qpos.device)
     derivative.deriv_smooth_vel(m, d, qH_M)
 
     # 2. Map qH_M (M-structure) to qLU (D-structure) via mapM2D.
@@ -1261,17 +1262,17 @@ def implicit(m: Model, d: Data):
     derivative.deriv_rne_vel(m, d, d.qLU)
 
     # 4. Factorize and solve: qacc = qLU \ Ma
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     smooth.factor_solve_lu(m, d, d.qLU, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
     _advance(m, d, qacc)
   elif (m.opt.disableflags & (DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)) != (
     DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER
   ):
-    # qDeriv is in M-structure; the scratch qLD matches d.qLD (per-block).
-    qDeriv = wp.empty((d.nworld, m.nC), dtype=float)
-    qLD = wp.empty_like(d.qLD)
-    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
+    # qDeriv is in M-structure; qLD matches d.qLD (per-block).
+    qDeriv = wp.empty((d.nworld, m.nC), dtype=float, device=d.qpos.device)
+    qLD = wp.empty((d.nworld, *d.qLD.shape[1:]), dtype=float, device=d.qpos.device)
+    qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     derivative.deriv_smooth_vel(m, d, qDeriv)
     if m.body_freeadr.size > 0:
       wp.launch(
@@ -1286,7 +1287,7 @@ def implicit(m: Model, d: Data):
         ],
         outputs=[qDeriv],
       )
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, device=d.qpos.device)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
     _launch_implicit_free_body_solve(m, d, qacc)
     _advance(m, d, qacc)
@@ -1339,7 +1340,10 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
   if sleep_enabled:
     # Contact provenance does not change wake policy or the timing of the support pass.
     sleep.wake_collision(m, d)
-    awake_prev = wp.clone(d.body_awake) if collision is not None else None
+    awake_prev = None
+    if collision is not None:
+      awake_prev = wp.empty((d.nworld, m.nbody), dtype=int, device=d.qpos.device)
+      wp.copy(awake_prev, d.body_awake, extent=(d.nworld, *awake_prev.shape[1:]))
     sleep.update_sleep(m, d)
     if collision is not None:
       collision(m, d, awake_prev=awake_prev)
@@ -1860,9 +1864,9 @@ def _qfrc_actuator_gravcomp_limits(
 def fwd_actuation(m: Model, d: Data):
   """Actuation-dependent computations."""
   if not m.nactuator or (m.opt.disableflags & DisableBit.ACTUATION):
-    d.act_dot.zero_()
-    d.qfrc_actuator.zero_()
-    d.actuator_force.zero_()
+    d.act_dot.zero_(extent=(d.nworld, *d.act_dot.shape[1:]))
+    d.qfrc_actuator.zero_(extent=(d.nworld, *d.qfrc_actuator.shape[1:]))
+    d.actuator_force.zero_(extent=(d.nworld, *d.actuator_force.shape[1:]))
   else:
     # read delayed ctrl (or direct copy if no delay)
     if m.nhistory > 0:
@@ -1931,7 +1935,7 @@ def fwd_actuation(m: Model, d: Data):
       )
 
     # TODO(team): optimize performance
-    d.qfrc_actuator.zero_()
+    d.qfrc_actuator.zero_(extent=(d.nworld, *d.qfrc_actuator.shape[1:]))
     wp.launch(
       _qfrc_actuator,
       dim=(d.nworld, m.nactuator),
@@ -2043,7 +2047,7 @@ def _energy_pos(m: Model, d: Data):
     if m.sensor_e_potential == 0:  # not computed by sensor
       sensor.energy_pos(m, d)
   else:
-    d.energy.zero_()
+    d.energy.zero_(extent=(d.nworld, *d.energy.shape[1:]))
 
 
 def _energy_vel(m: Model, d: Data):
