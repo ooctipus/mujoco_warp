@@ -631,6 +631,28 @@ def set_const_fixed(m: types.Model, d: types.Data):
     )
 
 
+def restore_const_state(m: types.Model, d: types.Data):
+  """Refresh current-position data after installing prepared model constants.
+
+  Rebuilds kinematics, the mass matrix and factorization, and transmissions at
+  ``d.qpos`` and the current mocap poses. Does not recompute reference constants
+  or modify positions, velocities, controls, time, or solver warm starts.
+
+  Args:
+    m: The model with its reference constants already installed (device).
+    d: The current state and derived output arrays (device).
+  """
+  smooth.kinematics(m, d)
+  smooth.com_pos(m, d)
+  smooth.camlight(m, d)
+  smooth.flex(m, d)
+  smooth.tendon(m, d)
+  smooth.crb(m, d)
+  smooth.tendon_armature(m, d)
+  smooth.factor_m(m, d)
+  smooth.transmission(m, d)
+
+
 def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
   """Compute quantities that depend on qpos0.
 
@@ -833,15 +855,7 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
   wp.copy(d.qpos, qpos_saved)
 
   if restore:
-    smooth.kinematics(m, d)
-    smooth.com_pos(m, d)
-    smooth.camlight(m, d)
-    smooth.flex(m, d)
-    smooth.tendon(m, d)
-    smooth.crb(m, d)
-    smooth.tendon_armature(m, d)
-    smooth.factor_m(m, d)
-    smooth.transmission(m, d)
+    restore_const_state(m, d)
 
 
 def set_const_spring(m: types.Model, d: types.Data, restore: bool = True):
@@ -938,15 +952,7 @@ def set_const(m: types.Model, d: types.Data, restore: bool = True):
   set_const_spring(m, d, restore=False)
 
   if restore:
-    smooth.kinematics(m, d)
-    smooth.com_pos(m, d)
-    smooth.camlight(m, d)
-    smooth.flex(m, d)
-    smooth.tendon(m, d)
-    smooth.crb(m, d)
-    smooth.tendon_armature(m, d)
-    smooth.factor_m(m, d)
-    smooth.transmission(m, d)
+    restore_const_state(m, d)
 
 
 def set_length_range(m: types.Model, d: types.Data, index: int = -1):
