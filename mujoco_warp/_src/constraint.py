@@ -5497,11 +5497,11 @@ def make_constraint(m: types.Model, d: types.Data):
         else:
           # Loop over the active contacts with a GPU-sized grid rather than launching naconmax
           # threads; several waves, since longer per-thread loops over contacts are slower.
-          ncontact_per_pass = d.naconmax
+          ncontact_per_pass = wp.upper_bound(d.naconmax)
           if wp.get_device().is_cuda:
             ncontact_per_pass = min(ncontact_per_pass, 1024 * wp.get_device().sm_count)
           ncontact_stride = max(ncontact_per_pass, 1)
-          max_records = ((d.naconmax + ncontact_stride - 1) // ncontact_stride) * nmaxdim if det_atomics else 0
+          max_records = ((wp.upper_bound(d.naconmax) + ncontact_stride - 1) // ncontact_stride) * nmaxdim if det_atomics else 0
           wp.launch(
             _efc_contact_jac_sparse(m.opt.cone, nmaxdim, max_records, det_atomics),
             dim=ncontact_stride * _CONTACT_JAC_LANES,

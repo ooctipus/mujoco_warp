@@ -4778,7 +4778,7 @@ def _compact_solver_views(m: types.Model, d: types.Data):
   # instead of running all iterations); fall back to the plain loop on CPU.
   nvp = d.nvmax_pad
   gc = m.opt.graph_conditional and d.qpos.device.is_cuda
-  opt2 = dataclasses.replace(m.opt, graph_conditional=gc, tolerance=d.ctol, ls_tolerance=d.cls_tol)
+  opt2 = dataclasses.replace(m.opt, graph_conditional=gc)
   m2 = dataclasses.replace(
     m, opt=opt2, nv=nvp, nv_pad=nvp, is_sparse=False, dof_tri_row=d.cdof_tri_row, dof_tri_col=d.cdof_tri_col
   )

@@ -1273,7 +1273,7 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
   ncollision = sum(_pair_count(g[0].value, g[1].value)[0] for g in collision_table)
   # no convex collisions, early return
 
-  if wp.upper_bound(ncollision) == 0:
+  if ncollision == 0:
     return
 
   # compute npolygonmax and nmeshdegmax given the geom pairs for the model
