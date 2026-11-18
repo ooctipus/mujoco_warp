@@ -18,6 +18,7 @@ from typing import Tuple
 import warp as wp
 
 from mujoco_warp._src import math
+from mujoco_warp._src import sort
 from mujoco_warp._src import support
 from mujoco_warp._src import types
 from mujoco_warp._src.types import ConstraintType
@@ -78,6 +79,13 @@ def _zero_constraint_counts(
   nefc_out[worldid] = 0
   efc_jtdaj_nblock_out[worldid] = 0
   efc_nnz_out[worldid] = 0
+
+
+@wp.func
+def _clear_contact_efc_address(conid: int, start: int, contact_efc_address_out: wp.array2d[int]):
+  """Clear unused row addresses when a reused contact changes dimension."""
+  for dim in range(start, contact_efc_address_out.shape[1]):
+    contact_efc_address_out[conid, dim] = -1
 
 
 @wp.func
@@ -1684,18 +1692,20 @@ def _equality_flexstrain(is_sparse: bool, newton: bool, is_discrete: bool = Fals
             idx_iw += 1
     avg_invweight /= float(npc)
 
+    # A cell's modes must stay contiguous so its JTDAJ block survives row sorting.
+    wp.atomic_add(ne_out, worldid, neig)  # kernel_analyzer: ignore[atomic]
+    efcid0 = wp.atomic_add(nefc_out, worldid, neig)  # kernel_analyzer: ignore[atomic]
+    if efcid0 >= njmax_in:
+      return
+    nrow = wp.min(neig, njmax_in - efcid0)
+    if wp.static(is_sparse and newton):
+      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)  # kernel_analyzer: ignore[atomic]
+      efc_jtdaj_adr_out[worldid, jgid] = efcid0
+      efc_jtdaj_nrow_out[worldid, jgid] = nrow
+
     # Loop over eigenmodes
-    for eig in range(neig):
-      wp.atomic_add(ne_out, worldid, 1)  # kernel_analyzer: ignore[atomic]
-      efcid = wp.atomic_add(nefc_out, worldid, 1)  # kernel_analyzer: ignore[atomic]
-
-      if efcid >= njmax_in:
-        return
-
-      if wp.static(is_sparse and newton):
-        jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)  # kernel_analyzer: ignore[atomic]
-        efc_jtdaj_adr_out[worldid, jgid] = efcid
-        efc_jtdaj_nrow_out[worldid, jgid] = 6
+    for eig in range(nrow):
+      efcid = efcid0 + eig
 
       # Read eigenvector from stiffness data
       eigvec_base = k_base + 1 + eig * ndof_cell
@@ -2509,7 +2519,9 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
     if conid >= nacon_in[0]:
       return
 
+    # Reused contact slots may contain addresses from a different contact dimension.
     if not (type_in[conid] & ContactType.CONSTRAINT):
+      _clear_contact_efc_address(conid, 0, contact_efc_address_out)
       return
 
     condim = condim_in[conid]
@@ -2522,6 +2534,7 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
       active = pos < 0.0
 
     if not active:
+      _clear_contact_efc_address(conid, 0, contact_efc_address_out)
       return
 
     if wp.static(IS_ELLIPTIC):
@@ -2531,6 +2544,8 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
         ndim = 1
       else:
         ndim = 2 * (condim - 1)
+
+    _clear_contact_efc_address(conid, ndim, contact_efc_address_out)
 
     worldid = worldid_in[conid]
 
@@ -2648,7 +2663,9 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
     if conid >= nacon_in[0]:
       return
 
+    # Reused contact slots may contain addresses from a different contact dimension.
     if not (type_in[conid] & ContactType.CONSTRAINT):
+      _clear_contact_efc_address(conid, 0, contact_efc_address_out)
       return
 
     condim = condim_in[conid]
@@ -2661,6 +2678,7 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
       active = active or (adhesion_in[conid] != 0.0)
 
     if not active:
+      _clear_contact_efc_address(conid, 0, contact_efc_address_out)
       return
 
     if wp.static(IS_ELLIPTIC):
@@ -2670,6 +2688,8 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
         ndim = 1
       else:
         ndim = 2 * (condim - 1)
+
+    _clear_contact_efc_address(conid, ndim, contact_efc_address_out)
 
     worldid = worldid_in[conid]
 
@@ -4785,12 +4805,6 @@ def _add_surface_vel(is_pyramidal: bool):
   return kernel
 
 
-def _sort_constraints(m: types.Model, d: types.Data):
-  """Order constraint rows canonically for determinism."""
-  # TODO(team): Implementation of constraint row sorting.
-  pass
-
-
 @event_scope
 def make_constraint(m: types.Model, d: types.Data):
   """Creates constraint jacobians and other supporting data."""
@@ -5747,7 +5761,7 @@ def make_constraint(m: types.Model, d: types.Data):
         )
 
   if m.opt.deterministic & types.DeterminismType.CONSTRAINT:
-    _sort_constraints(m, d)
+    sort.constraints(m, d, efc_nnz)
 
 
 @cache_kernel
